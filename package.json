@@ -1,0 +1,61 @@
+{
+  "name": "pi-slopchop",
+  "version": "0.0.1",
+  "type": "module",
+  "description": "Terminal-native code review and annotation workflow for the Pi coding agent.",
+  "author": "Rob Zolkos <rob@zolkos.com>",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/robzolkos/pi-slopchop.git"
+  },
+  "homepage": "https://github.com/robzolkos/pi-slopchop#readme",
+  "bugs": {
+    "url": "https://github.com/robzolkos/pi-slopchop/issues"
+  },
+  "files": [
+    "src/diff.ts",
+    "src/git.ts",
+    "src/index.ts",
+    "src/pi-render.ts",
+    "src/prompt.ts",
+    "src/search.ts",
+    "src/shortcuts.ts",
+    "src/state.ts",
+    "src/syntax-highlight.ts",
+    "src/theme-highlight.ts",
+    "src/types.ts",
+    "src/ui",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "pi-package",
+    "pi",
+    "diff-review",
+    "code-review",
+    "annotation",
+    "terminal"
+  ],
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "diff": "^8.0.2"
+  },
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": "*",
+    "@mariozechner/pi-tui": "*"
+  },
+  "devDependencies": {
+    "@types/node": "^24.5.2",
+    "typescript": "^5.9.3",
+    "vitest": "^3.2.4"
+  }
+}
