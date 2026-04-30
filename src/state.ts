@@ -8,6 +8,7 @@ function hasFilesForScope(files: ReviewFile[], scope: ReviewScope): boolean {
 
 export function getDefaultScope(files: ReviewFile[]): ReviewScope {
   if (hasFilesForScope(files, "git-diff")) return "git-diff";
+  if (hasFilesForScope(files, "all-files")) return "all-files";
   if (hasFilesForScope(files, "last-commit")) return "last-commit";
   return "all-files";
 }
@@ -19,7 +20,7 @@ export function getScopedFiles(files: ReviewFile[], scope: ReviewScope): ReviewF
     case "last-commit":
       return files.filter((file) => file.inLastCommit);
     case "all-files":
-      return files.filter((file) => file.hasWorkingTreeFile);
+      return files.filter((file) => file.inAllFiles);
   }
 }
 

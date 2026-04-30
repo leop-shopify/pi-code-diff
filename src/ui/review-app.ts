@@ -142,7 +142,7 @@ function getScopeComparison(file: ReviewFile | null, scope: ReviewScope) {
   if (file == null) return null;
   if (scope === "git-diff") return file.gitDiff;
   if (scope === "last-commit") return file.lastCommit;
-  return null;
+  return file.allFiles;
 }
 
 function getScopeDisplayPath(file: ReviewFile | null, scope: ReviewScope): string {

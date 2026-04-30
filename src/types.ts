@@ -18,8 +18,10 @@ export interface ReviewFile {
   hasWorkingTreeFile: boolean;
   inGitDiff: boolean;
   inLastCommit: boolean;
+  inAllFiles: boolean;
   gitDiff: ReviewFileComparison | null;
   lastCommit: ReviewFileComparison | null;
+  allFiles: ReviewFileComparison | null;
 }
 
 export interface ReviewFileContents {

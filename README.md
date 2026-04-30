@@ -61,12 +61,13 @@ ctrl+alt+s
 2. Pick a scope:
    - `git diff` — review your current uncommitted working tree changes against `HEAD`
    - `last commit` — review the most recent commit against its parent
-   - `all files` — review current file contents without diff-only filtering
+   - `all files` — review files changed on the current branch compared with the default branch; if there are no changed scopes, falls back to current file contents
 
    By default, `/slopchop` opens the first scope that makes sense for the repo in this order:
    - `git diff` if there are uncommitted changes
+   - otherwise `all files` if the current branch differs from the default branch
    - otherwise `last commit` if there is a reviewable last commit
-   - otherwise `all files`
+   - otherwise `all files` as a current-file fallback
 3. Move to the file and line you care about
 4. Add annotations:
    - `f` for a line annotation with `FIX` preselected

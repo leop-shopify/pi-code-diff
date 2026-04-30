@@ -22,8 +22,10 @@ function makeFile(path: string, flags?: Partial<ReviewFile>): ReviewFile {
     hasWorkingTreeFile: true,
     inGitDiff: true,
     inLastCommit: false,
+    inAllFiles: false,
     gitDiff: null,
     lastCommit: null,
+    allFiles: null,
     ...flags,
   };
 }
@@ -34,6 +36,13 @@ describe("review state", () => {
       makeFile("src/a.ts", { inGitDiff: true }),
       makeFile("src/b.ts", { inGitDiff: false, inLastCommit: true }),
     ])).toBe("git-diff");
+  });
+
+  it("prefers all changed files over the last commit when there is no worktree diff", () => {
+    expect(getDefaultScope([
+      makeFile("src/a.ts", { inGitDiff: false, inAllFiles: true }),
+      makeFile("src/b.ts", { inGitDiff: false, inLastCommit: true }),
+    ])).toBe("all-files");
   });
 
   it("switches scopes and keeps selection valid", () => {
