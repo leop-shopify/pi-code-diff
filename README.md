@@ -175,6 +175,7 @@ That keeps pure discussion prompts strict, and avoids unnecessary instructions w
 
 - `↑↓` or `j/k` — move between selectable added/deleted lines
 - `n / p` — next / previous hunk
+- `o` — open the selected line in `$EDITOR`, then return to `/slopchop` when the editor exits
 - `f` — line comment, default `FIX`
 - `d` or `c` — line comment, default `DISCUSS`
 - `e` — edit the existing line comment on the selected line

@@ -1,3 +1,5 @@
+import { spawn } from "node:child_process";
+import { join } from "node:path";
 import type { ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { Editor, type EditorTheme, Key, matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@mariozechner/pi-tui";
 import { adjustStructuredDiffContext, buildStructuredDiff, type StructuredDiff, type StructuredDiffVisibleItem } from "../diff.js";
@@ -63,6 +65,7 @@ type CommentPanelItem =
 
 interface ReviewAppOptions {
   files: ReviewFile[];
+  repoRoot: string;
   loadFileContents: (file: ReviewFile, scope: ReviewScope) => Promise<ReviewFileContents>;
   commentShortcuts: CommentShortcut[];
   notify: ExtensionContext["ui"]["notify"];
@@ -70,6 +73,51 @@ interface ReviewAppOptions {
 
 const SEARCHABLE_SCOPES: ReviewScope[] = ["git-diff", "last-commit", "all-files"];
 const DEFAULT_CONTEXT_LINES = 3;
+
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+export function buildEditorLaunchCommand(editorCommand: string, filePath: string, line: number): string {
+  const lineNumber = Math.max(1, Math.floor(line));
+  return `${editorCommand.trim() || "vi"} +${lineNumber} -- ${shellQuote(filePath)}`;
+}
+
+function runShellCommand(command: string, cwd: string): Promise<number | null> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, {
+      cwd,
+      env: process.env,
+      shell: true,
+      stdio: "inherit",
+    });
+
+    child.once("error", reject);
+    child.once("close", (code) => resolve(code));
+  });
+}
+
+export function getEditorLineForTarget(diff: StructuredDiff, target: ReviewLineTarget): number {
+  if (target.side === "added") return target.line;
+
+  const rowIndex = diff.rows.findIndex((row) => row.oldLineNumber === target.line);
+  if (rowIndex < 0) return target.line;
+
+  const selectedRow = diff.rows[rowIndex]!;
+  if (selectedRow.newLineNumber != null) return selectedRow.newLineNumber;
+
+  for (let index = rowIndex + 1; index < diff.rows.length; index += 1) {
+    const line = diff.rows[index]!.newLineNumber;
+    if (line != null) return line;
+  }
+
+  for (let index = rowIndex - 1; index >= 0; index -= 1) {
+    const line = diff.rows[index]!.newLineNumber;
+    if (line != null) return line;
+  }
+
+  return 1;
+}
 
 type Theme = Parameters<ExtensionContext["ui"]["custom"]>[0] extends (tui: any, theme: infer T, kb: any, done: any) => any ? T : never;
 
@@ -323,6 +371,7 @@ class ReviewApp {
   private searchBuffer = "";
   private shortcutMode = false;
   private helpMode = false;
+  private externalEditorOpen = false;
   private editTarget: EditTarget | null = null;
   private editor: Editor;
   private message: string | null = null;
@@ -673,6 +722,60 @@ class ReviewApp {
     this.editLineComment();
   }
 
+  private async openSelectedLineInEditor(): Promise<void> {
+    if (this.externalEditorOpen) return;
+
+    const file = this.activeFile();
+    if (file == null) {
+      this.setMessage("No file selected.");
+      this.requestRender();
+      return;
+    }
+
+    if (!file.hasWorkingTreeFile) {
+      this.setMessage("Cannot open this file in $EDITOR because it does not exist in the working tree.");
+      this.requestRender();
+      return;
+    }
+
+    const target = getSelectedLineTarget(this.state, file.id, this.state.activeScope);
+    if (target == null) {
+      this.setMessage("No selectable diff line to open in $EDITOR.");
+      this.requestRender();
+      return;
+    }
+
+    const diff = this.getDisplayDiff(file.id, this.state.activeScope);
+    if (diff == null) {
+      this.setMessage("Diff is still loading; try again in a moment.");
+      this.requestRender();
+      return;
+    }
+
+    const editorLine = getEditorLineForTarget(diff, target);
+    const editorCommand = (process.env.EDITOR || process.env.VISUAL || "vi").trim() || "vi";
+    const filePath = join(this.options.repoRoot, file.path);
+    const command = buildEditorLaunchCommand(editorCommand, filePath, editorLine);
+
+    this.externalEditorOpen = true;
+    this.setMessage(`Opening ${file.path}:${editorLine} in $EDITOR…`);
+    this.requestRender();
+
+    try {
+      if (typeof this.tui.stop === "function") this.tui.stop();
+      if (typeof this.tui.terminal?.clearScreen === "function") this.tui.terminal.clearScreen();
+      const code = await runShellCommand(command, this.options.repoRoot);
+      this.setMessage(code === 0 ? `Returned from $EDITOR at ${file.path}:${editorLine}.` : `$EDITOR exited with code ${code ?? "unknown"}.`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.setMessage(`Could not open $EDITOR: ${message}`);
+    } finally {
+      this.externalEditorOpen = false;
+      if (typeof this.tui.start === "function") this.tui.start();
+      if (typeof this.tui.requestRender === "function") this.tui.requestRender(true);
+    }
+  }
+
   private submit(): void {
     if (!hasDraftContent(this.state)) {
       this.setMessage("Add at least one line comment, file comment, or all note before submitting.");
@@ -797,6 +900,8 @@ class ReviewApp {
   }
 
   handleInput(data: string): void {
+    if (this.externalEditorOpen) return;
+
     if (this.editTarget != null) {
       if (matchesKey(data, Key.escape)) {
         this.cancelEditor();
@@ -890,6 +995,10 @@ class ReviewApp {
         if (matchesKey(data, Key.up) || data === "k") {
           this.state = moveSelectedLineTarget(this.state, file.id, this.state.activeScope, visibleTargets, -1);
           this.requestRender();
+          return;
+        }
+        if (data === "o") {
+          void this.openSelectedLineInEditor();
           return;
         }
         if (data === "f") {
@@ -1059,7 +1168,7 @@ class ReviewApp {
     lines.push(this.theme.fg("warning", "Keys"));
     lines.push(this.theme.fg("muted", "1/2/3 scope • Tab focus • / shortcuts/search • s submit"));
     lines.push(this.theme.fg("muted", "f line fix • d/c line discuss • e edit line • x delete line"));
-    lines.push(this.theme.fg("muted", "l file • a all • n/p hunks"));
+    lines.push(this.theme.fg("muted", "o open in $EDITOR • l file • a all • n/p hunks"));
     lines.push("");
     lines.push(this.theme.fg("warning", "Editor"));
     lines.push(this.theme.fg("muted", "Tab toggle • Enter save • Shift+Enter newline • Esc cancel"));
@@ -1208,7 +1317,7 @@ class ReviewApp {
           ? `Search: ${this.searchBuffer}`
           : this.editTarget != null
             ? `Editing ${formatIntentLabel(this.editTarget.intent).toLowerCase()} comment`
-            : "Tab focus • / search • ? help • 1/2/3 scopes • s submit • Esc cancel");
+            : "Tab focus • / search • ? help • 1/2/3 scopes • o open • s submit • Esc cancel");
 
     const scopeTabs = SEARCHABLE_SCOPES.map((scope, index) => {
       const active = this.state.activeScope === scope;
@@ -1232,7 +1341,7 @@ class ReviewApp {
 
     const footer = [
       truncateToWidth(this.theme.fg("dim", promptStatus), frameInnerWidth, "…", false),
-      truncateToWidth(this.theme.fg("dim", "navigator: ↑↓ files • diff: ↑↓ lines, / shortcuts, f fix line, d/c discuss line, e edit, x delete, l file, a all, n/p hunks • comments: e edit, d delete • editor: Tab toggle intent, Enter save, Shift+Enter newline • ? help • w wrap • u toggle unchanged"), frameInnerWidth, "…", false),
+      truncateToWidth(this.theme.fg("dim", "navigator: ↑↓ files • diff: ↑↓ lines, / shortcuts, o open in $EDITOR, f fix line, d/c discuss line, e edit, x delete, l file, a all, n/p hunks • comments: e edit, d delete • editor: Tab toggle intent, Enter save, Shift+Enter newline • ? help • w wrap • u toggle unchanged"), frameInnerWidth, "…", false),
     ];
 
     return renderOuterFrame(this.lastWidth, totalHeight, this.theme, "slopchop", [...headerLines, ...body, ...footer], frameColor);
