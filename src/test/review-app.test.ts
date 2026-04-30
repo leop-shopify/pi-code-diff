@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { buildStructuredDiff } from "../diff.js";
 import type { ReviewFile } from "../types.js";
-import { buildDisplayRows, buildEditorLaunchCommand, getEditorLineForTarget, getHalfPageStep, getPaneLayout, getRelatedFileMarker, getRelatedFilePaths } from "../ui/review-app.js";
+import { buildDisplayRows, buildEditorLaunchCommand, getEditorLineForTarget, getHalfPageStep, getPaneLayout, getRelatedFileMarker, getRelatedFilePaths, parseMouseWheelInput } from "../ui/review-app.js";
 
 function makeFile(path: string, flags?: Partial<ReviewFile>): ReviewFile {
   return {
@@ -88,6 +88,17 @@ describe("related navigator helpers", () => {
     });
 
     expect([...getRelatedFilePaths(active)].sort()).toEqual(["src/both.ts", "src/in.ts", "src/out.ts"]);
+  });
+});
+
+describe("parseMouseWheelInput", () => {
+  it("parses SGR mouse wheel events", () => {
+    expect(parseMouseWheelInput("\x1b[<64;10;5M")).toEqual({ direction: "up", col: 10, row: 5 });
+    expect(parseMouseWheelInput("\x1b[<65;10;5M")).toEqual({ direction: "down", col: 10, row: 5 });
+  });
+
+  it("ignores non-wheel mouse events", () => {
+    expect(parseMouseWheelInput("\x1b[<0;10;5M")).toBeNull();
   });
 });
 

@@ -70,6 +70,17 @@ interface ReviewAppOptions {
   notify: ExtensionContext["ui"]["notify"];
 }
 
+interface MousePaneLayout {
+  bodyTop: number;
+  bodyBottom: number;
+  navigatorLeft: number;
+  navigatorRight: number;
+  diffLeft: number;
+  diffRight: number;
+  commentsLeft: number | null;
+  commentsRight: number | null;
+}
+
 const SEARCHABLE_SCOPES: ReviewScope[] = ["git-diff", "last-commit", "all-files"];
 const DEFAULT_CONTEXT_LINES = 3;
 
@@ -139,6 +150,33 @@ export function getPaneLayout(frameInnerWidth: number, commentsHidden: boolean):
     diffWidth: Math.max(24, frameInnerWidth - navigatorWidth - commentsWidth - 2),
   };
 }
+
+export type MouseWheelDirection = "up" | "down";
+
+export interface MouseWheelEvent {
+  direction: MouseWheelDirection;
+  col: number;
+  row: number;
+}
+
+export function parseMouseWheelInput(data: string): MouseWheelEvent | null {
+  const match = data.match(/^\x1b\[<(\d+);(\d+);(\d+)[Mm]$/);
+  if (match == null) return null;
+
+  const button = Number.parseInt(match[1]!, 10);
+  if ((button & 64) === 0) return null;
+
+  const wheelButton = button & 3;
+  if (wheelButton !== 0 && wheelButton !== 1) return null;
+
+  return {
+    direction: wheelButton === 0 ? "up" : "down",
+    col: Number.parseInt(match[2]!, 10),
+    row: Number.parseInt(match[3]!, 10),
+  };
+}
+
+type PaneName = "navigator" | "diff" | "comments";
 
 type RelatedFileMarker = "→" | "←" | "↔";
 
@@ -434,6 +472,8 @@ class ReviewApp {
   private diffPageSize = 1;
   private commentsPageSize = 1;
   private relatedFilterAnchorFileId: string | null = null;
+  private mousePaneLayout: MousePaneLayout | null = null;
+  private mouseTrackingEnabled = false;
   private lastWidth = 120;
   private readonly previousHardwareCursor: boolean;
   private readonly syntaxLineCache = new Map<string, string>();
@@ -464,6 +504,7 @@ class ReviewApp {
       ? this.tui.getShowHardwareCursor()
       : false;
     this.syncCursorMode();
+    this.setMouseTracking(true);
 
     queueMicrotask(() => {
       this.ensureActiveEntry();
@@ -472,6 +513,7 @@ class ReviewApp {
   }
 
   dispose(): void {
+    this.setMouseTracking(false);
     if (typeof this.tui.setShowHardwareCursor === "function") {
       this.tui.setShowHardwareCursor(this.previousHardwareCursor);
     }
@@ -494,6 +536,33 @@ class ReviewApp {
     if (typeof this.tui.requestRender === "function") {
       this.tui.requestRender();
     }
+  }
+
+  private writeTerminal(data: string): void {
+    if (typeof this.tui.terminal?.write === "function") {
+      this.tui.terminal.write(data);
+    } else {
+      process.stdout.write(data);
+    }
+  }
+
+  private setMouseTracking(enabled: boolean): void {
+    if (this.mouseTrackingEnabled === enabled) return;
+    this.mouseTrackingEnabled = enabled;
+    this.writeTerminal(enabled ? "\x1b[?1000h\x1b[?1006h" : "\x1b[?1000l\x1b[?1006l");
+  }
+
+  private getPaneAtMousePosition(col: number, row: number): PaneName | null {
+    const layout = this.mousePaneLayout;
+    if (layout == null) return null;
+
+    const zeroCol = col - 1;
+    const zeroRow = row - 1;
+    if (zeroRow < layout.bodyTop || zeroRow > layout.bodyBottom) return null;
+    if (zeroCol >= layout.navigatorLeft && zeroCol <= layout.navigatorRight) return "navigator";
+    if (zeroCol >= layout.diffLeft && zeroCol <= layout.diffRight) return "diff";
+    if (layout.commentsLeft != null && layout.commentsRight != null && zeroCol >= layout.commentsLeft && zeroCol <= layout.commentsRight) return "comments";
+    return null;
   }
 
   private getCachedHighlightedCode(tone: DiffTone, text: string, language: string | undefined): string {
@@ -844,6 +913,7 @@ class ReviewApp {
     this.requestRender();
 
     try {
+      this.setMouseTracking(false);
       if (typeof this.tui.stop === "function") this.tui.stop();
       if (typeof this.tui.terminal?.clearScreen === "function") this.tui.terminal.clearScreen();
       const code = await runShellCommand(command, this.options.repoRoot);
@@ -854,6 +924,7 @@ class ReviewApp {
     } finally {
       this.externalEditorOpen = false;
       if (typeof this.tui.start === "function") this.tui.start();
+      this.setMouseTracking(true);
       if (typeof this.tui.requestRender === "function") this.tui.requestRender(true);
     }
   }
@@ -1003,6 +1074,47 @@ class ReviewApp {
     this.requestRender();
   }
 
+  private moveDiffSelection(delta: number): void {
+    const file = this.activeFile();
+    if (file == null) return;
+    const visibleTargets = this.getVisibleLineTargets(file.id, this.state.activeScope);
+    this.state = moveSelectedLineTarget(this.state, file.id, this.state.activeScope, visibleTargets, delta);
+    this.requestRender();
+  }
+
+  private moveCommentSelection(delta: number): void {
+    const items = getCommentPanelItems(this.state, this.state.activeFileId, this.state.activeScope);
+    this.state = moveSelectedCommentIndex(this.state, items.length, delta);
+    this.requestRender();
+  }
+
+  private handleMouseWheel(data: string): boolean {
+    const event = parseMouseWheelInput(data);
+    if (event == null) return false;
+
+    const pane = this.getPaneAtMousePosition(event.col, event.row);
+    if (pane == null) return true;
+
+    const delta = event.direction === "down" ? 1 : -1;
+    if (pane === "navigator") {
+      this.state = setFocus(this.state, "navigator");
+      this.moveNavigatorSelection(delta);
+      return true;
+    }
+    if (pane === "diff") {
+      this.state = setFocus(this.state, "diff");
+      this.moveDiffSelection(delta);
+      return true;
+    }
+    if (pane === "comments" && !this.commentsHidden) {
+      this.state = setFocus(this.state, "comments");
+      this.moveCommentSelection(delta);
+      return true;
+    }
+
+    return true;
+  }
+
   private applyShortcutByKey(key: string): void {
     const file = this.activeFile();
     const target = getSelectedLineTarget(this.state, file?.id ?? null, this.state.activeScope);
@@ -1051,6 +1163,7 @@ class ReviewApp {
 
   handleInput(data: string): void {
     if (this.externalEditorOpen) return;
+    if (this.handleMouseWheel(data)) return;
 
     if (this.editTarget != null) {
       if (matchesKey(data, Key.escape)) {
@@ -1145,25 +1258,20 @@ class ReviewApp {
       }
       const file = this.activeFile();
       if (file != null) {
-        const visibleTargets = this.getVisibleLineTargets(file.id, this.state.activeScope);
         if (matchesKey(data, Key.down) || data === "j") {
-          this.state = moveSelectedLineTarget(this.state, file.id, this.state.activeScope, visibleTargets, 1);
-          this.requestRender();
+          this.moveDiffSelection(1);
           return;
         }
         if (matchesKey(data, Key.up) || data === "k") {
-          this.state = moveSelectedLineTarget(this.state, file.id, this.state.activeScope, visibleTargets, -1);
-          this.requestRender();
+          this.moveDiffSelection(-1);
           return;
         }
         if (matchesKey(data, Key.ctrl("d"))) {
-          this.state = moveSelectedLineTarget(this.state, file.id, this.state.activeScope, visibleTargets, getHalfPageStep(this.diffPageSize));
-          this.requestRender();
+          this.moveDiffSelection(getHalfPageStep(this.diffPageSize));
           return;
         }
         if (matchesKey(data, Key.ctrl("u"))) {
-          this.state = moveSelectedLineTarget(this.state, file.id, this.state.activeScope, visibleTargets, -getHalfPageStep(this.diffPageSize));
-          this.requestRender();
+          this.moveDiffSelection(-getHalfPageStep(this.diffPageSize));
           return;
         }
         if (data === "o") {
@@ -1195,23 +1303,19 @@ class ReviewApp {
     if (this.state.focus === "comments") {
       const items = getCommentPanelItems(this.state, this.state.activeFileId, this.state.activeScope);
       if (matchesKey(data, Key.down) || data === "j") {
-        this.state = moveSelectedCommentIndex(this.state, items.length, 1);
-        this.requestRender();
+        this.moveCommentSelection(1);
         return;
       }
       if (matchesKey(data, Key.up) || data === "k") {
-        this.state = moveSelectedCommentIndex(this.state, items.length, -1);
-        this.requestRender();
+        this.moveCommentSelection(-1);
         return;
       }
       if (matchesKey(data, Key.ctrl("d"))) {
-        this.state = moveSelectedCommentIndex(this.state, items.length, getHalfPageStep(this.commentsPageSize));
-        this.requestRender();
+        this.moveCommentSelection(getHalfPageStep(this.commentsPageSize));
         return;
       }
       if (matchesKey(data, Key.ctrl("u"))) {
-        this.state = moveSelectedCommentIndex(this.state, items.length, -getHalfPageStep(this.commentsPageSize));
-        this.requestRender();
+        this.moveCommentSelection(-getHalfPageStep(this.commentsPageSize));
         return;
       }
       if (data === "e" || matchesKey(data, Key.enter)) {
@@ -1496,6 +1600,23 @@ class ReviewApp {
     const frameInnerHeight = Math.max(10, totalHeight - 2 - MODAL_INNER_PADDING_Y * 2);
     const bodyHeight = Math.max(6, frameInnerHeight - 5);
     const { navigatorWidth, diffWidth, commentsWidth } = getPaneLayout(frameInnerWidth, this.commentsHidden);
+    const terminalCols = this.tui?.terminal?.columns ?? this.lastWidth;
+    const overlayOriginCol = Math.max(0, Math.floor((terminalCols - this.lastWidth) / 2));
+    const overlayOriginRow = Math.max(0, Math.floor((terminalRows - totalHeight) / 2));
+    const bodyTop = overlayOriginRow + 1 + MODAL_INNER_PADDING_Y + 1;
+    const contentLeft = overlayOriginCol + 1 + MODAL_INNER_PADDING_X;
+    const diffLeft = contentLeft + navigatorWidth + 1;
+    const commentsLeft = this.commentsHidden ? null : diffLeft + diffWidth + 1;
+    this.mousePaneLayout = {
+      bodyTop,
+      bodyBottom: bodyTop + bodyHeight - 1,
+      navigatorLeft: contentLeft,
+      navigatorRight: contentLeft + navigatorWidth - 1,
+      diffLeft,
+      diffRight: diffLeft + diffWidth - 1,
+      commentsLeft,
+      commentsRight: commentsLeft == null ? null : commentsLeft + commentsWidth - 1,
+    };
 
     const promptStatus = this.shortcutMode
       ? "Shortcut mode • choose from the right panel • Esc cancel"

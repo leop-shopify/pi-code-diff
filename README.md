@@ -161,6 +161,7 @@ That keeps pure discussion prompts strict, and avoids unnecessary instructions w
 #### Global
 
 - `1 / 2 / 3` — switch scope
+- mouse wheel — scroll the pane under the cursor
 - `Tab` — cycle focus: navigator → diff → comments
 - `/` — search files, or open slash shortcuts in diff focus
 - `?` — toggle help in the right sidebar
