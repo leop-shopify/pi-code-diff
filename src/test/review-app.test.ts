@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { buildStructuredDiff } from "../diff.js";
-import { buildDisplayRows, buildEditorLaunchCommand, getEditorLineForTarget } from "../ui/review-app.js";
+import { buildDisplayRows, buildEditorLaunchCommand, getEditorLineForTarget, getHalfPageStep } from "../ui/review-app.js";
 
 describe("buildDisplayRows", () => {
   it("keeps deleted and added rows independently commentable when line numbers overlap", () => {
@@ -29,6 +29,14 @@ describe("getEditorLineForTarget", () => {
     );
 
     expect(getEditorLineForTarget(diff, { side: "deleted", line: 2 })).toBe(2);
+  });
+});
+
+describe("getHalfPageStep", () => {
+  it("uses at least one row and otherwise half the visible rows", () => {
+    expect(getHalfPageStep(1)).toBe(1);
+    expect(getHalfPageStep(9)).toBe(4);
+    expect(getHalfPageStep(10)).toBe(5);
   });
 });
 

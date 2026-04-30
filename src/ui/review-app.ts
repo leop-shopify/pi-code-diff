@@ -119,6 +119,10 @@ export function getEditorLineForTarget(diff: StructuredDiff, target: ReviewLineT
   return 1;
 }
 
+export function getHalfPageStep(visibleRows: number): number {
+  return Math.max(1, Math.floor(visibleRows / 2));
+}
+
 type Theme = Parameters<ExtensionContext["ui"]["custom"]>[0] extends (tui: any, theme: infer T, kb: any, done: any) => any ? T : never;
 
 function repeat(char: string, count: number): string {
@@ -378,6 +382,9 @@ class ReviewApp {
   private navigatorScroll = 0;
   private diffScroll = 0;
   private commentsScroll = 0;
+  private navigatorPageSize = 1;
+  private diffPageSize = 1;
+  private commentsPageSize = 1;
   private lastWidth = 120;
   private readonly previousHardwareCursor: boolean;
   private readonly syntaxLineCache = new Map<string, string>();
@@ -972,6 +979,18 @@ class ReviewApp {
         this.requestRender();
         return;
       }
+      if (matchesKey(data, Key.ctrl("d"))) {
+        this.state = moveActiveFile(this.state, this.options.files, getHalfPageStep(this.navigatorPageSize));
+        void this.ensureActiveEntry();
+        this.requestRender();
+        return;
+      }
+      if (matchesKey(data, Key.ctrl("u"))) {
+        this.state = moveActiveFile(this.state, this.options.files, -getHalfPageStep(this.navigatorPageSize));
+        void this.ensureActiveEntry();
+        this.requestRender();
+        return;
+      }
       if (matchesKey(data, Key.enter)) {
         this.state = setFocus(this.state, "diff");
         this.requestRender();
@@ -994,6 +1013,16 @@ class ReviewApp {
         }
         if (matchesKey(data, Key.up) || data === "k") {
           this.state = moveSelectedLineTarget(this.state, file.id, this.state.activeScope, visibleTargets, -1);
+          this.requestRender();
+          return;
+        }
+        if (matchesKey(data, Key.ctrl("d"))) {
+          this.state = moveSelectedLineTarget(this.state, file.id, this.state.activeScope, visibleTargets, getHalfPageStep(this.diffPageSize));
+          this.requestRender();
+          return;
+        }
+        if (matchesKey(data, Key.ctrl("u"))) {
+          this.state = moveSelectedLineTarget(this.state, file.id, this.state.activeScope, visibleTargets, -getHalfPageStep(this.diffPageSize));
           this.requestRender();
           return;
         }
@@ -1035,6 +1064,16 @@ class ReviewApp {
         this.requestRender();
         return;
       }
+      if (matchesKey(data, Key.ctrl("d"))) {
+        this.state = moveSelectedCommentIndex(this.state, items.length, getHalfPageStep(this.commentsPageSize));
+        this.requestRender();
+        return;
+      }
+      if (matchesKey(data, Key.ctrl("u"))) {
+        this.state = moveSelectedCommentIndex(this.state, items.length, -getHalfPageStep(this.commentsPageSize));
+        this.requestRender();
+        return;
+      }
       if (data === "e" || matchesKey(data, Key.enter)) {
         this.editSelectedComment();
         return;
@@ -1060,6 +1099,7 @@ class ReviewApp {
     }
 
     const maxBody = Math.max(1, height - 4);
+    this.navigatorPageSize = maxBody;
     const activeIndex = Math.max(0, files.findIndex((file) => file.id === this.state.activeFileId));
     if (activeIndex < this.navigatorScroll) this.navigatorScroll = activeIndex;
     if (activeIndex >= this.navigatorScroll + maxBody) this.navigatorScroll = activeIndex - maxBody + 1;
@@ -1152,6 +1192,7 @@ class ReviewApp {
     }
 
     const maxBody = Math.max(1, height - 5);
+    this.diffPageSize = maxBody;
     if (selectedIndex < this.diffScroll) this.diffScroll = selectedIndex;
     if (selectedIndex >= this.diffScroll + maxBody) this.diffScroll = selectedIndex - maxBody + 1;
     lines.push(...rendered.slice(this.diffScroll, this.diffScroll + maxBody));
@@ -1168,7 +1209,7 @@ class ReviewApp {
     lines.push(this.theme.fg("warning", "Keys"));
     lines.push(this.theme.fg("muted", "1/2/3 scope • Tab focus • / shortcuts/search • s submit"));
     lines.push(this.theme.fg("muted", "f line fix • d/c line discuss • e edit line • x delete line"));
-    lines.push(this.theme.fg("muted", "o open in $EDITOR • l file • a all • n/p hunks"));
+    lines.push(this.theme.fg("muted", "Ctrl+d/u half-page • o open in $EDITOR • l file • a all • n/p hunks"));
     lines.push("");
     lines.push(this.theme.fg("warning", "Editor"));
     lines.push(this.theme.fg("muted", "Tab toggle • Enter save • Shift+Enter newline • Esc cancel"));
@@ -1274,6 +1315,7 @@ class ReviewApp {
     }
 
     const maxBody = Math.max(1, height - 5);
+    this.commentsPageSize = maxBody;
     const activeIndex = Math.max(0, this.state.selectedCommentIndex);
     if (activeIndex < this.commentsScroll) this.commentsScroll = activeIndex;
     if (activeIndex >= this.commentsScroll + maxBody) this.commentsScroll = activeIndex - maxBody + 1;
@@ -1341,7 +1383,7 @@ class ReviewApp {
 
     const footer = [
       truncateToWidth(this.theme.fg("dim", promptStatus), frameInnerWidth, "…", false),
-      truncateToWidth(this.theme.fg("dim", "navigator: ↑↓ files • diff: ↑↓ lines, / shortcuts, o open in $EDITOR, f fix line, d/c discuss line, e edit, x delete, l file, a all, n/p hunks • comments: e edit, d delete • editor: Tab toggle intent, Enter save, Shift+Enter newline • ? help • w wrap • u toggle unchanged"), frameInnerWidth, "…", false),
+      truncateToWidth(this.theme.fg("dim", "navigator: ↑↓ files, Ctrl+d/u half-page • diff: ↑↓ lines, Ctrl+d/u half-page, / shortcuts, o open in $EDITOR, f fix line, d/c discuss line, e edit, x delete, l file, a all, n/p hunks • comments: ↑↓ comments, Ctrl+d/u half-page, e edit, d delete • editor: Tab toggle intent, Enter save, Shift+Enter newline • ? help • w wrap • u toggle unchanged"), frameInnerWidth, "…", false),
     ];
 
     return renderOuterFrame(this.lastWidth, totalHeight, this.theme, "slopchop", [...headerLines, ...body, ...footer], frameColor);

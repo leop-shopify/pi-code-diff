@@ -170,11 +170,13 @@ That keeps pure discussion prompts strict, and avoids unnecessary instructions w
 #### Navigator
 
 - `↑↓` or `j/k` — move between files
+- `Ctrl+d` / `Ctrl+u` — move down / up by half a pane
 - `Enter` — move focus to diff
 
 #### Diff
 
 - `↑↓` or `j/k` — move between selectable added/deleted lines
+- `Ctrl+d` / `Ctrl+u` — move down / up by half a pane
 - `n / p` — next / previous hunk
 - `o` — open the selected line in `$EDITOR`, then return to `/slopchop` when the editor exits
 - `f` — line comment, default `FIX`
@@ -193,6 +195,7 @@ Line comment markers in the diff gutter:
 #### Comments panel
 
 - `↑↓` or `j/k` — move through saved comments
+- `Ctrl+d` / `Ctrl+u` — move down / up by half a pane
 - `e` or `Enter` — edit selected comment
 - `d` — delete selected comment
 
