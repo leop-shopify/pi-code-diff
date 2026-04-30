@@ -12,12 +12,10 @@ import {
   ensureActiveFile,
   getCommentsForFileScope,
   getFileComment,
-  getFilteredFiles,
   getLineComment,
   getScopedFiles,
   getSelectedLineTarget,
   hasDraftContent,
-  moveActiveFile,
   moveSelectedCommentIndex,
   moveSelectedLineTarget,
   setActiveFileId,
@@ -33,6 +31,7 @@ import {
 } from "../state.js";
 import { detectPiLanguage, highlightCodeLineWithPi } from "../pi-render.js";
 import { getShortcutConfigPath, getShortcutsForSide, type CommentShortcut } from "../shortcuts.js";
+import { filterFilesBySearch } from "../search.js";
 import { highlightJsonLine, highlightMarkdownLine } from "../theme-highlight.js";
 import type { CommentIntent, DiffReviewComment, ReviewFile, ReviewFileContents, ReviewLineTarget, ReviewResult, ReviewScope, ReviewState } from "../types.js";
 import { formatIntentLabel, formatScopeLabel } from "../types.js";
@@ -123,6 +122,25 @@ export function getHalfPageStep(visibleRows: number): number {
   return Math.max(1, Math.floor(visibleRows / 2));
 }
 
+type RelatedFileMarker = "→" | "←" | "↔";
+
+export function getRelatedFilePaths(file: ReviewFile | null): Set<string> {
+  return new Set([
+    ...(file?.allFilesOutgoingReferences ?? []),
+    ...(file?.allFilesIncomingReferences ?? []),
+  ]);
+}
+
+export function getRelatedFileMarker(file: ReviewFile, activeFile: ReviewFile | null, scope: ReviewScope): RelatedFileMarker | null {
+  if (activeFile == null || scope !== "all-files" || file.id === activeFile.id) return null;
+  const outgoing = new Set(activeFile.allFilesOutgoingReferences ?? []).has(file.path);
+  const incoming = new Set(activeFile.allFilesIncomingReferences ?? []).has(file.path);
+  if (outgoing && incoming) return "↔";
+  if (outgoing) return "→";
+  if (incoming) return "←";
+  return null;
+}
+
 type Theme = Parameters<ExtensionContext["ui"]["custom"]>[0] extends (tui: any, theme: infer T, kb: any, done: any) => any ? T : never;
 
 function repeat(char: string, count: number): string {
@@ -163,6 +181,17 @@ function getStatusLabel(file: ReviewFile | null, scope: ReviewScope): string {
     case "modified": return "M";
     default: return "·";
   }
+}
+
+function getChangeCountLabel(theme: Theme, file: ReviewFile, scope: ReviewScope): string {
+  const comparison = getScopeComparison(file, scope);
+  const additions = comparison?.additions;
+  const deletions = comparison?.deletions;
+  if (additions == null && deletions == null) return "";
+  const safeAdditions = additions ?? 0;
+  const safeDeletions = deletions ?? 0;
+  if (safeAdditions === 0 && safeDeletions === 0) return "";
+  return ` ${theme.fg("success", `+${safeAdditions}`)} ${theme.fg("error", `-${safeDeletions}`)}`;
 }
 
 function getFileCommentCount(state: ReviewState, fileId: string, scope: ReviewScope): number {
@@ -385,6 +414,7 @@ class ReviewApp {
   private navigatorPageSize = 1;
   private diffPageSize = 1;
   private commentsPageSize = 1;
+  private relatedFilterAnchorFileId: string | null = null;
   private lastWidth = 120;
   private readonly previousHardwareCursor: boolean;
   private readonly syntaxLineCache = new Map<string, string>();
@@ -513,6 +543,29 @@ class ReviewApp {
     return getCommentableLineTargets(diff);
   }
 
+  private relatedFilterAnchorFile(): ReviewFile | null {
+    if (this.relatedFilterAnchorFileId == null || this.state.activeScope !== "all-files") return null;
+    return this.options.files.find((file) => file.id === this.relatedFilterAnchorFileId) ?? null;
+  }
+
+  private getNavigatorFiles(): ReviewFile[] {
+    let files = getScopedFiles(this.options.files, this.state.activeScope);
+    const anchor = this.relatedFilterAnchorFile();
+
+    if (anchor != null) {
+      const relatedPaths = getRelatedFilePaths(anchor);
+      files = files
+        .filter((file) => file.id === anchor.id || relatedPaths.has(file.path))
+        .sort((a, b) => {
+          if (a.id === anchor.id) return -1;
+          if (b.id === anchor.id) return 1;
+          return 0;
+        });
+    }
+
+    return filterFilesBySearch(files, this.state.searchQuery);
+  }
+
   private ensureLineSelection(): void {
     const file = this.activeFile();
     if (file == null) return;
@@ -546,6 +599,7 @@ class ReviewApp {
   }
 
   private setScope(scope: ReviewScope): void {
+    this.relatedFilterAnchorFileId = null;
     this.state = setScope(this.state, this.options.files, scope);
     this.diffScroll = 0;
     this.navigatorScroll = 0;
@@ -555,6 +609,7 @@ class ReviewApp {
   }
 
   private openSearch(): void {
+    this.relatedFilterAnchorFileId = null;
     this.searchMode = true;
     this.searchBuffer = this.state.searchQuery;
     this.setMessage("Search files; Enter or Esc to finish.");
@@ -860,6 +915,51 @@ class ReviewApp {
     this.requestRender();
   }
 
+  private toggleRelatedFilter(): void {
+    if (this.relatedFilterAnchorFileId != null) {
+      this.relatedFilterAnchorFileId = null;
+      this.navigatorScroll = 0;
+      this.setMessage("Showing all files.");
+      this.requestRender();
+      return;
+    }
+
+    if (this.state.activeScope !== "all-files") {
+      this.setMessage("Related filter is only available in the all files scope.");
+      this.requestRender();
+      return;
+    }
+
+    const file = this.activeFile();
+    const relatedPaths = getRelatedFilePaths(file);
+    if (file == null || relatedPaths.size === 0) {
+      this.setMessage("No related files for the active file.");
+      this.requestRender();
+      return;
+    }
+
+    this.relatedFilterAnchorFileId = file.id;
+    this.navigatorScroll = 0;
+    this.setMessage(`Showing files related to ${file.path}. Press r to show all files.`);
+    this.requestRender();
+  }
+
+  private moveNavigatorSelection(delta: number): void {
+    const files = this.getNavigatorFiles();
+    if (files.length === 0) {
+      this.state = setActiveFileId(this.state, this.options.files, null);
+      this.requestRender();
+      return;
+    }
+
+    const index = files.findIndex((file) => file.id === this.state.activeFileId);
+    const currentIndex = index >= 0 ? index : 0;
+    const nextIndex = Math.max(0, Math.min(files.length - 1, currentIndex + delta));
+    this.state = setActiveFileId(this.state, this.options.files, files[nextIndex]!.id);
+    void this.ensureActiveEntry();
+    this.requestRender();
+  }
+
   private applyShortcutByKey(key: string): void {
     const file = this.activeFile();
     const target = getSelectedLineTarget(this.state, file?.id ?? null, this.state.activeScope);
@@ -968,27 +1068,23 @@ class ReviewApp {
 
     if (this.state.focus === "navigator") {
       if (matchesKey(data, Key.down) || data === "j") {
-        this.state = moveActiveFile(this.state, this.options.files, 1);
-        void this.ensureActiveEntry();
-        this.requestRender();
+        this.moveNavigatorSelection(1);
         return;
       }
       if (matchesKey(data, Key.up) || data === "k") {
-        this.state = moveActiveFile(this.state, this.options.files, -1);
-        void this.ensureActiveEntry();
-        this.requestRender();
+        this.moveNavigatorSelection(-1);
         return;
       }
       if (matchesKey(data, Key.ctrl("d"))) {
-        this.state = moveActiveFile(this.state, this.options.files, getHalfPageStep(this.navigatorPageSize));
-        void this.ensureActiveEntry();
-        this.requestRender();
+        this.moveNavigatorSelection(getHalfPageStep(this.navigatorPageSize));
         return;
       }
       if (matchesKey(data, Key.ctrl("u"))) {
-        this.state = moveActiveFile(this.state, this.options.files, -getHalfPageStep(this.navigatorPageSize));
-        void this.ensureActiveEntry();
-        this.requestRender();
+        this.moveNavigatorSelection(-getHalfPageStep(this.navigatorPageSize));
+        return;
+      }
+      if (data === "r") {
+        this.toggleRelatedFilter();
         return;
       }
       if (matchesKey(data, Key.enter)) {
@@ -1086,10 +1182,12 @@ class ReviewApp {
   }
 
   private renderNavigator(width: number, height: number): string[] {
-    const files = getFilteredFiles(this.options.files, this.state);
+    const files = this.getNavigatorFiles();
     const lines: string[] = [];
+    const relatedAnchor = this.relatedFilterAnchorFile();
+    const relatedSuffix = relatedAnchor == null ? "" : ` • related to ${shortenNavigatorPath(relatedAnchor.path, 24)}`;
     const titleSuffix = this.searchMode ? ` (${this.searchBuffer || "…"})` : this.state.searchQuery ? ` (${this.state.searchQuery})` : "";
-    lines.push(this.theme.fg("muted", `${files.length} file${files.length === 1 ? "" : "s"}${titleSuffix}`));
+    lines.push(this.theme.fg("muted", `${files.length} file${files.length === 1 ? "" : "s"}${titleSuffix}${relatedSuffix}`));
     lines.push("");
 
     if (files.length === 0) {
@@ -1104,20 +1202,26 @@ class ReviewApp {
     if (activeIndex < this.navigatorScroll) this.navigatorScroll = activeIndex;
     if (activeIndex >= this.navigatorScroll + maxBody) this.navigatorScroll = activeIndex - maxBody + 1;
     const visible = files.slice(this.navigatorScroll, this.navigatorScroll + maxBody);
+    const relationSource = relatedAnchor;
 
     for (const file of visible) {
       const active = file.id === this.state.activeFileId;
-      const prefix = active ? this.theme.fg("accent", "›") : " ";
-      const status = this.theme.fg(active ? "accent" : "muted", getStatusLabel(file, this.state.activeScope));
+      const relationMarker = getRelatedFileMarker(file, relationSource, this.state.activeScope);
+      const related = relationMarker != null;
+      const prefix = active ? this.theme.fg("accent", "›") : related ? this.theme.fg("accent", relationMarker) : " ";
+      const status = this.theme.fg(active || related ? "accent" : "muted", getStatusLabel(file, this.state.activeScope));
       const count = getFileCommentCount(this.state, file.id, this.state.activeScope);
-      const marker = count > 0 ? this.theme.fg("success", ` ${count}●`) : this.theme.fg("dim", "  ·");
+      const changeMarker = getChangeCountLabel(this.theme, file, this.state.activeScope);
+      const commentMarker = count > 0 ? this.theme.fg("success", ` ${count}●`) : this.theme.fg("dim", "  ·");
       const prefixText = `${prefix} ${status} `;
-      const pathWidth = Math.max(1, width - 6 - visibleWidth(prefixText) - visibleWidth(marker));
+      const pathWidth = Math.max(1, width - 2 - visibleWidth(prefixText) - visibleWidth(changeMarker) - visibleWidth(commentMarker));
       const shortenedPath = shortenNavigatorPath(file.path, pathWidth);
       const pathText = active
         ? this.theme.fg("accent", shortenedPath)
-        : this.theme.fg("text", shortenedPath);
-      lines.push(`${prefixText}${pathText}${marker}`);
+        : related
+          ? this.theme.fg("accent", shortenedPath)
+          : this.theme.fg("text", shortenedPath);
+      lines.push(`${prefixText}${pathText}${changeMarker}${commentMarker}`);
     }
 
     return renderBox("Navigator", width, height, this.theme, lines, this.state.focus === "navigator");
@@ -1207,7 +1311,7 @@ class ReviewApp {
     lines.push(this.theme.fg("muted", "? toggle help • Esc close"));
     lines.push("");
     lines.push(this.theme.fg("warning", "Keys"));
-    lines.push(this.theme.fg("muted", "1/2/3 scope • Tab focus • / shortcuts/search • s submit"));
+    lines.push(this.theme.fg("muted", "1/2/3 scope • Tab focus • / shortcuts/search • r related • s submit"));
     lines.push(this.theme.fg("muted", "f line fix • d/c line discuss • e edit line • x delete line"));
     lines.push(this.theme.fg("muted", "Ctrl+d/u half-page • o open in $EDITOR • l file • a all • n/p hunks"));
     lines.push("");
@@ -1383,7 +1487,7 @@ class ReviewApp {
 
     const footer = [
       truncateToWidth(this.theme.fg("dim", promptStatus), frameInnerWidth, "…", false),
-      truncateToWidth(this.theme.fg("dim", "navigator: ↑↓ files, Ctrl+d/u half-page • diff: ↑↓ lines, Ctrl+d/u half-page, / shortcuts, o open in $EDITOR, f fix line, d/c discuss line, e edit, x delete, l file, a all, n/p hunks • comments: ↑↓ comments, Ctrl+d/u half-page, e edit, d delete • editor: Tab toggle intent, Enter save, Shift+Enter newline • ? help • w wrap • u toggle unchanged"), frameInnerWidth, "…", false),
+      truncateToWidth(this.theme.fg("dim", "navigator: ↑↓ files, Ctrl+d/u half-page, r related filter • diff: ↑↓ lines, Ctrl+d/u half-page, / shortcuts, o open in $EDITOR, f fix line, d/c discuss line, e edit, x delete, l file, a all, n/p hunks • comments: ↑↓ comments, Ctrl+d/u half-page, e edit, d delete • editor: Tab toggle intent, Enter save, Shift+Enter newline • ? help • w wrap • u toggle unchanged"), frameInnerWidth, "…", false),
     ];
 
     return renderOuterFrame(this.lastWidth, totalHeight, this.theme, "slopchop", [...headerLines, ...body, ...footer], frameColor);

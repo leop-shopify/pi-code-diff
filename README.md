@@ -68,6 +68,8 @@ ctrl+alt+s
    - otherwise `all files` if the current branch differs from the default branch
    - otherwise `last commit` if there is a reviewable last commit
    - otherwise `all files` as a current-file fallback
+
+   In the branch-level `all files` scope, files are ordered for review priority: changed files referenced by more other changed files come first, then modified/renamed before added before deleted, then source files before tests/docs/changesets, then path order. The navigator can filter to files related to the active file with `r`. In related mode, `→` means the active file references that file, `←` means that file references the active file, and `↔` means both. Press `r` again to return to all files.
 3. Move to the file and line you care about
 4. Add annotations:
    - `f` for a line annotation with `FIX` preselected
@@ -171,6 +173,8 @@ That keeps pure discussion prompts strict, and avoids unnecessary instructions w
 
 - `↑↓` or `j/k` — move between files
 - `Ctrl+d` / `Ctrl+u` — move down / up by half a pane
+- `r` — toggle related-files filter in `all files` scope
+- file rows show change counts as `+added -deleted`
 - `Enter` — move focus to diff
 
 #### Diff

@@ -6,6 +6,7 @@ import {
   getFileComment,
   getFilteredFiles,
   getLineComment,
+  getScopedFiles,
   moveActiveFile,
   setScope,
   setSearchQuery,
@@ -43,6 +44,36 @@ describe("review state", () => {
       makeFile("src/a.ts", { inGitDiff: false, inAllFiles: true }),
       makeFile("src/b.ts", { inGitDiff: false, inLastCommit: true }),
     ])).toBe("all-files");
+  });
+
+  it("orders all-files changes by review priority", () => {
+    const makeAllFile = (path: string, status: "modified" | "added" | "deleted", references = 0) => makeFile(path, {
+      inGitDiff: false,
+      inAllFiles: true,
+      allFilesReferenceCount: references,
+      allFiles: {
+        status,
+        oldPath: status === "added" ? null : path,
+        newPath: status === "deleted" ? null : path,
+        displayPath: path,
+        hasOriginal: status !== "added",
+        hasModified: status !== "deleted",
+      },
+    });
+
+    const files = [
+      makeAllFile("docs/readme.md", "added"),
+      makeAllFile("src/new.ts", "added"),
+      makeAllFile("src/feature.ts", "modified"),
+      makeAllFile("src/root.ts", "added", 2),
+    ];
+
+    expect(getScopedFiles(files, "all-files").map((file) => file.path)).toEqual([
+      "src/root.ts",
+      "src/feature.ts",
+      "src/new.ts",
+      "docs/readme.md",
+    ]);
   });
 
   it("switches scopes and keeps selection valid", () => {

@@ -1,5 +1,5 @@
 import { readFile } from "node:fs/promises";
-import { extname, join } from "node:path";
+import { extname, join, posix } from "node:path";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import type { ChangeStatus, ReviewFile, ReviewFileComparison, ReviewFileContents, ReviewScope } from "./types.js";
 
@@ -7,6 +7,11 @@ export interface ChangedPath {
   status: ChangeStatus;
   oldPath: string | null;
   newPath: string | null;
+}
+
+export interface ChangeStats {
+  additions: number;
+  deletions: number;
 }
 
 interface ReviewFileSeed {
@@ -19,6 +24,9 @@ interface ReviewFileSeed {
   gitDiff: ReviewFileComparison | null;
   lastCommit: ReviewFileComparison | null;
   allFiles: ReviewFileComparison | null;
+  allFilesReferenceCount: number;
+  allFilesOutgoingReferences: string[];
+  allFilesIncomingReferences: string[];
 }
 
 async function runGit(pi: ExtensionAPI, repoRoot: string, args: string[]): Promise<string> {
@@ -125,6 +133,43 @@ function uniquePaths(paths: string[]): string[] {
   return [...new Set(paths)];
 }
 
+function parseStatCount(value: string | undefined): number {
+  if (value == null || value === "-") return 0;
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function normalizeNumStatPath(path: string): string {
+  if (!path.includes(" => ")) return path;
+  const expanded = path.replace(/\{[^{}]* => ([^{}]*)\}/g, "$1");
+  if (!expanded.includes(" => ")) return expanded;
+  return expanded.split(" => ").pop() ?? expanded;
+}
+
+export function parseNumStat(output: string): Map<string, ChangeStats> {
+  const stats = new Map<string, ChangeStats>();
+
+  for (const line of output.split(/\r?\n/)) {
+    if (line.trim().length === 0) continue;
+    const parts = line.split("\t");
+    const rawPath = parts.slice(2).join("\t");
+    if (rawPath.length === 0) continue;
+    stats.set(normalizeGitPath(normalizeNumStatPath(rawPath)), {
+      additions: parseStatCount(parts[0]),
+      deletions: parseStatCount(parts[1]),
+    });
+  }
+
+  return stats;
+}
+
+function countContentLines(content: string): number {
+  if (content.length === 0) return 0;
+  const lines = content.split(/\r?\n/);
+  if (lines[lines.length - 1] === "") lines.pop();
+  return lines.length;
+}
+
 function toDisplayPath(change: ChangedPath): string {
   if (change.status === "renamed") {
     return `${change.oldPath ?? ""} -> ${change.newPath ?? ""}`;
@@ -132,7 +177,7 @@ function toDisplayPath(change: ChangedPath): string {
   return change.newPath ?? change.oldPath ?? "(unknown)";
 }
 
-function toComparison(change: ChangedPath): ReviewFileComparison {
+function toComparison(change: ChangedPath, stats?: ChangeStats): ReviewFileComparison {
   return {
     status: change.status,
     oldPath: change.oldPath,
@@ -140,6 +185,8 @@ function toComparison(change: ChangedPath): ReviewFileComparison {
     displayPath: toDisplayPath(change),
     hasOriginal: change.oldPath != null,
     hasModified: change.newPath != null,
+    additions: stats?.additions,
+    deletions: stats?.deletions,
   };
 }
 
@@ -165,6 +212,9 @@ function createReviewFile(seed: ReviewFileSeed): ReviewFile {
     gitDiff: seed.gitDiff,
     lastCommit: seed.lastCommit,
     allFiles: seed.allFiles,
+    allFilesReferenceCount: seed.allFilesReferenceCount,
+    allFilesOutgoingReferences: seed.allFilesOutgoingReferences,
+    allFilesIncomingReferences: seed.allFilesIncomingReferences,
   };
 }
 
@@ -235,6 +285,109 @@ export function isReviewableFilePath(path: string): boolean {
   return true;
 }
 
+function normalizeGitPath(path: string): string {
+  return posix.normalize(path).replace(/^\.\//, "");
+}
+
+function getChangeKey(change: ChangedPath): string {
+  return change.newPath ?? change.oldPath ?? toDisplayPath(change);
+}
+
+function getImportAliases(path: string): string[] {
+  const normalized = normalizeGitPath(path);
+  const aliases = [normalized];
+  const extension = posix.extname(normalized);
+
+  if (extension.length > 0) {
+    aliases.push(normalized.slice(0, -extension.length));
+  }
+
+  const directory = posix.dirname(normalized);
+  const basename = posix.basename(normalized, extension);
+  if (basename === "index" && directory !== ".") {
+    aliases.push(directory);
+  }
+
+  return aliases;
+}
+
+function extractImportSpecifiers(content: string): string[] {
+  const specifiers: string[] = [];
+  const patterns = [
+    /\b(?:import|export)\s+(?:type\s+)?(?:[^"']*?\s+from\s+)?["']([^"']+)["']/g,
+    /\b(?:import|require)\s*\(\s*["']([^"']+)["']\s*\)/g,
+  ];
+
+  for (const pattern of patterns) {
+    for (const match of content.matchAll(pattern)) {
+      const specifier = match[1];
+      if (specifier != null) specifiers.push(specifier);
+    }
+  }
+
+  return specifiers;
+}
+
+function resolveRelativeImport(sourcePath: string, specifier: string, aliases: Map<string, string>): string | null {
+  if (!specifier.startsWith(".")) return null;
+  const resolved = normalizeGitPath(posix.join(posix.dirname(sourcePath), specifier));
+  return aliases.get(resolved) ?? null;
+}
+
+export interface ChangedFileReferenceGraph {
+  counts: Map<string, number>;
+  outgoing: Map<string, string[]>;
+  incoming: Map<string, string[]>;
+}
+
+export function getChangedFileReferenceGraph(changes: ChangedPath[], contentsByPath: Map<string, string>): ChangedFileReferenceGraph {
+  const paths = changes.map(getChangeKey).map(normalizeGitPath);
+  const pathSet = new Set(paths);
+  const aliases = new Map<string, string>();
+  const counts = new Map<string, number>(paths.map((path) => [path, 0]));
+  const outgoingSets = new Map<string, Set<string>>(paths.map((path) => [path, new Set<string>()]));
+  const incomingSets = new Map<string, Set<string>>(paths.map((path) => [path, new Set<string>()]));
+
+  for (const path of paths) {
+    for (const alias of getImportAliases(path)) {
+      if (!aliases.has(alias)) aliases.set(alias, path);
+    }
+  }
+
+  for (const change of changes) {
+    if (change.newPath == null) continue;
+    const sourcePath = normalizeGitPath(change.newPath);
+    const content = contentsByPath.get(sourcePath) ?? contentsByPath.get(change.newPath) ?? "";
+    const referencedPaths = new Set<string>();
+
+    for (const specifier of extractImportSpecifiers(content)) {
+      const referencedPath = resolveRelativeImport(sourcePath, specifier, aliases);
+      if (referencedPath == null || referencedPath === sourcePath || !pathSet.has(referencedPath)) continue;
+      referencedPaths.add(referencedPath);
+    }
+
+    for (const referencedPath of referencedPaths) {
+      counts.set(referencedPath, (counts.get(referencedPath) ?? 0) + 1);
+      outgoingSets.get(sourcePath)?.add(referencedPath);
+      incomingSets.get(referencedPath)?.add(sourcePath);
+    }
+  }
+
+  const toSortedArrays = (map: Map<string, Set<string>>): Map<string, string[]> => new Map(
+    [...map.entries()].map(([path, relatedPaths]) => [path, [...relatedPaths].sort((a, b) => a.localeCompare(b))]),
+  );
+
+  return {
+    counts,
+    outgoing: toSortedArrays(outgoingSets),
+    incoming: toSortedArrays(incomingSets),
+  };
+}
+
+export function getChangedFileReferenceCounts(changes: ChangedPath[], contentsByPath: Map<string, string>): Map<string, number> {
+  return getChangedFileReferenceGraph(changes, contentsByPath).counts;
+}
+
 function compareReviewFiles(a: ReviewFile, b: ReviewFile): number {
   return a.path.localeCompare(b.path);
 }
@@ -258,6 +411,9 @@ function createSeed(path: string, hasWorkingTreeFile: boolean): ReviewFileSeed {
     gitDiff: null,
     lastCommit: null,
     allFiles: null,
+    allFilesReferenceCount: 0,
+    allFilesOutgoingReferences: [],
+    allFilesIncomingReferences: [],
   };
 }
 
@@ -291,18 +447,36 @@ export async function getReviewWindowData(pi: ExtensionAPI, cwd: string): Promis
   const trackedDiffOutput = repositoryHasHead
     ? await runGit(pi, repoRoot, ["diff", "--find-renames", "-M", "--name-status", "HEAD", "--"])
     : "";
+  const worktreeNumStatOutput = repositoryHasHead
+    ? await runGitAllowFailure(pi, repoRoot, ["diff", "--find-renames", "-M", "--numstat", "HEAD", "--"])
+    : "";
   const untrackedOutput = await runGitAllowFailure(pi, repoRoot, ["ls-files", "--others", "--exclude-standard"]);
   const trackedFilesOutput = await runGitAllowFailure(pi, repoRoot, ["ls-files", "--cached"]);
   const deletedFilesOutput = await runGitAllowFailure(pi, repoRoot, ["ls-files", "--deleted"]);
   const lastCommitOutput = repositoryHasHead
     ? await runGitAllowFailure(pi, repoRoot, ["diff-tree", "--root", "--find-renames", "-M", "--name-status", "--no-commit-id", "-r", "HEAD"])
     : "";
+  const lastCommitNumStatOutput = repositoryHasHead
+    ? await runGitAllowFailure(pi, repoRoot, ["diff-tree", "--root", "--find-renames", "-M", "--numstat", "--no-commit-id", "-r", "HEAD"])
+    : "";
   const branchBaseRevision = repositoryHasHead ? await getBranchBaseRevision(pi, repoRoot) : null;
   const branchDiffOutput = branchBaseRevision == null
     ? ""
     : await runGitAllowFailure(pi, repoRoot, ["diff", "--find-renames", "-M", "--name-status", branchBaseRevision, "HEAD", "--"]);
+  const branchNumStatOutput = branchBaseRevision == null
+    ? ""
+    : await runGitAllowFailure(pi, repoRoot, ["diff", "--find-renames", "-M", "--numstat", branchBaseRevision, "HEAD", "--"]);
 
-  const worktreeChanges = mergeChangedPaths(parseNameStatus(trackedDiffOutput), parseUntrackedPaths(untrackedOutput))
+  const untrackedChanges = parseUntrackedPaths(untrackedOutput);
+  const worktreeStats = parseNumStat(worktreeNumStatOutput);
+  await Promise.all(untrackedChanges.map(async (change) => {
+    if (change.newPath == null) return;
+    const content = await getWorkingTreeContent(repoRoot, change.newPath);
+    worktreeStats.set(normalizeGitPath(change.newPath), { additions: countContentLines(content), deletions: 0 });
+  }));
+  const lastCommitStats = parseNumStat(lastCommitNumStatOutput);
+  const branchStats = parseNumStat(branchNumStatOutput);
+  const worktreeChanges = mergeChangedPaths(parseNameStatus(trackedDiffOutput), untrackedChanges)
     .filter((change) => isReviewableFilePath(change.newPath ?? change.oldPath ?? ""));
   const deletedPaths = new Set(parseTrackedPaths(deletedFilesOutput));
   const currentPaths = uniquePaths([...parseTrackedPaths(trackedFilesOutput), ...parseTrackedPaths(untrackedOutput)])
@@ -313,30 +487,39 @@ export async function getReviewWindowData(pi: ExtensionAPI, cwd: string): Promis
     .filter((change) => isReviewableFilePath(change.newPath ?? change.oldPath ?? ""));
   const branchChanges = parseNameStatus(branchDiffOutput)
     .filter((change) => isReviewableFilePath(change.newPath ?? change.oldPath ?? ""));
+  const branchContentsByPath = new Map<string, string>();
+  await Promise.all(branchChanges.map(async (change) => {
+    if (change.newPath == null) return;
+    branchContentsByPath.set(normalizeGitPath(change.newPath), await getWorkingTreeContent(repoRoot, change.newPath));
+  }));
+  const branchReferenceGraph = getChangedFileReferenceGraph(branchChanges, branchContentsByPath);
 
   const seeds = new Map<string, ReviewFileSeed>();
 
   for (const change of worktreeChanges) {
-    const key = change.newPath ?? change.oldPath ?? toDisplayPath(change);
+    const key = getChangeKey(change);
     const seed = upsertSeed(seeds, key, () => createSeed(key, change.newPath != null));
     seed.worktreeStatus = change.status;
     seed.hasWorkingTreeFile = change.newPath != null;
     seed.inGitDiff = true;
-    seed.gitDiff = toComparison(change);
+    seed.gitDiff = toComparison(change, worktreeStats.get(normalizeGitPath(key)));
   }
 
   for (const change of branchChanges) {
-    const key = change.newPath ?? change.oldPath ?? toDisplayPath(change);
+    const key = getChangeKey(change);
     const seed = upsertSeed(seeds, key, () => createSeed(key, change.newPath != null && currentPathSet.has(change.newPath)));
     seed.inAllFiles = true;
-    seed.allFiles = toComparison(change);
+    seed.allFiles = toComparison(change, branchStats.get(normalizeGitPath(key)));
+    seed.allFilesReferenceCount = branchReferenceGraph.counts.get(normalizeGitPath(key)) ?? 0;
+    seed.allFilesOutgoingReferences = branchReferenceGraph.outgoing.get(normalizeGitPath(key)) ?? [];
+    seed.allFilesIncomingReferences = branchReferenceGraph.incoming.get(normalizeGitPath(key)) ?? [];
   }
 
   for (const change of lastCommitChanges) {
-    const key = change.newPath ?? change.oldPath ?? toDisplayPath(change);
+    const key = getChangeKey(change);
     const seed = upsertSeed(seeds, key, () => createSeed(key, change.newPath != null && currentPathSet.has(change.newPath)));
     seed.inLastCommit = true;
-    seed.lastCommit = toComparison(change);
+    seed.lastCommit = toComparison(change, lastCommitStats.get(normalizeGitPath(key)));
   }
 
   if (seeds.size === 0) {

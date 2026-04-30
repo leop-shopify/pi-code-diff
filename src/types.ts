@@ -9,6 +9,8 @@ export interface ReviewFileComparison {
   displayPath: string;
   hasOriginal: boolean;
   hasModified: boolean;
+  additions?: number;
+  deletions?: number;
 }
 
 export interface ReviewFile {
@@ -22,6 +24,9 @@ export interface ReviewFile {
   gitDiff: ReviewFileComparison | null;
   lastCommit: ReviewFileComparison | null;
   allFiles: ReviewFileComparison | null;
+  allFilesReferenceCount?: number;
+  allFilesOutgoingReferences?: string[];
+  allFilesIncomingReferences?: string[];
 }
 
 export interface ReviewFileContents {

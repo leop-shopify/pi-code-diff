@@ -1,6 +1,23 @@
 import { describe, expect, it } from "vitest";
 import { buildStructuredDiff } from "../diff.js";
-import { buildDisplayRows, buildEditorLaunchCommand, getEditorLineForTarget, getHalfPageStep } from "../ui/review-app.js";
+import type { ReviewFile } from "../types.js";
+import { buildDisplayRows, buildEditorLaunchCommand, getEditorLineForTarget, getHalfPageStep, getRelatedFileMarker, getRelatedFilePaths } from "../ui/review-app.js";
+
+function makeFile(path: string, flags?: Partial<ReviewFile>): ReviewFile {
+  return {
+    id: path,
+    path,
+    worktreeStatus: null,
+    hasWorkingTreeFile: true,
+    inGitDiff: false,
+    inLastCommit: false,
+    inAllFiles: true,
+    gitDiff: null,
+    lastCommit: null,
+    allFiles: null,
+    ...flags,
+  };
+}
 
 describe("buildDisplayRows", () => {
   it("keeps deleted and added rows independently commentable when line numbers overlap", () => {
@@ -37,6 +54,29 @@ describe("getHalfPageStep", () => {
     expect(getHalfPageStep(1)).toBe(1);
     expect(getHalfPageStep(9)).toBe(4);
     expect(getHalfPageStep(10)).toBe(5);
+  });
+});
+
+describe("related navigator helpers", () => {
+  it("marks incoming, outgoing, and bidirectional related files", () => {
+    const active = makeFile("src/active.ts", {
+      allFilesOutgoingReferences: ["src/out.ts", "src/both.ts"],
+      allFilesIncomingReferences: ["src/in.ts", "src/both.ts"],
+    });
+
+    expect(getRelatedFileMarker(makeFile("src/out.ts"), active, "all-files")).toBe("→");
+    expect(getRelatedFileMarker(makeFile("src/in.ts"), active, "all-files")).toBe("←");
+    expect(getRelatedFileMarker(makeFile("src/both.ts"), active, "all-files")).toBe("↔");
+    expect(getRelatedFileMarker(makeFile("src/other.ts"), active, "all-files")).toBeNull();
+  });
+
+  it("combines incoming and outgoing related file paths", () => {
+    const active = makeFile("src/active.ts", {
+      allFilesOutgoingReferences: ["src/out.ts", "src/both.ts"],
+      allFilesIncomingReferences: ["src/in.ts", "src/both.ts"],
+    });
+
+    expect([...getRelatedFilePaths(active)].sort()).toEqual(["src/both.ts", "src/in.ts", "src/out.ts"]);
   });
 });
 
