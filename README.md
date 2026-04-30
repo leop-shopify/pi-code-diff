@@ -166,6 +166,7 @@ That keeps pure discussion prompts strict, and avoids unnecessary instructions w
 - `?` — toggle help in the right sidebar
 - `w` — toggle wrapping
 - `u` — toggle unchanged context in diff scopes
+- `h` — hide/show the comments pane
 - `s` — insert the generated prompt into the editor
 - `Esc` — cancel the review
 

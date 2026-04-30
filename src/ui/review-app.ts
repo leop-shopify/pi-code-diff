@@ -122,6 +122,24 @@ export function getHalfPageStep(visibleRows: number): number {
   return Math.max(1, Math.floor(visibleRows / 2));
 }
 
+export function getPaneLayout(frameInnerWidth: number, commentsHidden: boolean): { navigatorWidth: number; diffWidth: number; commentsWidth: number } {
+  const navigatorWidth = Math.max(24, Math.min(36, Math.floor(frameInnerWidth * 0.26)));
+  if (commentsHidden) {
+    return {
+      navigatorWidth,
+      diffWidth: Math.max(24, frameInnerWidth - navigatorWidth - 1),
+      commentsWidth: 0,
+    };
+  }
+
+  const commentsWidth = Math.max(24, Math.min(36, Math.floor(frameInnerWidth * 0.27)));
+  return {
+    navigatorWidth,
+    commentsWidth,
+    diffWidth: Math.max(24, frameInnerWidth - navigatorWidth - commentsWidth - 2),
+  };
+}
+
 type RelatedFileMarker = "→" | "←" | "↔";
 
 export function getRelatedFilePaths(file: ReviewFile | null): Set<string> {
@@ -404,6 +422,7 @@ class ReviewApp {
   private searchBuffer = "";
   private shortcutMode = false;
   private helpMode = false;
+  private commentsHidden = false;
   private externalEditorOpen = false;
   private editTarget: EditTarget | null = null;
   private editor: Editor;
@@ -626,6 +645,7 @@ class ReviewApp {
   }
 
   private openEditor(target: EditTarget): void {
+    this.commentsHidden = false;
     this.editTarget = target;
     this.editor.setText(target.initialBody);
     this.syncCursorMode();
@@ -900,6 +920,7 @@ class ReviewApp {
       this.requestRender();
       return;
     }
+    this.commentsHidden = false;
     this.helpMode = false;
     this.shortcutMode = true;
     this.requestRender();
@@ -912,6 +933,28 @@ class ReviewApp {
 
   private toggleHelpMode(): void {
     this.helpMode = !this.helpMode;
+    if (this.helpMode) this.commentsHidden = false;
+    this.requestRender();
+  }
+
+  private toggleCommentsPane(): void {
+    this.commentsHidden = !this.commentsHidden;
+    if (this.commentsHidden) this.helpMode = false;
+    if (this.commentsHidden && this.state.focus === "comments") {
+      this.state = setFocus(this.state, "diff");
+    }
+    this.requestRender();
+  }
+
+  private cycleVisibleFocus(backward = false): void {
+    if (!this.commentsHidden) {
+      this.state = backward ? cycleFocusBackward(this.state) : cycleFocus(this.state);
+      this.requestRender();
+      return;
+    }
+
+    const nextFocus = this.state.focus === "navigator" ? "diff" : "navigator";
+    this.state = setFocus(this.state, nextFocus);
     this.requestRender();
   }
 
@@ -1055,9 +1098,10 @@ class ReviewApp {
     if (data === "1") { this.setScope("git-diff"); return; }
     if (data === "2") { this.setScope("last-commit"); return; }
     if (data === "3") { this.setScope("all-files"); return; }
-    if (matchesKey(data, Key.shift("tab"))) { this.state = cycleFocusBackward(this.state); this.requestRender(); return; }
-    if (matchesKey(data, Key.tab)) { this.state = cycleFocus(this.state); this.requestRender(); return; }
+    if (matchesKey(data, Key.shift("tab"))) { this.cycleVisibleFocus(true); return; }
+    if (matchesKey(data, Key.tab)) { this.cycleVisibleFocus(); return; }
     if (matchesKey(data, Key.escape)) { this.cancel(); return; }
+    if (data === "h") { this.toggleCommentsPane(); return; }
     if (data === "w") { this.state = setWrapLines(this.state, !this.state.wrapLines); this.requestRender(); return; }
     if (data === "u") { this.state = toggleHideUnchanged(this.state); this.ensureLineSelection(); this.requestRender(); return; }
     if (data === "s") { this.submit(); return; }
@@ -1311,7 +1355,7 @@ class ReviewApp {
     lines.push(this.theme.fg("muted", "? toggle help • Esc close"));
     lines.push("");
     lines.push(this.theme.fg("warning", "Keys"));
-    lines.push(this.theme.fg("muted", "1/2/3 scope • Tab focus • / shortcuts/search • r related • s submit"));
+    lines.push(this.theme.fg("muted", "1/2/3 scope • Tab focus • / shortcuts/search • r related • h comments • s submit"));
     lines.push(this.theme.fg("muted", "f line fix • d/c line discuss • e edit line • x delete line"));
     lines.push(this.theme.fg("muted", "Ctrl+d/u half-page • o open in $EDITOR • l file • a all • n/p hunks"));
     lines.push("");
@@ -1451,9 +1495,7 @@ class ReviewApp {
     const frameInnerWidth = Math.max(40, this.lastWidth - 2 - MODAL_INNER_PADDING_X * 2);
     const frameInnerHeight = Math.max(10, totalHeight - 2 - MODAL_INNER_PADDING_Y * 2);
     const bodyHeight = Math.max(6, frameInnerHeight - 5);
-    const navigatorWidth = Math.max(24, Math.min(36, Math.floor(frameInnerWidth * 0.26)));
-    const commentsWidth = Math.max(24, Math.min(36, Math.floor(frameInnerWidth * 0.27)));
-    const diffWidth = Math.max(24, frameInnerWidth - navigatorWidth - commentsWidth - 2);
+    const { navigatorWidth, diffWidth, commentsWidth } = getPaneLayout(frameInnerWidth, this.commentsHidden);
 
     const promptStatus = this.shortcutMode
       ? "Shortcut mode • choose from the right panel • Esc cancel"
@@ -1463,7 +1505,7 @@ class ReviewApp {
           ? `Search: ${this.searchBuffer}`
           : this.editTarget != null
             ? `Editing ${formatIntentLabel(this.editTarget.intent).toLowerCase()} comment`
-            : "Tab focus • / search • ? help • 1/2/3 scopes • o open • s submit • Esc cancel");
+            : `Tab focus • / search • ? help • 1/2/3 scopes • h ${this.commentsHidden ? "show" : "hide"} comments • o open • s submit • Esc cancel`);
 
     const scopeTabs = SEARCHABLE_SCOPES.map((scope, index) => {
       const active = this.state.activeScope === scope;
@@ -1478,16 +1520,18 @@ class ReviewApp {
 
     const navigator = this.renderNavigator(navigatorWidth, bodyHeight);
     const diff = this.renderDiff(diffWidth, bodyHeight);
-    const comments = this.renderComments(commentsWidth, bodyHeight);
+    const comments = this.commentsHidden ? [] : this.renderComments(commentsWidth, bodyHeight);
     const body: string[] = [];
 
     for (let i = 0; i < bodyHeight; i += 1) {
-      body.push(`${navigator[i] ?? ""} ${diff[i] ?? ""} ${comments[i] ?? ""}`);
+      body.push(this.commentsHidden
+        ? `${navigator[i] ?? ""} ${diff[i] ?? ""}`
+        : `${navigator[i] ?? ""} ${diff[i] ?? ""} ${comments[i] ?? ""}`);
     }
 
     const footer = [
       truncateToWidth(this.theme.fg("dim", promptStatus), frameInnerWidth, "…", false),
-      truncateToWidth(this.theme.fg("dim", "navigator: ↑↓ files, Ctrl+d/u half-page, r related filter • diff: ↑↓ lines, Ctrl+d/u half-page, / shortcuts, o open in $EDITOR, f fix line, d/c discuss line, e edit, x delete, l file, a all, n/p hunks • comments: ↑↓ comments, Ctrl+d/u half-page, e edit, d delete • editor: Tab toggle intent, Enter save, Shift+Enter newline • ? help • w wrap • u toggle unchanged"), frameInnerWidth, "…", false),
+      truncateToWidth(this.theme.fg("dim", "navigator: ↑↓ files, Ctrl+d/u half-page, r related filter • diff: ↑↓ lines, Ctrl+d/u half-page, / shortcuts, o open in $EDITOR, f fix line, d/c discuss line, e edit, x delete, l file, a all, n/p hunks • comments: h hide/show, ↑↓ comments, Ctrl+d/u half-page, e edit, d delete • editor: Tab toggle intent, Enter save, Shift+Enter newline • ? help • w wrap • u toggle unchanged"), frameInnerWidth, "…", false),
     ];
 
     return renderOuterFrame(this.lastWidth, totalHeight, this.theme, "slopchop", [...headerLines, ...body, ...footer], frameColor);
