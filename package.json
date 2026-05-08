@@ -47,11 +47,11 @@
     "test": "vitest run"
   },
   "dependencies": {
+    "@earendil-works/pi-tui": "*",
     "diff": "^8.0.2"
   },
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": "*",
-    "@earendil-works/pi-tui": "*"
+    "@earendil-works/pi-coding-agent": "*"
   },
   "devDependencies": {
     "@types/node": "^24.5.2",
