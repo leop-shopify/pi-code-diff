@@ -1,22 +1,25 @@
 # pi-code-diff
 
-`/diff`, `/code`, and `/code-diff` open a terminal-native review and annotation surface for Pi.
+`/diff`, `/code`, and `/code-diff` open an interactive code diff editor for Pi with comments, editable line suggestions, AI-assisted review handoff, GitHub PR submission support, and local or remote diff review.
 
 It is inspired by Mario Zechner's [pi-diff-review](https://github.com/badlogic/pi-diff-review).
 
-It lets you stop after an agent turn, walk the diff inside Pi, add fast line/file/whole-change annotations, and send that feedback back to the agent as a clean prompt in the editor.
+It lets you stop after an agent turn, walk a local diff or remote PR inside Pi, add fast line/file/whole-change annotations, and route the result either back to the agent or into a GitHub PR review.
 
-The goal is simple: keep terminal-based review within Pi, keep annotations precise, and make it easy to separate edits you want applied from comments you want posted and things you want explained.
+The goal is simple: keep terminal-based code review inside Pi, keep annotations precise, and make it easy to separate edits you want applied from comments you want posted and things you want explained.
 
 ## Summary
 
-Use `/diff`, `/code`, or `/code-diff` when you want to review and annotate work before sending the agent another turn.
+Use `/diff`, `/code`, or `/code-diff` when you want to review and annotate code changes before sending the agent another turn or posting GitHub PR feedback.
 
-It supports three review scopes:
+It supports local and remote review modes:
 
 - `git diff`
 - `last commit`
 - `all files`
+- custom `base..head` / `base...head` ranges
+- remote branches
+- GitHub or stack-host PR URLs
 
 Inside the review UI you can:
 
@@ -29,9 +32,10 @@ Inside the review UI you can:
   - `DISCUSS` — the agent explains, justifies, or proposes; it never edits code or touches GitHub to satisfy the note
   - `COMMENT` — a real GitHub PR comment when the review is remote; for a local review it becomes a local comment to the agent about the change
   - `MODIFY` — an exact edit you make in place on the line; the agent applies it locally
-- insert the resulting review prompt into Pi’s editor
+- insert the resulting local review prompt into Pi’s editor
+- for GitHub PR reviews, send a structured handoff to the agent so it can grammar-check comments, ask for confirmation, and call Pi's GitHub review submission tool
 
-The review UI does **not** auto-send the prompt. It stages the next message for you.
+For local reviews, the UI stages the next message for you. For GitHub PR verdicts, the UI sends the review-submission handoff to the agent automatically after you choose the verdict.
 
 ## Quickstart
 
@@ -142,12 +146,14 @@ When the review is a GitHub PR, finishing the review opens an end-action menu:
 - `Comment`
 - `Send feedback to the agent (no GitHub post)`
 
-The three GitHub verdicts go through a deliberate, gated path so nothing is posted by accident:
+The three GitHub verdicts use an agent-mediated submission flow:
 
-1. You pick a verdict and confirm it in a UI dialog. Nothing is posted yet.
-2. After confirmation, pi-code-diff submits the review directly through `provider-cli api repos/:owner/:repo/pulls/:number/reviews`.
-3. `COMMENT` line items are posted as GitHub inline comments (path, line, and side; `RIGHT` for added lines, `LEFT` for deleted, with `start_line` for ranges). `MODIFY` line edits are posted as inline comments containing a suggested diff. `COMMENT` file items and review-wide `COMMENT` notes become the review body. `DISCUSS` items are never sent to GitHub.
-4. Approval refuses self-approval with a clear message, and `request changes` requires a body or at least one inline comment.
+1. You pick a verdict in the review UI.
+2. pi-code-diff sends the agent a structured submission handoff with the exact repo, PR number, commit, file paths, lines, sides, verdict, body, and inline comments.
+3. The agent must not inspect code or change review locations. It only fixes grammar, spelling, capitalization, and punctuation in the supplied review text.
+4. The agent asks you to approve/edit/skip each changed text item. Approving an item is the confirmation to submit that item; after the last item is resolved, the agent calls `submit_pr_review` without a second confirmation.
+5. `COMMENT` line items are posted as GitHub inline comments. `MODIFY` line edits are posted as inline comments containing a suggested diff. `COMMENT` file items and review-wide `COMMENT` notes become the review body. `DISCUSS` items are never sent to GitHub.
+6. Approval refuses self-approval with a clear message, and `request changes` requires a body or at least one inline comment.
 
 `Send feedback to the agent` skips GitHub entirely and inserts the normal local review prompt instead, so the agent can answer or ask follow-up questions.
 
