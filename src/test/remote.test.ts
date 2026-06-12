@@ -34,6 +34,7 @@ describe("remote review helpers", () => {
   });
 
   it("resolves same-repo GitHub PRs to fetched base and head refs", async () => {
+    const fetchCalls: string[][] = [];
     const exec = vi.fn(async (command: string, args: string[]) => {
       if (command === "gh" && args[0] === "pr" && args[1] === "view") {
         return {
@@ -56,17 +57,67 @@ describe("remote review helpers", () => {
         };
       }
 
-      if (command === "git" && args[1] === "fetch") return { code: 0, stdout: "", stderr: "", killed: false };
+      if (command === "git" && args[0] === "merge-base") return { code: 0, stdout: "merge-base-sha\n", stderr: "", killed: false };
+      if (command === "git" && args[1] === "fetch") {
+        fetchCalls.push(args);
+        return { code: 0, stdout: "", stderr: "", killed: false };
+      }
       return { code: 1, stdout: "", stderr: `unexpected ${command} ${args.join(" ")}`, killed: false };
     });
 
     await expect(resolveRemoteReviewTarget({ exec } as never, "/repo", "https://github.com/example/widgets/pull/123", "/repo")).resolves.toMatchObject({
       gitRoot: "/repo",
-      baseRef: "origin/main",
+      baseRef: "merge-base-sha",
       headRef: "origin/feature/review",
       branch: "feature/review",
       pullRequest: { number: "123", headRefOid: "abc123" },
     });
+    expect(fetchCalls[0]).toContain("+refs/heads/main:refs/remotes/origin/main");
+    expect(fetchCalls[0]).toContain("+refs/heads/feature/review:refs/remotes/origin/feature/review");
+  });
+
+  it("falls back to GitHub pull refs when a local origin cannot fetch the PR branch", async () => {
+    const fetchCalls: string[][] = [];
+    const exec = vi.fn(async (command: string, args: string[]) => {
+      if (command === "gh" && args[0] === "pr" && args[1] === "view") {
+        return {
+          code: 0,
+          stdout: JSON.stringify({
+            title: "Add review mode",
+            body: "Body",
+            additions: 10,
+            deletions: 4,
+            changedFiles: 3,
+            author: { login: "leo" },
+            state: "OPEN",
+            reviews: [],
+            headRefName: "feature/review",
+            headRefOid: "abc123",
+            baseRefName: "main",
+          }),
+          stderr: "",
+          killed: false,
+        };
+      }
+
+      if (command === "git" && args[0] === "merge-base") return { code: 0, stdout: "merge-base-sha\n", stderr: "", killed: false };
+      if (command === "git" && args[1] === "fetch") {
+        fetchCalls.push(args);
+        if (fetchCalls.length === 1) return { code: 1, stdout: "", stderr: "branch missing", killed: false };
+        return { code: 0, stdout: "", stderr: "", killed: false };
+      }
+      return { code: 1, stdout: "", stderr: `unexpected ${command} ${args.join(" ")}`, killed: false };
+    });
+
+    await expect(resolveRemoteReviewTarget({ exec } as never, "/repo", "https://github.com/example/widgets/pull/123", "/repo")).resolves.toMatchObject({
+      gitRoot: "/repo",
+      baseRef: "merge-base-sha",
+      headRef: "origin/pr/123/head",
+      branch: "feature/review",
+    });
+    expect(fetchCalls[0]?.[3]).toBe("origin");
+    expect(fetchCalls[1]?.[3]).toBe("https://github.com/example/widgets.git");
+    expect(fetchCalls[1]).toContain("+refs/pull/123/head:refs/remotes/origin/pr/123/head");
   });
 
   it("resolves GitHub PRs through a matching current checkout", async () => {
