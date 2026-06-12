@@ -34,6 +34,7 @@ import {
 import { detectPiLanguage, highlightCodeLineWithPi } from "../pi-render.js";
 import { getShortcutConfigPath, getShortcutsForSide, type CommentShortcut } from "../shortcuts.js";
 import { filterFilesBySearch } from "../search.js";
+import { sanitizeTerminalText } from "../sanitize.js";
 import { highlightJsonLine, highlightMarkdownLine } from "../theme-highlight.js";
 import type { CommentIntent, DiffReviewComment, ReviewFile, ReviewFileContents, ReviewLineTarget, ReviewResult, ReviewScope, ReviewState } from "../types.js";
 import { formatIntentLabel, formatScopeLabel } from "../types.js";
@@ -56,7 +57,7 @@ interface LoadedEntryLoading {
 type LoadedEntry = LoadedEntryReady | LoadedEntryError | LoadedEntryLoading;
 
 type EditTarget =
-  | { kind: "line"; fileId: string; scope: ReviewScope; side: ReviewLineTarget["side"]; startLine: number; endLine: number; initialBody: string; intent: CommentIntent }
+  | { kind: "line"; fileId: string; scope: ReviewScope; side: ReviewLineTarget["side"]; startLine: number; endLine: number; initialBody: string; intent: CommentIntent; originalText?: string }
   | { kind: "file"; fileId: string; scope: ReviewScope; initialBody: string; intent: CommentIntent }
   | { kind: "all"; initialBody: string; intent: CommentIntent };
 
@@ -260,7 +261,7 @@ function getScopeComparison(file: ReviewFile | null, scope: ReviewScope) {
 
 function getScopeDisplayPath(file: ReviewFile | null, scope: ReviewScope): string {
   const comparison = getScopeComparison(file, scope);
-  return comparison?.displayPath ?? file?.path ?? "(no file)";
+  return sanitizeTerminalText(comparison?.displayPath ?? file?.path ?? "(no file)");
 }
 
 function getStatusLabel(file: ReviewFile | null, scope: ReviewScope): string {
@@ -303,7 +304,15 @@ function getCommentPanelItems(state: ReviewState, fileId: string | null, scope: 
 
 function getIntentBadge(theme: Theme, intent: CommentIntent): string {
   const text = `[${formatIntentLabel(intent)}]`;
-  return intent === "fix" ? theme.fg("success", text) : theme.fg("warning", text);
+  if (intent === "modify") return theme.fg("accent", text);
+  if (intent === "comment") return theme.fg("success", text);
+  return theme.fg("warning", text);
+}
+
+function getCommentIndicator(theme: Theme, intent: CommentIntent): string {
+  if (intent === "modify") return theme.fg("accent", "\u25cf");
+  if (intent === "comment") return theme.fg("success", "\u25a0");
+  return theme.fg("warning", "\u25c6");
 }
 
 function formatLineSideLabel(side: ReviewLineTarget["side"]): string {
@@ -457,9 +466,9 @@ const HELP_KEY_SECTIONS = [
       "←/→ choose side in side-by-side view",
       "Ctrl+d/u half-page • gg/G top/bottom",
       "n/p next/previous hunk",
-      "t templates • o open in $EDITOR",
-      "f fix line • d/c discuss line",
-      "e edit • x delete • l file • a all",
+      "t templates • o edit file in $EDITOR (same shell)",
+      "m modify • c comment • d discuss line",
+      "e edit • x delete • l file (comment) • a all (discuss)",
     ],
   },
   {
@@ -489,7 +498,7 @@ function pushWrappedAnsiText(lines: string[], text: string, width: number, prefi
 }
 
 function pushWrappedText(lines: string[], theme: Theme, text: string, width: number, color: "muted" | "dim" = "muted", prefix = ""): void {
-  pushWrappedAnsiText(lines, theme.fg(color, text), width, prefix);
+  pushWrappedAnsiText(lines, theme.fg(color, sanitizeTerminalText(text)), width, prefix);
 }
 
 export function buildCommentPanelTextLines(theme: Theme, width: number, text: string, color: "muted" | "dim" = "muted", prefix = "", maxLines?: number): string[] {
@@ -502,7 +511,7 @@ export function buildCommentPanelTextLines(theme: Theme, width: number, text: st
 export function buildCommentPanelEmptyStateLines(theme: Theme, width: number): string[] {
   return [
     ...buildCommentPanelTextLines(theme, width, "No comments yet.", "dim"),
-    ...buildCommentPanelTextLines(theme, width, "Use f/d/c for a line or range, l for file, or a for all.", "dim"),
+    ...buildCommentPanelTextLines(theme, width, "Use m modify, c comment, d discuss for a line or range, l for file, or a for all.", "dim"),
   ];
 }
 
@@ -639,6 +648,14 @@ export type SideBySideDisplayRow =
 export type DiffViewMode = "unified" | "side-by-side";
 
 type DiffTone = "added" | "removed" | "context";
+
+interface DiffLayout {
+  displayDiff: StructuredDiff;
+  unifiedRows: DisplayRow[];
+  sideBySideRows: SideBySideDisplayRow[];
+  commentableTargets: ReviewLineTarget[];
+  rowRenderCache: Map<DisplayRow, Map<string, string[]>>;
+}
 
 function applyLineBackground(theme: Theme, text: string, tone: DiffTone): string {
   if (tone === "added") return theme.bg("toolSuccessBg", text);
@@ -815,7 +832,7 @@ class ReviewApp {
   private pendingVimSequence: "g" | null = null;
   private readonly previousHardwareCursor: boolean;
   private readonly syntaxLineCache = new Map<string, string>();
-  private readonly renderedDiffLineCache = new Map<string, string[]>();
+  private readonly diffLayoutCache = new Map<string, DiffLayout>();
 
   constructor(
     private readonly tui: any,
@@ -859,7 +876,7 @@ class ReviewApp {
 
   invalidate(): void {
     this.syntaxLineCache.clear();
-    this.renderedDiffLineCache.clear();
+    this.diffLayoutCache.clear();
     this.message = this.message;
   }
 
@@ -919,33 +936,42 @@ class ReviewApp {
     return highlighted;
   }
 
-  private getCachedRenderedDiffLines(
+  private buildUnifiedRowLines(
+    row: DisplayRow,
     width: number,
-    wrapLines: boolean,
-    rowKind: DisplayRow["kind"],
-    tone: DiffTone,
-    contentText: string,
+    language: string | undefined,
     isSelected: boolean,
+    lineComment: DiffReviewComment | undefined,
   ): string[] {
-    const key = `${width}\u001f${wrapLines ? "wrap" : "nowrap"}\u001f${rowKind}\u001f${tone}\u001f${isSelected ? 1 : 0}\u001f${contentText}`;
-    const cached = this.renderedDiffLineCache.get(key);
-    if (cached != null) return cached;
+    let contentText: string;
+    let tone: DiffTone = "context";
+    if (row.kind === "gap") {
+      contentText = this.theme.fg("muted", centerText(row.codeText, Math.max(row.codeText.length + 2, 10)));
+    } else {
+      tone = row.kind === "added" ? "added" : row.kind === "removed" ? "removed" : "context";
+      const lineLabel = row.displayLineNumber == null ? "    " : String(row.displayLineNumber).padStart(4, " ");
+      const gutterLine = this.theme.fg("borderMuted", lineLabel);
+      const gutterSign = row.sign === "+"
+        ? this.theme.fg("success", row.sign)
+        : row.sign === "-"
+          ? this.theme.fg("error", row.sign)
+          : this.theme.fg("toolDiffContext", row.sign);
+      const commentIndicator = lineComment == null ? " " : getCommentIndicator(this.theme, lineComment.intent);
+      const highlightedCode = this.getCachedHighlightedCode(tone, row.codeText, language);
+      contentText = `${gutterLine} ${gutterSign} ${commentIndicator} ${highlightedCode}`;
+    }
 
-    const wrapped = wrapAnsiText(contentText, Math.max(1, width - 2), wrapLines);
-    const rendered = wrapped.map((line) => {
+    const wrapped = wrapAnsiText(contentText, Math.max(1, width - 2), this.state.wrapLines);
+    return wrapped.map((line) => {
       const paddedLine = padLine(line, Math.max(1, width - 2));
       if (isSelected) return this.theme.bg("selectedBg", paddedLine);
-      if (rowKind === "added" || rowKind === "removed") return applyLineBackground(this.theme, paddedLine, tone);
+      if (row.kind === "added" || row.kind === "removed") return applyLineBackground(this.theme, paddedLine, tone);
       return paddedLine;
     });
-
-    if (this.renderedDiffLineCache.size > 5000) this.renderedDiffLineCache.clear();
-    this.renderedDiffLineCache.set(key, rendered);
-    return rendered;
   }
 
   private setMessage(message: string): void {
-    this.message = message;
+    this.message = sanitizeTerminalText(message);
   }
 
   private activeFile(): ReviewFile | null {
@@ -964,20 +990,44 @@ class ReviewApp {
   private invalidateEntry(fileId: string, scope: ReviewScope): void {
     this.cache.delete(this.cacheKey(fileId, scope));
     this.syntaxLineCache.clear();
-    this.renderedDiffLineCache.clear();
+    this.diffLayoutCache.clear();
+  }
+
+  private getDiffLayout(fileId: string | null, scope: ReviewScope): DiffLayout | null {
+    if (fileId == null) return null;
+    const entry = this.getEntry(fileId, scope);
+    if (entry?.status !== "ready") return null;
+    const key = `${scope}\u001f${fileId}\u001f${this.state.hideUnchanged ? 1 : 0}`;
+    const cached = this.diffLayoutCache.get(key);
+    if (cached != null) return cached;
+
+    const displayDiff = scope === "all-files"
+      ? entry.baseDiff
+      : adjustStructuredDiffContext(entry.baseDiff, this.state.hideUnchanged ? 0 : DEFAULT_CONTEXT_LINES);
+    const unifiedRows = buildDisplayRows(displayDiff);
+    const sideBySideRows = buildSideBySideDisplayRows(displayDiff);
+
+    const seen = new Set<string>();
+    const commentableTargets: ReviewLineTarget[] = [];
+    for (const row of unifiedRows) {
+      if (row.commentLineNumber == null || row.commentSide == null) continue;
+      const targetKey = `${row.commentSide}:${row.commentLineNumber}`;
+      if (seen.has(targetKey)) continue;
+      seen.add(targetKey);
+      commentableTargets.push({ side: row.commentSide, line: row.commentLineNumber });
+    }
+
+    const layout: DiffLayout = { displayDiff, unifiedRows, sideBySideRows, commentableTargets, rowRenderCache: new Map() };
+    this.diffLayoutCache.set(key, layout);
+    return layout;
   }
 
   private getDisplayDiff(fileId: string | null, scope: ReviewScope): StructuredDiff | null {
-    const entry = this.getEntry(fileId, scope);
-    if (entry?.status !== "ready") return null;
-    if (scope === "all-files") return entry.baseDiff;
-    return adjustStructuredDiffContext(entry.baseDiff, this.state.hideUnchanged ? 0 : DEFAULT_CONTEXT_LINES);
+    return this.getDiffLayout(fileId, scope)?.displayDiff ?? null;
   }
 
   private getVisibleLineTargets(fileId: string | null, scope: ReviewScope): ReviewLineTarget[] {
-    const diff = this.getDisplayDiff(fileId, scope);
-    if (diff == null) return [];
-    return getCommentableLineTargets(diff);
+    return this.getDiffLayout(fileId, scope)?.commentableTargets ?? [];
   }
 
   private relatedFilterAnchorFile(): ReviewFile | null {
@@ -1081,7 +1131,9 @@ class ReviewApp {
 
   private toggleEditIntent(): void {
     if (this.editTarget == null) return;
-    this.setEditIntent(this.editTarget.intent === "fix" ? "discuss" : "fix");
+    const order: CommentIntent[] = ["discuss", "comment", "modify"];
+    const next = order[(order.indexOf(this.editTarget.intent) + 1) % order.length]!;
+    this.setEditIntent(next);
   }
 
   private saveEditor(): void {
@@ -1103,6 +1155,7 @@ class ReviewApp {
         value,
         target.intent,
         target.endLine,
+        target.intent === "modify" ? target.originalText : undefined,
       );
     }
 
@@ -1117,6 +1170,14 @@ class ReviewApp {
     this.requestRender();
   }
 
+  private getSourceLinesText(fileId: string, scope: ReviewScope, side: ReviewLineTarget["side"], startLine: number, endLine: number): string {
+    const entry = this.getEntry(fileId, scope);
+    if (entry?.status !== "ready") return "";
+    const content = side === "deleted" ? entry.contents.originalContent : entry.contents.modifiedContent;
+    const lines = content.split("\n");
+    return lines.slice(Math.max(0, startLine - 1), endLine).join("\n");
+  }
+
   private editLineCommentWithIntent(defaultIntent: CommentIntent): void {
     const file = this.activeFile();
     if (file == null) return;
@@ -1128,15 +1189,22 @@ class ReviewApp {
     }
     const range = getLineTargetRange(target);
     const existing = getLineComment(this.state, file.id, this.state.activeScope, target.side, target.line);
+    const startLine = existing?.startLine ?? range.startLine;
+    const endLine = existing?.endLine ?? range.endLine;
+    const seedModify = defaultIntent === "modify" && existing == null;
+    const sourceText = seedModify || existing?.intent === "modify"
+      ? this.getSourceLinesText(file.id, this.state.activeScope, target.side, startLine, endLine)
+      : "";
     this.openEditor({
       kind: "line",
       fileId: file.id,
       scope: this.state.activeScope,
       side: target.side,
-      startLine: existing?.startLine ?? range.startLine,
-      endLine: existing?.endLine ?? range.endLine,
-      initialBody: existing?.body ?? "",
+      startLine,
+      endLine,
+      initialBody: existing?.body ?? (seedModify ? sourceText : ""),
       intent: existing?.intent ?? defaultIntent,
+      originalText: existing?.originalText ?? (sourceText.length > 0 ? sourceText : undefined),
     });
   }
 
@@ -1151,15 +1219,21 @@ class ReviewApp {
     }
     const range = getLineTargetRange(target);
     const existing = getLineComment(this.state, file.id, this.state.activeScope, target.side, target.line);
+    const startLine = existing?.startLine ?? range.startLine;
+    const endLine = existing?.endLine ?? range.endLine;
+    const sourceText = existing?.intent === "modify"
+      ? this.getSourceLinesText(file.id, this.state.activeScope, target.side, startLine, endLine)
+      : "";
     this.openEditor({
       kind: "line",
       fileId: file.id,
       scope: this.state.activeScope,
       side: target.side,
-      startLine: existing?.startLine ?? range.startLine,
-      endLine: existing?.endLine ?? range.endLine,
+      startLine,
+      endLine,
       initialBody: existing?.body ?? "",
-      intent: existing?.intent ?? "fix",
+      intent: existing?.intent ?? "discuss",
+      originalText: existing?.originalText ?? (sourceText.length > 0 ? sourceText : undefined),
     });
   }
 
@@ -1172,7 +1246,7 @@ class ReviewApp {
       fileId: file.id,
       scope: this.state.activeScope,
       initialBody: existing?.body ?? "",
-      intent: existing?.intent ?? "fix",
+      intent: existing?.intent ?? "comment",
     });
   }
 
@@ -1410,7 +1484,6 @@ class ReviewApp {
 
   private toggleDiffViewMode(): void {
     this.diffViewMode = this.diffViewMode === "unified" ? "side-by-side" : "unified";
-    this.renderedDiffLineCache.clear();
     this.requestRender();
   }
 
@@ -1774,12 +1847,16 @@ class ReviewApp {
           void this.openSelectedLineInEditor();
           return;
         }
-        if (data === "f") {
-          this.editLineCommentWithIntent("fix");
+        if (data === "m") {
+          this.editLineCommentWithIntent("modify");
           return;
         }
-        if (data === "d" || data === "c") {
+        if (data === "d") {
           this.editLineCommentWithIntent("discuss");
+          return;
+        }
+        if (data === "c") {
+          this.editLineCommentWithIntent("comment");
           return;
         }
         if (data === "e") {
@@ -1861,7 +1938,7 @@ class ReviewApp {
       const commentMarker = count > 0 ? this.theme.fg("success", ` ${count}●`) : this.theme.fg("dim", "  ·");
       const prefixText = `${prefix} ${status} `;
       const pathWidth = Math.max(1, width - 2 - visibleWidth(prefixText) - visibleWidth(changeMarker) - visibleWidth(commentMarker));
-      const shortenedPath = shortenNavigatorPath(file.path, pathWidth);
+      const shortenedPath = shortenNavigatorPath(sanitizeTerminalText(file.path), pathWidth);
       const pathText = active || (!relatedFilterActive && related)
         ? this.theme.fg("accent", shortenedPath)
         : this.theme.fg("text", shortenedPath);
@@ -1882,11 +1959,7 @@ class ReviewApp {
       : cell.sign === "-"
         ? this.theme.fg("error", cell.sign)
         : this.theme.fg("toolDiffContext", cell.sign);
-    const commentIndicator = lineComment == null
-      ? " "
-      : lineComment.intent === "fix"
-        ? this.theme.fg("success", "●")
-        : this.theme.fg("warning", "◆");
+    const commentIndicator = lineComment == null ? " " : getCommentIndicator(this.theme, lineComment.intent);
     const highlightedCode = this.getCachedHighlightedCode(cell.tone, cell.text, language);
     const contentText = `${gutterLine} ${gutterSign} ${commentIndicator} ${highlightedCode}`;
 
@@ -1898,16 +1971,17 @@ class ReviewApp {
     });
   }
 
-  private renderSideBySideDiff(diff: StructuredDiff, width: number, fileId: string, language: string | undefined, selectedTarget: ReviewLineTarget | null): { lines: string[]; selectedIndex: number } {
+  private renderSideBySideDiff(diff: StructuredDiff, width: number, fileId: string, language: string | undefined, selectedTarget: ReviewLineTarget | null): { lines: string[]; selectedIndex: number; selectedEndIndex: number } {
     const innerWidth = Math.max(1, width - 2);
     const separator = this.theme.fg("borderMuted", " │ ");
     const separatorWidth = visibleWidth(separator);
     const oldWidth = Math.max(8, Math.floor((innerWidth - separatorWidth) / 2));
     const newWidth = Math.max(8, innerWidth - separatorWidth - oldWidth);
     const selectedRange = selectedTarget == null ? null : getLineTargetRange(selectedTarget);
-    const rows = buildSideBySideDisplayRows(diff);
+    const rows = this.getDiffLayout(fileId, this.state.activeScope)?.sideBySideRows ?? buildSideBySideDisplayRows(diff);
     const lines: string[] = [];
     let selectedIndex = 0;
+    let selectedEndIndex = 0;
 
     const oldHeaderActive = selectedTarget?.side === "deleted";
     const newHeaderActive = selectedTarget?.side === "added";
@@ -1938,10 +2012,29 @@ class ReviewApp {
       for (let index = 0; index < rowHeight; index += 1) {
         lines.push(`${oldLines[index] ?? " ".repeat(oldWidth)}${separator}${newLines[index] ?? " ".repeat(newWidth)}`);
       }
-      if (oldCurrent || newCurrent) selectedIndex = rowStart;
+      if (oldCurrent || newCurrent) {
+        selectedIndex = rowStart;
+        selectedEndIndex = rowStart + rowHeight;
+      }
     }
 
-    return { lines, selectedIndex };
+    return { lines, selectedIndex, selectedEndIndex };
+  }
+
+  private buildInlineEditorBlock(width: number): string[] {
+    const target = this.editTarget;
+    if (target == null) return [];
+    const label = target.kind === "all"
+      ? "All note"
+      : target.kind === "file"
+        ? "File comment"
+        : `${formatLineSideLabel(target.side)} line ${formatLineRangeLabel(target.startLine, target.endLine)}`;
+    const bar = this.theme.fg("accent", "\u258c");
+    const header = `${bar} ${getIntentBadge(this.theme, target.intent)} ${this.theme.fg("muted", label)}`;
+    const hints = `${bar} ${this.theme.fg("dim", "Tab intent • Enter save • Shift+Enter newline • Esc cancel")}`;
+    const editorLines = this.editor.render(Math.max(10, width - 4));
+    const body = editorLines.map((line) => `${bar} ${line}`);
+    return [header, hints, ...body];
   }
 
   private renderDiff(width: number, height: number): string[] {
@@ -1967,8 +2060,9 @@ class ReviewApp {
       return renderBox("Diff", width, height, this.theme, lines, this.state.focus === "diff");
     }
 
-    const diff = this.getDisplayDiff(file.id, this.state.activeScope)!;
-    const visibleTargets = this.getVisibleLineTargets(file.id, this.state.activeScope);
+    const layout = this.getDiffLayout(file.id, this.state.activeScope)!;
+    const diff = layout.displayDiff;
+    const visibleTargets = layout.commentableTargets;
     const language = detectPiLanguage(file.path);
     this.state = clampSelectedLineTarget(this.state, file.id, this.state.activeScope, visibleTargets);
     const selectedTarget = getSelectedLineTarget(this.state, file.id, this.state.activeScope);
@@ -1976,63 +2070,79 @@ class ReviewApp {
     let rendered: string[];
     let selectedIndex = 0;
 
+    let selectedEndIndex = 0;
     if (this.diffViewMode === "side-by-side") {
       const sideBySide = this.renderSideBySideDiff(diff, width, file.id, language, selectedTarget);
       rendered = sideBySide.lines;
       selectedIndex = sideBySide.selectedIndex;
+      selectedEndIndex = sideBySide.selectedEndIndex;
     } else {
-      const displayRows = buildDisplayRows(diff);
+      const displayRows = layout.unifiedRows;
+      const rowRenderCache = layout.rowRenderCache;
       rendered = [];
-
-      for (const row of displayRows) {
       const selectedRange = selectedTarget == null ? null : getLineTargetRange(selectedTarget);
       const selectedSide = selectedTarget?.side ?? null;
-      const isCurrentTarget = row.commentLineNumber != null
-        && row.commentSide != null
-        && selectedTarget?.line === row.commentLineNumber
-        && selectedSide === row.commentSide;
-      const isSelected = row.commentLineNumber != null
-        && row.commentSide != null
-        && selectedRange != null
-        && selectedSide === row.commentSide
-        && selectedRange.startLine <= row.commentLineNumber
-        && row.commentLineNumber <= selectedRange.endLine;
-      const lineComment = row.commentLineNumber != null && row.commentSide != null
-        ? getLineComment(this.state, file.id, this.state.activeScope, row.commentSide, row.commentLineNumber)
-        : undefined;
+      const wrapFlag = this.state.wrapLines ? 1 : 0;
 
-      let contentText: string;
-      let tone: DiffTone = "context";
-      if (row.kind === "gap") {
-        contentText = this.theme.fg("muted", centerText(row.codeText, Math.max(row.codeText.length + 2, 10)));
-      } else {
-        tone = row.kind === "added" ? "added" : row.kind === "removed" ? "removed" : "context";
-        const lineLabel = row.displayLineNumber == null ? "    " : String(row.displayLineNumber).padStart(4, " ");
-        const gutterLine = this.theme.fg("borderMuted", lineLabel);
-        const gutterSign = row.sign === "+"
-          ? this.theme.fg("success", row.sign)
-          : row.sign === "-"
-            ? this.theme.fg("error", row.sign)
-            : this.theme.fg("toolDiffContext", row.sign);
-        const commentIndicator = lineComment == null
-          ? " "
-          : lineComment.intent === "fix"
-            ? this.theme.fg("success", "●")
-            : this.theme.fg("warning", "◆");
-        const highlightedCode = this.getCachedHighlightedCode(tone, row.codeText, language);
-        contentText = `${gutterLine} ${gutterSign} ${commentIndicator} ${highlightedCode}`;
-      }
+      for (const row of displayRows) {
+        const isCurrentTarget = row.commentLineNumber != null
+          && row.commentSide != null
+          && selectedTarget?.line === row.commentLineNumber
+          && selectedSide === row.commentSide;
+        const isSelected = row.commentLineNumber != null
+          && row.commentSide != null
+          && selectedRange != null
+          && selectedSide === row.commentSide
+          && selectedRange.startLine <= row.commentLineNumber
+          && row.commentLineNumber <= selectedRange.endLine;
+        const lineComment = row.commentLineNumber != null && row.commentSide != null
+          ? getLineComment(this.state, file.id, this.state.activeScope, row.commentSide, row.commentLineNumber)
+          : undefined;
 
-      const renderedLines = this.getCachedRenderedDiffLines(width, this.state.wrapLines, row.kind, tone, contentText, isSelected);
+        const memoKey = `${width}\u001f${wrapFlag}\u001f${isSelected ? 1 : 0}\u001f${lineComment?.intent ?? "-"}`;
+        let memo = rowRenderCache.get(row);
+        if (memo == null) {
+          memo = new Map();
+          rowRenderCache.set(row, memo);
+        }
+        let renderedLines = memo.get(memoKey);
+        if (renderedLines == null) {
+          renderedLines = this.buildUnifiedRowLines(row, width, language, isSelected, lineComment);
+          memo.set(memoKey, renderedLines);
+        }
+
         if (isCurrentTarget) selectedIndex = rendered.length;
         rendered.push(...renderedLines);
+        if (isCurrentTarget) selectedEndIndex = rendered.length;
+      }
+    }
+
+    let editorStart = -1;
+    let editorEnd = -1;
+    if (this.editTarget != null) {
+      const matchesLine = this.editTarget.kind === "line"
+        && this.editTarget.fileId === file.id
+        && this.editTarget.scope === this.state.activeScope;
+      const insertIndex = matchesLine ? selectedEndIndex : 0;
+      const block = this.buildInlineEditorBlock(width);
+      if (block.length > 0) {
+        rendered.splice(insertIndex, 0, ...block);
+        editorStart = insertIndex;
+        editorEnd = insertIndex + block.length - 1;
       }
     }
 
     const maxBody = Math.max(1, height - 5);
     this.diffPageSize = maxBody;
-    if (selectedIndex < this.diffScroll) this.diffScroll = selectedIndex;
-    if (selectedIndex >= this.diffScroll + maxBody) this.diffScroll = selectedIndex - maxBody + 1;
+    if (editorStart >= 0) {
+      const anchorTop = Math.max(0, editorStart - 1);
+      if (editorEnd >= this.diffScroll + maxBody) this.diffScroll = editorEnd - maxBody + 1;
+      if (anchorTop < this.diffScroll && editorEnd - anchorTop < maxBody) this.diffScroll = anchorTop;
+    } else {
+      if (selectedIndex < this.diffScroll) this.diffScroll = selectedIndex;
+      if (selectedIndex >= this.diffScroll + maxBody) this.diffScroll = selectedIndex - maxBody + 1;
+    }
+    this.diffScroll = Math.max(0, this.diffScroll);
     lines.push(...rendered.slice(this.diffScroll, this.diffScroll + maxBody));
 
     return renderBox(`Diff ${diff.hunks.length > 0 ? `(${diff.hunks.length} hunk${diff.hunks.length === 1 ? "" : "s"})` : ""}`.trim(), width, height, this.theme, lines, this.state.focus === "diff");
@@ -2076,8 +2186,9 @@ class ReviewApp {
       }
 
       const groups = [
+        { intent: "modify" as const, header: this.theme.fg("accent", "MODIFY") },
+        { intent: "comment" as const, header: this.theme.fg("success", "COMMENT") },
         { intent: "discuss" as const, header: this.theme.fg("warning", "DISCUSS") },
-        { intent: "fix" as const, header: this.theme.fg("success", "FIX") },
       ];
 
       groups.forEach((group, groupIndex) => {
@@ -2103,7 +2214,7 @@ class ReviewApp {
       return this.renderHelpPanel(width, height);
     }
 
-    if (this.editTarget != null) {
+    if (this.editTarget != null && this.activeFile() == null) {
       lines.push(this.theme.fg("muted", this.editTarget.kind === "all"
         ? "All note"
         : this.editTarget.kind === "file"
@@ -2187,7 +2298,7 @@ class ReviewApp {
       : this.helpMode
         ? "Help open • ? toggle • Esc close"
         : this.message ?? (this.searchMode
-          ? `Search: ${this.searchBuffer}`
+          ? `Search: ${sanitizeTerminalText(this.searchBuffer)}`
           : this.editTarget != null
             ? `Editing ${formatIntentLabel(this.editTarget.intent).toLowerCase()} comment`
             : `${formatFocusStatus(this.state.focus)} • ${layoutStatus}Tab focus • / search • t templates • v diff view • ? help • 1/2/3 scopes • h ${this.commentsHidden ? "show" : "hide"} comments • o open in $EDITOR • s submit • Esc exit • Ctrl+C exit`);
@@ -2244,7 +2355,7 @@ class ReviewApp {
 
     const footer = buildFooterLines(this.theme, promptStatus, frameInnerWidth);
 
-    const rendered = renderOuterFrame(this.lastWidth, totalHeight, this.theme, "slopchop", [...headerLines, ...body, ...footer], frameColor);
+    const rendered = renderOuterFrame(this.lastWidth, totalHeight, this.theme, "code-diff", [...headerLines, ...body, ...footer], frameColor);
     if (!this.confirmCancel) return rendered;
     return renderCenteredOverlay(rendered, this.renderCancelConfirmation(), this.lastWidth, totalHeight);
   }

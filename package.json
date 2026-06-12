@@ -1,18 +1,12 @@
 {
-  "name": "pi-slopchop",
-  "version": "0.9.1",
+  "name": "pi-code-diff",
+  "version": "0.1.0",
+  "private": true,
+  "packageManager": "pnpm@10.28.0",
   "type": "module",
-  "description": "Terminal-native code review and annotation workflow for the Pi coding agent.",
-  "author": "Rob Zolkos <rob@zolkos.com>",
+  "description": "Leo-owned local Pi package for code diff review and annotation workflows.",
+  "author": "Leonardo Pereira",
   "license": "MIT",
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/robzolkos/pi-slopchop.git"
-  },
-  "homepage": "https://github.com/robzolkos/pi-slopchop#readme",
-  "bugs": {
-    "url": "https://github.com/robzolkos/pi-slopchop/issues"
-  },
   "files": [
     "src/diff.ts",
     "src/git.ts",
@@ -33,6 +27,7 @@
     "pi-package",
     "pi",
     "diff-review",
+    "code-diff",
     "code-review",
     "annotation",
     "terminal"
@@ -47,15 +42,16 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "@earendil-works/pi-tui": "*",
-    "@pierre/diffs": "^1.2.1"
+    "@earendil-works/pi-tui": "0.78.0",
+    "@pierre/diffs": "1.2.7",
+    "typebox": "1.1.38"
   },
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": "*"
+    "@earendil-works/pi-coding-agent": "0.78.0"
   },
   "devDependencies": {
-    "@types/node": "^24.5.2",
-    "typescript": "^5.9.3",
-    "vitest": "^3.2.4"
+    "@types/node": "24.12.4",
+    "typescript": "5.9.3",
+    "vitest": "3.2.6"
   }
 }

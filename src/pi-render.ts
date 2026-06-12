@@ -1,12 +1,14 @@
 import { getLanguageFromPath, highlightCode } from "@earendil-works/pi-coding-agent";
+import { sanitizeTerminalText } from "./sanitize.js";
 
 export function detectPiLanguage(filePath: string): string | undefined {
   return getLanguageFromPath(filePath);
 }
 
 export function highlightCodeLineWithPi(text: string, language: string | undefined): string {
-  if (text.length === 0) return "";
-  return highlightCode(text, language)[0] ?? text;
+  const sanitizedText = sanitizeTerminalText(text);
+  if (sanitizedText.length === 0) return "";
+  return highlightCode(sanitizedText, language)[0] ?? sanitizedText;
 }
 
 function replaceTabs(text: string): string {
@@ -101,7 +103,7 @@ function diffWordTokens(oldContent: string, newContent: string): WordDiffPart[] 
 }
 
 /**
- * Adapted from Pi's internal diff renderer so slopchop follows Pi's intra-line
+ * Adapted from Pi's internal diff renderer so code-diff follows Pi's intra-line
  * diff highlighting behavior while still controlling its own gutters and
  * comment markers.
  */
@@ -110,7 +112,7 @@ export function renderPiIntraLineDiff(
   newContent: string,
   inverse: (text: string) => string,
 ): { removedLine: string; addedLine: string } {
-  const wordDiff = diffWordTokens(oldContent, newContent);
+  const wordDiff = diffWordTokens(sanitizeTerminalText(oldContent), sanitizeTerminalText(newContent));
 
   let removedLine = "";
   let addedLine = "";

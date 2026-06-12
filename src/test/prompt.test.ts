@@ -51,80 +51,11 @@ const files: ReviewFile[] = [
 ];
 
 describe("composeReviewPrompt", () => {
-  it("uses strict mixed-mode instructions when both fix and discuss items exist", () => {
-    const prompt = composeReviewPrompt(files, {
-      type: "submit",
-      allComment: "Tighten naming.",
-      allIntent: "discuss",
-      comments: [
-        {
-          id: "2",
-          fileId: "foo",
-          scope: "last-commit",
-          side: "file",
-          intent: "fix",
-          startLine: null,
-          endLine: null,
-          body: "Rename this API to match the package.",
-        },
-        {
-          id: "1",
-          fileId: "bar",
-          scope: "git-diff",
-          side: "added",
-          intent: "fix",
-          startLine: 27,
-          endLine: 27,
-          body: "Flatten this conditional.",
-        },
-        {
-          id: "3",
-          fileId: "foo",
-          scope: "last-commit",
-          side: "deleted",
-          intent: "fix",
-          startLine: 11,
-          endLine: 11,
-          body: "Check whether this removal is safe.",
-        },
-      ],
-    });
-
-    expect(prompt).toBe([
-      "Process the following review feedback.",
-      "",
-      "Rules:",
-      "- For FIX items: make the requested changes.",
-      "- For DISCUSS items: do not edit files, write code, run write/editing tools, or make repo changes in order to address them.",
-      "- Treat DISCUSS items as non-actionable discussion prompts; answer them only in prose with explanation, rationale, or a proposal.",
-      "- DISCUSS items must never be converted into code changes unless the user later gives an explicit follow-up request.",
-      "- If both FIX and DISCUSS items are present, implement only the FIX items; answer the DISCUSS items separately in prose.",
-      "",
-      "FIX",
-      "",
-      "Files:",
-      "- src/old-foo.ts -> src/foo.ts",
-      "  Rename this API to match the package.",
-      "",
-      "Lines:",
-      "1. src/bar.ts:27 (added)",
-      "   Flatten this conditional.",
-      "",
-      "2. src/old-foo.ts -> src/foo.ts:11 (deleted)",
-      "   Check whether this removal is safe.",
-      "",
-      "DISCUSS",
-      "",
-      "Review-wide:",
-      "Tighten naming.",
-    ].join("\n"));
-  });
-
-  it("uses discuss-only instructions with no fix references", () => {
+  it("uses discuss-only instructions in prose", () => {
     const prompt = composeReviewPrompt(files, {
       type: "submit",
       allComment: "",
-      allIntent: "fix",
+      allIntent: "discuss",
       comments: [
         {
           id: "1",
@@ -150,21 +81,142 @@ describe("composeReviewPrompt", () => {
       "   First line",
       "   Second line",
     ].join("\n"));
-    expect(prompt).not.toContain("FIX items");
+    expect(prompt).not.toContain("MODIFY items");
   });
 
-  it("formats line ranges", () => {
+  it("uses comment-only instructions", () => {
     const prompt = composeReviewPrompt(files, {
       type: "submit",
       allComment: "",
-      allIntent: "fix",
+      allIntent: "discuss",
       comments: [
         {
           id: "1",
           fileId: "bar",
           scope: "git-diff",
           side: "added",
-          intent: "fix",
+          intent: "comment",
+          startLine: 4,
+          endLine: 4,
+          body: "Can this be simplified?",
+        },
+      ],
+    });
+
+    expect(prompt).toBe([
+      "The following are review comments about the change. Respond to them in prose; only edit if a comment clearly requires it.",
+      "",
+      "COMMENT",
+      "",
+      "Lines:",
+      "1. src/bar.ts:4 (added)",
+      "   Can this be simplified?",
+    ].join("\n"));
+  });
+
+  it("uses modify-only instructions for proposed code changes", () => {
+    const prompt = composeReviewPrompt(files, {
+      type: "submit",
+      allComment: "",
+      allIntent: "discuss",
+      comments: [
+        {
+          id: "1",
+          fileId: "bar",
+          scope: "git-diff",
+          side: "added",
+          intent: "modify",
+          startLine: 27,
+          endLine: 27,
+          body: "return early()",
+        },
+      ],
+    });
+
+    expect(prompt).toBe([
+      "Apply the following proposed code changes exactly as written, as local edits.",
+      "",
+      "MODIFY",
+      "",
+      "Lines:",
+      "1. src/bar.ts:27 (added)",
+      "   return early()",
+    ].join("\n"));
+    expect(prompt).not.toContain("DISCUSS items");
+  });
+
+  it("renders a MODIFY line edit as a LINE CHANGED old-to-new block", () => {
+    const prompt = composeReviewPrompt(files, {
+      type: "submit",
+      allComment: "",
+      allIntent: "discuss",
+      comments: [
+        {
+          id: "1",
+          fileId: "bar",
+          scope: "git-diff",
+          side: "added",
+          intent: "modify",
+          startLine: 27,
+          endLine: 27,
+          originalText: "const x = compute(1)",
+          body: "const x = compute(1, { cached: true })",
+        },
+      ],
+    });
+
+    expect(prompt).toBe([
+      "Apply the following proposed code changes exactly as written, as local edits.",
+      "",
+      "MODIFY",
+      "",
+      "Lines:",
+      "1. src/bar.ts:27 (added)",
+      "   LINE CHANGED",
+      "   - const x = compute(1)",
+      "   + const x = compute(1, { cached: true })",
+    ].join("\n"));
+  });
+
+  it("renders a multi-line MODIFY edit with every old and new line", () => {
+    const prompt = composeReviewPrompt(files, {
+      type: "submit",
+      allComment: "",
+      allIntent: "discuss",
+      comments: [
+        {
+          id: "1",
+          fileId: "bar",
+          scope: "git-diff",
+          side: "added",
+          intent: "modify",
+          startLine: 10,
+          endLine: 11,
+          originalText: "foo()\nbar()",
+          body: "foo()\nbaz()",
+        },
+      ],
+    });
+
+    expect(prompt).toContain("   LINE CHANGED");
+    expect(prompt).toContain("   - foo()");
+    expect(prompt).toContain("   - bar()");
+    expect(prompt).toContain("   + foo()");
+    expect(prompt).toContain("   + baz()");
+  });
+
+  it("formats line ranges", () => {
+    const prompt = composeReviewPrompt(files, {
+      type: "submit",
+      allComment: "",
+      allIntent: "discuss",
+      comments: [
+        {
+          id: "1",
+          fileId: "bar",
+          scope: "git-diff",
+          side: "added",
+          intent: "comment",
           startLine: 27,
           endLine: 29,
           body: "Apply this to the whole block.",
@@ -175,34 +227,50 @@ describe("composeReviewPrompt", () => {
     expect(prompt).toContain("1. src/bar.ts:27-29 (added)");
   });
 
-  it("uses fix-only instructions with no discuss references", () => {
+  it("separates modify, comment, and discuss sections in mixed mode", () => {
     const prompt = composeReviewPrompt(files, {
       type: "submit",
-      allComment: "",
-      allIntent: "fix",
+      allComment: "Tighten naming.",
+      allIntent: "discuss",
       comments: [
         {
           id: "1",
           fileId: "bar",
           scope: "git-diff",
           side: "added",
-          intent: "fix",
-          startLine: 27,
-          endLine: 27,
-          body: "Flatten this conditional.",
+          intent: "modify",
+          startLine: 20,
+          endLine: 20,
+          originalText: "user = find(id)",
+          body: "user = fetchUser(id)",
+        },
+        {
+          id: "2",
+          fileId: "bar",
+          scope: "git-diff",
+          side: "added",
+          intent: "comment",
+          startLine: 10,
+          endLine: 10,
+          body: "Handle the nil case.",
+        },
+        {
+          id: "3",
+          fileId: "bar",
+          scope: "git-diff",
+          side: "added",
+          intent: "discuss",
+          startLine: 30,
+          endLine: 30,
+          body: "Why is this needed?",
         },
       ],
     });
 
-    expect(prompt).toBe([
-      "Address the following review feedback by making the requested changes.",
-      "",
-      "FIX",
-      "",
-      "Lines:",
-      "1. src/bar.ts:27 (added)",
-      "   Flatten this conditional.",
-    ].join("\n"));
-    expect(prompt).not.toContain("DISCUSS items");
+    expect(prompt).toContain("- For MODIFY items: apply the exact code change shown (LINE CHANGED old -> new) as a local edit.");
+    expect(prompt).toContain("- For COMMENT and DISCUSS items: respond only in prose.");
+    expect(prompt).toContain("- Apply the MODIFY items; answer the other items separately in prose.");
+    expect(prompt.indexOf("\nMODIFY\n")).toBeLessThan(prompt.indexOf("\nCOMMENT\n"));
+    expect(prompt.indexOf("\nCOMMENT\n")).toBeLessThan(prompt.indexOf("\nDISCUSS\n"));
   });
 });

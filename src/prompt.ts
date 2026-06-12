@@ -61,6 +61,17 @@ interface PromptItem {
   body: string;
 }
 
+function commentPromptBody(comment: DiffReviewComment): string {
+  const body = comment.body.trim();
+  if (comment.intent === "modify" && comment.originalText != null && comment.originalText.length > 0) {
+    const out = ["LINE CHANGED"];
+    for (const line of comment.originalText.split(/\r?\n/)) out.push(`- ${line}`);
+    for (const line of body.split(/\r?\n/)) out.push(`+ ${line}`);
+    return out.join("\n");
+  }
+  return body;
+}
+
 interface IntentSectionContent {
   reviewWide: string | null;
   files: PromptItem[];
@@ -79,7 +90,7 @@ function getIntentSectionContent(files: ReviewFile[], payload: ReviewSubmitPaylo
         const file = fileMap.get(comment.fileId);
         return {
           location: formatLocation(comment, file),
-          body: comment.body.trim(),
+          body: commentPromptBody(comment),
         };
       }),
     lines: comments
@@ -88,7 +99,7 @@ function getIntentSectionContent(files: ReviewFile[], payload: ReviewSubmitPaylo
         const file = fileMap.get(comment.fileId);
         return {
           location: formatLocation(comment, file),
-          body: comment.body.trim(),
+          body: commentPromptBody(comment),
         };
       }),
   };
@@ -157,35 +168,64 @@ function pushIntentSection(lines: string[], title: string, section: IntentSectio
   });
 }
 
+function joinIntentLabels(labels: string[]): string {
+  if (labels.length <= 1) return labels[0] ?? "";
+  if (labels.length === 2) return `${labels[0]} and ${labels[1]}`;
+  return `${labels.slice(0, -1).join(", ")}, and ${labels[labels.length - 1]}`;
+}
+
+function pushMixedModeHeader(lines: string[], hasModify: boolean, hasComment: boolean, hasDiscuss: boolean): void {
+  lines.push("Process the following review feedback.");
+  lines.push("");
+  lines.push("Rules:");
+  if (hasModify) {
+    lines.push("- For MODIFY items: apply the exact code change shown (LINE CHANGED old -> new) as a local edit.");
+  }
+  if (hasComment || hasDiscuss) {
+    const labels = joinIntentLabels([hasComment ? "COMMENT" : null, hasDiscuss ? "DISCUSS" : null].filter((label): label is string => label != null));
+    lines.push(`- For ${labels} items: respond only in prose. Do not edit files, write code, run write/editing tools, or make repo changes to satisfy them unless explicitly asked.`);
+  }
+  if (hasModify && (hasComment || hasDiscuss)) {
+    lines.push("- Apply the MODIFY items; answer the other items separately in prose.");
+  }
+  lines.push("");
+}
+
 export function composeReviewPrompt(files: ReviewFile[], payload: ReviewSubmitPayload): string {
   const lines: string[] = [];
-  const fixSection = getIntentSectionContent(files, payload, "fix");
+  const modifySection = getIntentSectionContent(files, payload, "modify");
+  const commentSection = getIntentSectionContent(files, payload, "comment");
   const discussSection = getIntentSectionContent(files, payload, "discuss");
-  const hasFix = hasIntentSectionContent(fixSection);
+  const hasModify = hasIntentSectionContent(modifySection);
+  const hasComment = hasIntentSectionContent(commentSection);
   const hasDiscuss = hasIntentSectionContent(discussSection);
+  const presentCount = [hasModify, hasComment, hasDiscuss].filter(Boolean).length;
 
-  if (hasFix && !hasDiscuss) {
-    lines.push("Address the following review feedback by making the requested changes.");
-    lines.push("");
-  } else if (hasDiscuss && !hasFix) {
-    lines.push("Respond to the following review discussion items in prose only.");
-    lines.push("Do not edit files, write code, run write/editing tools, or make repo changes.");
-    lines.push("");
+  if (presentCount <= 1) {
+    if (hasModify) {
+      lines.push("Apply the following proposed code changes exactly as written, as local edits.");
+      lines.push("");
+    } else if (hasComment) {
+      lines.push("The following are review comments about the change. Respond to them in prose; only edit if a comment clearly requires it.");
+      lines.push("");
+    } else if (hasDiscuss) {
+      lines.push("Respond to the following review discussion items in prose only.");
+      lines.push("Do not edit files, write code, run write/editing tools, or make repo changes.");
+      lines.push("");
+    }
   } else {
-    lines.push("Process the following review feedback.");
-    lines.push("");
-    lines.push("Rules:");
-    lines.push("- For FIX items: make the requested changes.");
-    lines.push("- For DISCUSS items: do not edit files, write code, run write/editing tools, or make repo changes in order to address them.");
-    lines.push("- Treat DISCUSS items as non-actionable discussion prompts; answer them only in prose with explanation, rationale, or a proposal.");
-    lines.push("- DISCUSS items must never be converted into code changes unless the user later gives an explicit follow-up request.");
-    lines.push("- If both FIX and DISCUSS items are present, implement only the FIX items; answer the DISCUSS items separately in prose.");
-    lines.push("");
+    pushMixedModeHeader(lines, hasModify, hasComment, hasDiscuss);
   }
 
-  pushIntentSection(lines, formatIntentLabel("fix"), fixSection);
-  if (hasFix && hasDiscuss) lines.push("");
-  pushIntentSection(lines, formatIntentLabel("discuss"), discussSection);
+  const sections: Array<[string, ReturnType<typeof getIntentSectionContent>]> = [];
+  if (hasModify) sections.push([formatIntentLabel("modify"), modifySection]);
+  if (hasComment) sections.push([formatIntentLabel("comment"), commentSection]);
+  if (hasDiscuss) sections.push([formatIntentLabel("discuss"), discussSection]);
+
+  sections.forEach(([title, section], index) => {
+    if (index > 0) lines.push("");
+    pushIntentSection(lines, title, section);
+  });
 
   return lines.join("\n").trim();
 }
