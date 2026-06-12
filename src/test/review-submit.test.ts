@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
-import { buildInlineComments, buildReviewPayload, submitPullRequestReview } from "../review-submit.js";
+import { buildInlineComments, buildReviewBody, buildReviewPayload, submitPullRequestReview } from "../review-submit.js";
 import type { DiffReviewComment, ReviewFile } from "../types.js";
 
 function makeFile(id: string, path: string): ReviewFile {
@@ -29,13 +29,13 @@ function comment(partial: Partial<DiffReviewComment> & Pick<DiffReviewComment, "
 }
 
 describe("buildInlineComments", () => {
-  it("maps only comment-intent line items, mirroring GitHub sides", () => {
+  it("maps comment and modify line items, mirroring GitHub sides", () => {
     const files = [makeFile("src/a.ts", "src/a.ts")];
     const comments: DiffReviewComment[] = [
       comment({ id: "1", fileId: "src/a.ts", side: "added", intent: "comment", startLine: 10, endLine: 10, body: "added note" }),
       comment({ id: "2", fileId: "src/a.ts", side: "deleted", intent: "comment", startLine: 5, endLine: 5, body: "deleted note" }),
       comment({ id: "3", fileId: "src/a.ts", side: "added", intent: "discuss", startLine: 7, endLine: 7, body: "discuss skipped" }),
-      comment({ id: "4", fileId: "src/a.ts", side: "added", intent: "modify", startLine: 8, endLine: 8, body: "modify skipped" }),
+      comment({ id: "4", fileId: "src/a.ts", side: "added", intent: "modify", startLine: 8, endLine: 8, originalText: "oldName()", body: "newName()" }),
       comment({ id: "5", fileId: "src/a.ts", side: "file", intent: "comment", body: "file skipped" }),
     ];
 
@@ -44,6 +44,7 @@ describe("buildInlineComments", () => {
     expect(inline).toEqual([
       { path: "src/a.ts", line: 10, side: "RIGHT", body: "added note" },
       { path: "src/a.ts", line: 5, side: "LEFT", body: "deleted note" },
+      { path: "src/a.ts", line: 8, side: "RIGHT", body: ["Suggested change:", "", "```diff", "- oldName()", "+ newName()", "```"].join("\n") },
     ]);
   });
 
@@ -56,6 +57,22 @@ describe("buildInlineComments", () => {
     expect(inline).toEqual([
       { path: "src/a.ts", line: 12, side: "RIGHT", body: "range", start_line: 10, start_side: "RIGHT" },
     ]);
+  });
+});
+
+describe("buildReviewBody", () => {
+  it("keeps GitHub review body to comment-intent review-wide and file comments", () => {
+    const files = [makeFile("src/a.ts", "src/a.ts")];
+    expect(buildReviewBody(files, {
+      type: "submit",
+      allComment: "Overall note",
+      allIntent: "comment",
+      comments: [
+        comment({ id: "1", fileId: "src/a.ts", side: "file", intent: "comment", body: "File note" }),
+        comment({ id: "2", fileId: "src/a.ts", side: "added", intent: "comment", startLine: 3, endLine: 3, body: "Inline note" }),
+        comment({ id: "3", fileId: "src/a.ts", side: "file", intent: "discuss", body: "Discuss note" }),
+      ],
+    })).toBe("Overall note\n\nsrc/a.ts:\nFile note");
   });
 });
 

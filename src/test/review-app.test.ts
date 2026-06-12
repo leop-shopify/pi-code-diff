@@ -2,7 +2,7 @@ import { visibleWidth } from "@earendil-works/pi-tui";
 import { describe, expect, it } from "vitest";
 import { buildStructuredDiff } from "../diff.js";
 import type { DiffReviewComment, ReviewFile, ReviewState } from "../types.js";
-import { buildCommentPanelEmptyStateLines, buildCommentPanelTextLines, buildDisplayRows, buildEditorLaunchCommand, buildFooterLines, buildHelpPanelLines, buildSideBySideDisplayRows, formatFocusStatus, formatPaneTitle, formatSelectedLineTargetLabel, getCancelAction, getDraftCommentCount, getEditorLineForTarget, getHalfPageStep, getPaneLayout, getRelatedFileMarker, getRelatedFilePanelSections, getRelatedFilePaths, getSideBySidePairedLineTarget, getStackedPaneLayout, parseMouseWheelInput, renderCenteredOverlay, shouldStackPanes } from "../ui/review-app.js";
+import { buildCommentPanelEmptyStateLines, buildCommentPanelTextLines, buildDisplayRows, buildEditorLaunchCommand, buildFooterLines, buildHelpPanelLines, buildSideBySideDisplayRows, diffTextMatchesSearch, formatFocusStatus, formatPaneTitle, formatSelectedLineTargetLabel, getCancelAction, getDraftCommentCount, getEditorLineForTarget, getHalfPageStep, getMatchingDiffLineTargets, getNavigatorMoveIndex, getNextSearchIndex, getPaneLayout, getRelatedFileMarker, getRelatedFilePanelSections, getRelatedFilePaths, getSideBySidePairedLineTarget, getStackedPaneLayout, parseMouseWheelInput, renderCenteredOverlay, shouldStackPanes } from "../ui/review-app.js";
 
 function makeFile(path: string, flags?: Partial<ReviewFile>): ReviewFile {
   return {
@@ -120,6 +120,39 @@ describe("getHalfPageStep", () => {
   });
 });
 
+describe("search and navigator movement helpers", () => {
+  it("finds matching diff line targets by code text", () => {
+    const diff = buildStructuredDiff(
+      ["alpha", "old value", "omega"].join("\n") + "\n",
+      ["alpha", "new value", "omega"].join("\n") + "\n",
+      3,
+    );
+
+    expect(getMatchingDiffLineTargets(buildDisplayRows(diff), "new value")).toEqual([{ side: "added", line: 2 }]);
+    expect(getMatchingDiffLineTargets(buildDisplayRows(diff), "old value")).toEqual([{ side: "deleted", line: 2 }]);
+  });
+
+  it("matches diff search text case-insensitively for highlighting", () => {
+    expect(diffTextMatchesSearch("const UserName = name", "username")).toBe(true);
+    expect(diffTextMatchesSearch("const UserName = name", "missing")).toBe(false);
+    expect(diffTextMatchesSearch("const UserName = name", "   ")).toBe(false);
+  });
+
+  it("wraps search result indexes for n and N", () => {
+    expect(getNextSearchIndex(-1, 3, 1)).toBe(0);
+    expect(getNextSearchIndex(-1, 3, -1)).toBe(2);
+    expect(getNextSearchIndex(2, 3, 1)).toBe(0);
+    expect(getNextSearchIndex(0, 3, -1)).toBe(2);
+  });
+
+  it("wraps single-step navigator movement and clamps page jumps", () => {
+    expect(getNavigatorMoveIndex(0, 3, -1)).toBe(2);
+    expect(getNavigatorMoveIndex(2, 3, 1)).toBe(0);
+    expect(getNavigatorMoveIndex(0, 3, 99)).toBe(2);
+    expect(getNavigatorMoveIndex(2, 3, -99)).toBe(0);
+  });
+});
+
 describe("pane layout", () => {
   it("gives the diff pane the comments width when comments are hidden", () => {
     const shown = getPaneLayout(100, false);
@@ -128,6 +161,12 @@ describe("pane layout", () => {
     expect(hidden.commentsWidth).toBe(0);
     expect(hidden.navigatorWidth).toBe(shown.navigatorWidth);
     expect(hidden.diffWidth).toBeGreaterThan(shown.diffWidth);
+  });
+
+  it("keeps navigator and comments panes the same width", () => {
+    const shown = getPaneLayout(120, false);
+
+    expect(shown.navigatorWidth).toBe(shown.commentsWidth);
   });
 
   it("stacks panes below the desktop width breakpoint", () => {

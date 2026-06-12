@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import type { DiffReviewComment, ReviewFile } from "./types.js";
+import type { DiffReviewComment, ReviewFile, ReviewSubmitPayload } from "./types.js";
 
 export type ReviewVerdict = "approve" | "request_changes" | "comment";
 
@@ -38,17 +38,39 @@ const EVENT_BY_VERDICT: Record<ReviewVerdict, string> = {
   comment: "COMMENT",
 };
 
+function getCommentFilePath(files: ReviewFile[], fileId: string): string {
+  return files.find((file) => file.id === fileId)?.path ?? fileId;
+}
+
+function cleanReviewText(text: string): string {
+  return text.trim().replace(/[ \t]+\n/g, "\n").replace(/\n{3,}/g, "\n\n");
+}
+
+function formatModifyInlineBody(comment: DiffReviewComment): string {
+  const newText = cleanReviewText(comment.body);
+  const oldText = comment.originalText?.trim();
+  if (oldText == null || oldText.length === 0) return newText;
+
+  const lines = ["Suggested change:", "", "```diff"];
+  for (const line of oldText.split(/\r?\n/)) lines.push(`- ${line}`);
+  for (const line of newText.split(/\r?\n/)) lines.push(`+ ${line}`);
+  lines.push("```");
+  return lines.join("\n");
+}
+
+function getInlineCommentBody(comment: DiffReviewComment): string {
+  return comment.intent === "modify" ? formatModifyInlineBody(comment) : cleanReviewText(comment.body);
+}
+
 export function buildInlineComments(files: ReviewFile[], comments: DiffReviewComment[]): ReviewInlineComment[] {
-  const fileMap = new Map(files.map((file) => [file.id, file]));
   const inline: ReviewInlineComment[] = [];
   for (const comment of comments) {
-    if (comment.intent !== "comment") continue;
+    if (comment.intent !== "comment" && comment.intent !== "modify") continue;
     if (comment.side === "file" || comment.startLine == null) continue;
-    const file = fileMap.get(comment.fileId);
-    const path = file?.path ?? comment.fileId;
+    const path = getCommentFilePath(files, comment.fileId);
     const side = comment.side === "deleted" ? "LEFT" : "RIGHT";
     const line = comment.endLine ?? comment.startLine;
-    const entry: ReviewInlineComment = { path, line, side, body: comment.body };
+    const entry: ReviewInlineComment = { path, line, side, body: getInlineCommentBody(comment) };
     if (comment.startLine !== line) {
       entry.start_line = comment.startLine;
       entry.start_side = side;
@@ -56,6 +78,21 @@ export function buildInlineComments(files: ReviewFile[], comments: DiffReviewCom
     inline.push(entry);
   }
   return inline;
+}
+
+export function buildReviewBody(files: ReviewFile[], payload: ReviewSubmitPayload): string | undefined {
+  const sections: string[] = [];
+  const allComment = cleanReviewText(payload.allComment);
+  if (payload.allIntent === "comment" && allComment.length > 0) sections.push(allComment);
+
+  for (const comment of payload.comments) {
+    if (comment.intent !== "comment" || comment.side !== "file") continue;
+    const body = cleanReviewText(comment.body);
+    if (body.length === 0) continue;
+    sections.push(`${getCommentFilePath(files, comment.fileId)}:\n${body}`);
+  }
+
+  return sections.length > 0 ? sections.join("\n\n") : undefined;
 }
 
 export async function getCurrentGitHubLogin(pi: ExtensionAPI, gitRoot?: string): Promise<string | null> {

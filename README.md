@@ -105,7 +105,7 @@ Local changes open the in-UI scope switcher described below.
    In the branch-level `all files` scope, files are compared against the nearest local ancestor branch when one exists, so stacked branches review only their own layer. If there is no local parent branch, it falls back to the repository default branch. Files are ordered for review priority: changed files referenced by more other changed files come first, then modified/renamed before added before deleted, then source files before tests/docs/changesets, then path order. The navigator can filter to files related to the active file with `r`. In related mode, `→` means the active file references that file, `←` means that file references the active file, and `↔` means both. Press `r` again to return to all files.
 3. Move to the file and line you care about; press `v` when you want side-by-side diff view
 4. Add annotations:
-   - `m` to edit the line in place as a `MODIFY` (the editor opens seeded with the line's code)
+   - `Enter` or `m` to edit the line in place as a `MODIFY` (the editor opens seeded with the line's code)
    - `c` for a line `COMMENT`
    - `d` for a line `DISCUSS`
    - `l` for a file annotation (a `COMMENT`)
@@ -118,10 +118,20 @@ Local changes open the in-UI scope switcher described below.
 There is no separate `/interactive-review` command; everything is `/diff`. Agents launch the same review surface through the `interactive_review` tool (the name is kept for Commander and existing prompts):
 
 - `remote` accepts a plain remote branch, a GitHub PR URL, a stack-host PR URL, or `owner/repo#number`
-- `cwd` points at an explicit local checkout for non-world repos
+- `cwd` points at an explicit local checkout when you want to review against a specific local repo
 - `ref` accepts a `base..head` or `base...head` custom range
 
-Remote branch and same-repo GitHub PR reviews fetch with `--no-tags` and a 15 second timeout, then review the fetched base/head range in the `/diff` UI. Cross-repo PRs still need a local checkout; pi-code-diff reports a clear unsupported message instead of pretending the review opened.
+Remote branch and GitHub PR reviews fetch with `--no-tags` and a 15 second timeout, then review the fetched base/head range in the `/diff` UI. PR URLs and `owner/repo#number` do not require a checkout; if no matching local checkout is configured or detected, pi-code-diff uses a lightweight git cache under `~/.pi/agent/cache/pi-code-diff/remotes/`.
+
+For monorepos or repos that should resolve to a specific local checkout, add a `repositories` mapping to `~/.pi/agent/extensions/code-diff.json`:
+
+```json
+{
+  "repositories": {
+    "owner/repo": { "cwd": "/absolute/path/to/local/checkout" }
+  }
+}
+```
 
 ### Approving and commenting on a PR
 
@@ -135,11 +145,11 @@ When the review is a GitHub PR, finishing the review opens an end-action menu:
 The three GitHub verdicts go through a deliberate, gated path so nothing is posted by accident:
 
 1. You pick a verdict and confirm it in a UI dialog. Nothing is posted yet.
-2. pi-code-diff prepares a handoff in the editor: the verdict, the review body, and your `COMMENT` items mapped to GitHub inline comments (path, line, and side; `RIGHT` for added lines, `LEFT` for deleted, with `start_line` for ranges). `DISCUSS` and `MODIFY` items are never sent to GitHub.
-3. The agent fixes only grammar and English in the text, shows you the final version, asks you to confirm, then calls the `submit_pr_review` tool.
-4. `submit_pr_review` posts through `provider-cli api repos/:owner/:repo/pulls/:number/reviews`. It refuses to approve a PR you authored (GitHub does not allow self-approval) with a clear message, and `request changes` requires a body or at least one inline comment.
+2. After confirmation, pi-code-diff submits the review directly through `provider-cli api repos/:owner/:repo/pulls/:number/reviews`.
+3. `COMMENT` line items are posted as GitHub inline comments (path, line, and side; `RIGHT` for added lines, `LEFT` for deleted, with `start_line` for ranges). `MODIFY` line edits are posted as inline comments containing a suggested diff. `COMMENT` file items and review-wide `COMMENT` notes become the review body. `DISCUSS` items are never sent to GitHub.
+4. Approval refuses self-approval with a clear message, and `request changes` requires a body or at least one inline comment.
 
-`Send feedback to the agent` skips GitHub entirely and inserts the normal local review prompt instead.
+`Send feedback to the agent` skips GitHub entirely and inserts the normal local review prompt instead, so the agent can answer or ask follow-up questions.
 
 ### Fastest path
 
@@ -200,7 +210,7 @@ Examples:
 
 #### COMMENT
 
-Use `COMMENT` (`c` on a line, `l` on a file) for review remarks. When the review is a remote GitHub PR, these post as real GitHub review comments, mirroring GitHub: inline on the line when the note has a line, or a general PR comment otherwise. For a local review there is nothing to post, so a `COMMENT` becomes a local comment to the agent about the change.
+Use `COMMENT` (`c` on a line, `l` on a file) for review remarks. When the review is a remote GitHub PR, these post as real GitHub review comments, mirroring GitHub: inline on the line when the note has a line, or a general PR comment otherwise. For a local review there is nothing to post, so a `COMMENT` becomes actionable feedback to the agent: questions should be answered in prose, and comments that ask for changes or state a preferred implementation should be handled with local edits.
 
 Examples:
 
@@ -210,7 +220,7 @@ Examples:
 
 #### MODIFY
 
-Use `MODIFY` when you already know the exact code change you want. Press `m` on a line and the inline editor opens pre-filled with that line's current code. You edit it in place, like a tiny code editor, and press Enter. The annotation is tracked as a `LINE CHANGED` block that records the original line and your edited line:
+Use `MODIFY` when you already know the exact code change you want. Press `Enter` or `m` on a line and the inline editor opens pre-filled with that line's current code. You edit it in place, like a tiny code editor, and press Enter. The annotation is tracked as a `LINE CHANGED` block that records the original line and your edited line:
 
 ```text
 LINE CHANGED
@@ -231,7 +241,9 @@ When the review UI generates the local prompt, it uses different wording dependi
 - `1 / 2 / 3` — switch scope
 - mouse wheel — scroll the pane under the cursor
 - `Tab` / `Shift+Tab` — cycle focus forward / backward
-- `/` — search files in the navigator
+- `/` — search the focused pane: files in Navigator, code in Diff, comments in Comments
+- `Esc` while searching — clear that pane's search
+- `n / N` — jump to the next / previous search match in the focused pane
 - `?` — toggle help in the right sidebar
 - `w` — toggle wrapping
 - `v` — toggle unified / side-by-side diff view
@@ -243,8 +255,9 @@ When the review UI generates the local prompt, it uses different wording dependi
 
 #### Navigator
 
-- `↑↓` or `j/k` — move between files
+- `↑↓` or `j/k` — move between files, wrapping from top to bottom and bottom to top
 - `Ctrl+d` / `Ctrl+u` — move down / up by half a pane
+- `Ctrl+f` / `Ctrl+b` or `PageDown` / `PageUp` — move down / up by a full pane
 - `gg / G` — jump to the top / bottom
 - `r` — toggle related-files filter in `all files` scope
 - file rows show change counts as `+added -deleted`
@@ -256,10 +269,12 @@ When the review UI generates the local prompt, it uses different wording dependi
 - `Shift+↑↓` — extend the selection into a multiline range on the current side
 - `← / →` — choose the old/deleted or new/added side on replacement rows in side-by-side view
 - `Ctrl+d` / `Ctrl+u` — move down / up by half a pane
+- `Ctrl+f` / `Ctrl+b` or `PageDown` / `PageUp` — move down / up by a full pane
 - `gg / G` — jump to the top / bottom
-- `n / p` — next / previous hunk
+- `n / N` — next / previous code search match when diff search is active
+- `n / p` — next / previous hunk when there is no active diff search
 - `o` — open the selected source location in `$EDITOR` inside the same Pi shell, then return to the review UI when the editor exits
-- `m` — edit the line in place as a `MODIFY`; the editor opens seeded with the line's code and saves a `LINE CHANGED` edit
+- `Enter` or `m` — edit the line in place as a `MODIFY`; the editor opens seeded with the line's code and saves a `LINE CHANGED` edit
 - `c` — line `COMMENT`
 - `d` — line `DISCUSS`
 - `e` — edit the existing line comment on the selected line
@@ -282,6 +297,7 @@ Line comment markers in the diff gutter:
 
 - `↑↓` or `j/k` — move through saved comments
 - `Ctrl+d` / `Ctrl+u` — move down / up by half a pane
+- `Ctrl+f` / `Ctrl+b` or `PageDown` / `PageUp` — move down / up by a full pane
 - `gg / G` — jump to the top / bottom
 - `e` or `Enter` — edit selected comment
 - `d` — delete selected comment

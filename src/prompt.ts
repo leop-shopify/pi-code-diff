@@ -168,12 +168,6 @@ function pushIntentSection(lines: string[], title: string, section: IntentSectio
   });
 }
 
-function joinIntentLabels(labels: string[]): string {
-  if (labels.length <= 1) return labels[0] ?? "";
-  if (labels.length === 2) return `${labels[0]} and ${labels[1]}`;
-  return `${labels.slice(0, -1).join(", ")}, and ${labels[labels.length - 1]}`;
-}
-
 function pushMixedModeHeader(lines: string[], hasModify: boolean, hasComment: boolean, hasDiscuss: boolean): void {
   lines.push("Process the following review feedback.");
   lines.push("");
@@ -181,12 +175,14 @@ function pushMixedModeHeader(lines: string[], hasModify: boolean, hasComment: bo
   if (hasModify) {
     lines.push("- For MODIFY items: apply the exact code change shown (LINE CHANGED old -> new) as a local edit.");
   }
-  if (hasComment || hasDiscuss) {
-    const labels = joinIntentLabels([hasComment ? "COMMENT" : null, hasDiscuss ? "DISCUSS" : null].filter((label): label is string => label != null));
-    lines.push(`- For ${labels} items: respond only in prose. Do not edit files, write code, run write/editing tools, or make repo changes to satisfy them unless explicitly asked.`);
+  if (hasComment) {
+    lines.push("- For COMMENT items: treat them as actionable review feedback. Answer questions in prose, and make local edits when a comment asks for a change or states a preferred implementation.");
   }
-  if (hasModify && (hasComment || hasDiscuss)) {
-    lines.push("- Apply the MODIFY items; answer the other items separately in prose.");
+  if (hasDiscuss) {
+    lines.push("- For DISCUSS items: respond only in prose. Do not edit files, write code, run write/editing tools, or make repo changes to satisfy them unless explicitly asked.");
+  }
+  if (hasModify || hasComment || hasDiscuss) {
+    lines.push("- Keep responses or edits scoped to the feedback under each item.");
   }
   lines.push("");
 }
@@ -206,7 +202,8 @@ export function composeReviewPrompt(files: ReviewFile[], payload: ReviewSubmitPa
       lines.push("Apply the following proposed code changes exactly as written, as local edits.");
       lines.push("");
     } else if (hasComment) {
-      lines.push("The following are review comments about the change. Respond to them in prose; only edit if a comment clearly requires it.");
+      lines.push("Treat the following review comments as actionable feedback about the change.");
+      lines.push("Answer questions in prose, and make local edits when a comment asks for a change or states a preferred implementation.");
       lines.push("");
     } else if (hasDiscuss) {
       lines.push("Respond to the following review discussion items in prose only.");

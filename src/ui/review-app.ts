@@ -36,7 +36,7 @@ import { getShortcutConfigPath, getShortcutsForSide, type CommentShortcut } from
 import { filterFilesBySearch } from "../search.js";
 import { sanitizeTerminalText } from "../sanitize.js";
 import { highlightJsonLine, highlightMarkdownLine } from "../theme-highlight.js";
-import type { CommentIntent, DiffReviewComment, ReviewFile, ReviewFileContents, ReviewLineTarget, ReviewResult, ReviewScope, ReviewState } from "../types.js";
+import type { CommentIntent, DiffReviewComment, ReviewFile, ReviewFileContents, ReviewFocus, ReviewLineTarget, ReviewResult, ReviewScope, ReviewState } from "../types.js";
 import { formatIntentLabel, formatScopeLabel } from "../types.js";
 
 interface LoadedEntryReady {
@@ -144,20 +144,19 @@ export function shouldStackPanes(frameInnerWidth: number): boolean {
 }
 
 export function getPaneLayout(frameInnerWidth: number, commentsHidden: boolean): { navigatorWidth: number; diffWidth: number; commentsWidth: number } {
-  const navigatorWidth = Math.max(24, Math.min(36, Math.floor(frameInnerWidth * 0.26)));
+  const sideWidth = Math.max(24, Math.min(36, Math.floor(frameInnerWidth * 0.26)));
   if (commentsHidden) {
     return {
-      navigatorWidth,
-      diffWidth: Math.max(24, frameInnerWidth - navigatorWidth - 1),
+      navigatorWidth: sideWidth,
+      diffWidth: Math.max(24, frameInnerWidth - sideWidth - 1),
       commentsWidth: 0,
     };
   }
 
-  const commentsWidth = Math.max(24, Math.min(36, Math.floor(frameInnerWidth * 0.27)));
   return {
-    navigatorWidth,
-    commentsWidth,
-    diffWidth: Math.max(24, frameInnerWidth - navigatorWidth - commentsWidth - 2),
+    navigatorWidth: sideWidth,
+    commentsWidth: sideWidth,
+    diffWidth: Math.max(24, frameInnerWidth - sideWidth * 2 - 2),
   };
 }
 
@@ -461,7 +460,8 @@ const HELP_KEY_SECTIONS = [
     lines: [
       "1/2/3 switch review scope",
       "Tab / Shift+Tab cycle focus",
-      "/ search files • ? toggle help",
+      "/ search focused pane • n/N next/prev search",
+      "? toggle help/actions",
       "w wrap lines • v toggle diff view",
       "u toggle unchanged context",
       "h hide/show comments • s submit",
@@ -472,7 +472,8 @@ const HELP_KEY_SECTIONS = [
     title: "Navigation",
     lines: [
       "navigator: ↑↓/j/k files",
-      "Ctrl+d/u half-page • gg/G top/bottom",
+      "Ctrl+d/u half-page • Ctrl+f/b full page",
+      "PageDown/PageUp page • gg/G top/bottom",
       "r related filter • Enter focus diff",
     ],
   },
@@ -482,10 +483,11 @@ const HELP_KEY_SECTIONS = [
       "diff: ↑↓/j/k lines",
       "Shift+↑↓ extend range",
       "←/→ choose side in side-by-side view",
-      "Ctrl+d/u half-page • gg/G top/bottom",
-      "n/p next/previous hunk",
+      "Ctrl+d/u half-page • Ctrl+f/b full page",
+      "PageDown/PageUp page • gg/G top/bottom",
+      "n/N next/prev search, or n/p hunk without search",
       "t templates • o edit file in $EDITOR (same shell)",
-      "m modify • c comment • d discuss line",
+      "Enter/m modify • c comment • d discuss line",
       "e edit • x delete • l file (comment) • a all (discuss)",
     ],
   },
@@ -493,7 +495,8 @@ const HELP_KEY_SECTIONS = [
     title: "Comments",
     lines: [
       "comments: ↑↓/j/k comments",
-      "Ctrl+d/u half-page • gg/G top/bottom",
+      "Ctrl+d/u half-page • Ctrl+f/b full page",
+      "PageDown/PageUp page • gg/G top/bottom",
       "e/Enter edit • d delete",
     ],
   },
@@ -529,7 +532,7 @@ export function buildCommentPanelTextLines(theme: Theme, width: number, text: st
 export function buildCommentPanelEmptyStateLines(theme: Theme, width: number): string[] {
   return [
     ...buildCommentPanelTextLines(theme, width, "No comments yet.", "dim"),
-    ...buildCommentPanelTextLines(theme, width, "Use m modify, c comment, d discuss for a line or range, l for file, or a for all.", "dim"),
+    ...buildCommentPanelTextLines(theme, width, "Use Enter/m modify, c comment, d discuss for a line or range, l for file, or a for all.", "dim"),
   ];
 }
 
@@ -687,6 +690,41 @@ export interface SideBySideCell {
 export type SideBySideDisplayRow =
   | { kind: "gap"; label: string; oldCell: null; newCell: null }
   | { kind: "context" | "change"; oldCell: SideBySideCell | null; newCell: SideBySideCell | null };
+
+export function diffTextMatchesSearch(text: string, query: string): boolean {
+  const normalizedQuery = query.trim().toLowerCase();
+  return normalizedQuery.length > 0 && text.toLowerCase().includes(normalizedQuery);
+}
+
+export function getMatchingDiffLineTargets(rows: DisplayRow[], query: string): ReviewLineTarget[] {
+  const normalizedQuery = query.trim().toLowerCase();
+  if (normalizedQuery.length === 0) return [];
+
+  const seen = new Set<string>();
+  const targets: ReviewLineTarget[] = [];
+  for (const row of rows) {
+    if (row.commentLineNumber == null || row.commentSide == null) continue;
+    if (!diffTextMatchesSearch(row.codeText, normalizedQuery)) continue;
+    const key = `${row.commentSide}:${row.commentLineNumber}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    targets.push({ side: row.commentSide, line: row.commentLineNumber });
+  }
+  return targets;
+}
+
+export function getNextSearchIndex(currentIndex: number, matchCount: number, direction: 1 | -1): number {
+  if (matchCount <= 0) return -1;
+  if (currentIndex < 0) return direction > 0 ? 0 : matchCount - 1;
+  return (currentIndex + direction + matchCount) % matchCount;
+}
+
+export function getNavigatorMoveIndex(currentIndex: number, fileCount: number, delta: number): number {
+  if (fileCount <= 0) return -1;
+  const safeCurrentIndex = currentIndex >= 0 ? currentIndex : 0;
+  if (Math.abs(delta) === 1) return (safeCurrentIndex + delta + fileCount) % fileCount;
+  return Math.max(0, Math.min(fileCount - 1, safeCurrentIndex + delta));
+}
 
 export type DiffViewMode = "unified" | "side-by-side";
 
@@ -852,6 +890,10 @@ class ReviewApp {
   private readonly cache = new Map<string, LoadedEntry>();
   private searchMode = false;
   private searchBuffer = "";
+  private searchInitialQuery = "";
+  private searchPane: ReviewFocus = "navigator";
+  private diffSearchQuery = "";
+  private commentSearchQuery = "";
   private shortcutMode = false;
   private helpMode = false;
   private diffViewMode: DiffViewMode = "unified";
@@ -984,6 +1026,7 @@ class ReviewApp {
     width: number,
     language: string | undefined,
     isSelected: boolean,
+    isSearchMatch: boolean,
     lineComment: DiffReviewComment | undefined,
   ): string[] {
     let contentText: string;
@@ -1007,6 +1050,7 @@ class ReviewApp {
     const wrapped = wrapAnsiText(contentText, Math.max(1, width - 2), this.state.wrapLines);
     return wrapped.map((line) => {
       const paddedLine = padLine(line, Math.max(1, width - 2));
+      if (isSearchMatch) return this.theme.bg("toolPendingBg", paddedLine);
       if (isSelected) return this.theme.bg("selectedBg", paddedLine);
       if (row.kind === "added" || row.kind === "removed") return applyLineBackground(this.theme, paddedLine, tone);
       return paddedLine;
@@ -1139,20 +1183,45 @@ class ReviewApp {
     this.requestRender();
   }
 
+  private getSearchQueryForPane(pane: ReviewFocus): string {
+    if (pane === "navigator") return this.state.searchQuery;
+    if (pane === "diff") return this.diffSearchQuery;
+    return this.commentSearchQuery;
+  }
+
+  private setSearchQueryForPane(pane: ReviewFocus, query: string): void {
+    this.message = null;
+    if (pane === "navigator") {
+      this.relatedFilterAnchorFileId = null;
+      this.relatedFilterReturnFileId = null;
+      this.state = setSearchQuery(this.state, this.options.files, query);
+      void this.ensureActiveEntry();
+      return;
+    }
+
+    if (pane === "diff") {
+      this.diffSearchQuery = query;
+      if (query.trim().length > 0) this.jumpDiffSearch(1, true);
+      return;
+    }
+
+    this.commentSearchQuery = query;
+    if (query.trim().length > 0) this.jumpCommentSearch(1, true);
+  }
+
   private openSearch(): void {
-    this.relatedFilterAnchorFileId = null;
-    this.relatedFilterReturnFileId = null;
+    this.searchPane = this.state.focus;
+    this.searchBuffer = this.getSearchQueryForPane(this.searchPane);
+    this.searchInitialQuery = this.searchBuffer;
     this.searchMode = true;
-    this.searchBuffer = this.state.searchQuery;
-    this.state = setFocus(this.state, "navigator");
     this.confirmCancel = false;
     this.requestRender();
   }
 
   private closeSearch(apply: boolean): void {
-    if (apply) {
-      this.state = setSearchQuery(this.state, this.options.files, this.searchBuffer);
-      void this.ensureActiveEntry();
+    if (!apply) {
+      this.searchBuffer = this.searchInitialQuery;
+      this.setSearchQueryForPane(this.searchPane, this.searchInitialQuery);
     }
     this.searchMode = false;
     this.requestRender();
@@ -1234,10 +1303,14 @@ class ReviewApp {
     const existing = getLineComment(this.state, file.id, this.state.activeScope, target.side, target.line);
     const startLine = existing?.startLine ?? range.startLine;
     const endLine = existing?.endLine ?? range.endLine;
-    const seedModify = defaultIntent === "modify" && existing == null;
-    const sourceText = seedModify || existing?.intent === "modify"
+    const sourceText = defaultIntent === "modify"
       ? this.getSourceLinesText(file.id, this.state.activeScope, target.side, startLine, endLine)
       : "";
+    const initialBody = existing != null && existing.intent === defaultIntent
+      ? existing.body
+      : defaultIntent === "modify"
+        ? sourceText
+        : existing?.body ?? "";
     this.openEditor({
       kind: "line",
       fileId: file.id,
@@ -1245,9 +1318,11 @@ class ReviewApp {
       side: target.side,
       startLine,
       endLine,
-      initialBody: existing?.body ?? (seedModify ? sourceText : ""),
-      intent: existing?.intent ?? defaultIntent,
-      originalText: existing?.originalText ?? (sourceText.length > 0 ? sourceText : undefined),
+      initialBody,
+      intent: defaultIntent,
+      originalText: defaultIntent === "modify" && sourceText.length > 0
+        ? sourceText
+        : existing?.originalText,
     });
   }
 
@@ -1610,8 +1685,7 @@ class ReviewApp {
     }
 
     const index = files.findIndex((file) => file.id === this.state.activeFileId);
-    const currentIndex = index >= 0 ? index : 0;
-    const nextIndex = Math.max(0, Math.min(files.length - 1, currentIndex + delta));
+    const nextIndex = getNavigatorMoveIndex(index, files.length, delta);
     this.state = setActiveFileId(this.state, this.options.files, files[nextIndex]!.id);
     void this.ensureActiveEntry();
     this.requestRender();
@@ -1637,6 +1711,100 @@ class ReviewApp {
     const items = getCommentPanelItems(this.state, this.state.activeFileId, this.state.activeScope);
     this.state = moveSelectedCommentIndex(this.state, items.length, delta);
     this.requestRender();
+  }
+
+  private moveFocusedSelection(delta: number): void {
+    if (this.state.focus === "navigator") {
+      this.moveNavigatorSelection(delta);
+      return;
+    }
+    if (this.state.focus === "diff") {
+      this.moveDiffSelection(delta);
+      return;
+    }
+    this.moveCommentSelection(delta);
+  }
+
+  private jumpNavigatorSearch(direction: 1 | -1): boolean {
+    if (this.state.searchQuery.trim().length === 0) return false;
+    const files = this.getNavigatorFiles();
+    if (files.length === 0) {
+      this.setMessage("No file search matches.");
+      this.requestRender();
+      return true;
+    }
+    this.message = null;
+    const index = files.findIndex((file) => file.id === this.state.activeFileId);
+    const nextIndex = getNextSearchIndex(index, files.length, direction);
+    this.state = setActiveFileId(this.state, this.options.files, files[nextIndex]!.id);
+    void this.ensureActiveEntry();
+    this.requestRender();
+    return true;
+  }
+
+  private jumpDiffSearch(direction: 1 | -1, allowCurrent = false): boolean {
+    if (this.diffSearchQuery.trim().length === 0) return false;
+    const file = this.activeFile();
+    if (file == null) return true;
+    const rows = this.getDiffLayout(file.id, this.state.activeScope)?.unifiedRows ?? [];
+    const matches = getMatchingDiffLineTargets(rows, this.diffSearchQuery);
+    if (matches.length === 0) {
+      this.setMessage("No code search matches.");
+      this.requestRender();
+      return true;
+    }
+
+    this.message = null;
+    const current = getSelectedLineTarget(this.state, file.id, this.state.activeScope);
+    let index = current == null ? -1 : matches.findIndex((match) => match.side === current.side && match.line === current.line);
+    if (allowCurrent && index >= 0) {
+      // Keep the live-search cursor on the current match while typing.
+    } else {
+      index = getNextSearchIndex(index, matches.length, direction);
+    }
+    this.state = setSelectedLineTarget(this.state, file.id, this.state.activeScope, matches[index]!);
+    this.requestRender();
+    return true;
+  }
+
+  private getCommentSearchText(item: CommentPanelItem): string {
+    if (item.kind === "all") return `all note ${formatIntentLabel(item.intent)} ${item.body}`;
+    const comment = item.comment;
+    const location = comment.side === "file"
+      ? "file"
+      : `${comment.side} ${formatLineRangeLabel(comment.startLine ?? 0, comment.endLine ?? comment.startLine ?? 0)}`;
+    return `${formatIntentLabel(comment.intent)} ${location} ${comment.body}`;
+  }
+
+  private jumpCommentSearch(direction: 1 | -1, allowCurrent = false): boolean {
+    const query = this.commentSearchQuery.trim().toLowerCase();
+    if (query.length === 0) return false;
+    const items = getCommentPanelItems(this.state, this.state.activeFileId, this.state.activeScope);
+    const matches = items
+      .map((item, index) => ({ item, index }))
+      .filter(({ item }) => this.getCommentSearchText(item).toLowerCase().includes(query));
+    if (matches.length === 0) {
+      this.setMessage("No comment search matches.");
+      this.requestRender();
+      return true;
+    }
+
+    this.message = null;
+    let index = matches.findIndex((match) => match.index === this.state.selectedCommentIndex);
+    if (allowCurrent && index >= 0) {
+      // Keep the live-search cursor on the current match while typing.
+    } else {
+      index = getNextSearchIndex(index, matches.length, direction);
+    }
+    this.state = moveSelectedCommentIndex(this.state, items.length, matches[index]!.index - this.state.selectedCommentIndex);
+    this.requestRender();
+    return true;
+  }
+
+  private jumpSearch(direction: 1 | -1): boolean {
+    if (this.state.focus === "navigator") return this.jumpNavigatorSearch(direction);
+    if (this.state.focus === "diff") return this.jumpDiffSearch(direction);
+    return this.jumpCommentSearch(direction);
   }
 
   private jumpToBoundary(direction: "start" | "end"): void {
@@ -1720,7 +1888,9 @@ class ReviewApp {
 
   private handleSearchInput(data: string): void {
     if (matchesKey(data, Key.escape)) {
-      this.closeSearch(false);
+      this.searchBuffer = "";
+      this.setSearchQueryForPane(this.searchPane, "");
+      this.closeSearch(true);
       return;
     }
     if (matchesKey(data, Key.enter)) {
@@ -1729,15 +1899,13 @@ class ReviewApp {
     }
     if (matchesKey(data, Key.backspace)) {
       this.searchBuffer = this.searchBuffer.slice(0, -1);
-      this.state = setSearchQuery(this.state, this.options.files, this.searchBuffer);
-      void this.ensureActiveEntry();
+      this.setSearchQueryForPane(this.searchPane, this.searchBuffer);
       this.requestRender();
       return;
     }
     if (data.length === 1 && data >= " ") {
       this.searchBuffer += data;
-      this.state = setSearchQuery(this.state, this.options.files, this.searchBuffer);
-      void this.ensureActiveEntry();
+      this.setSearchQueryForPane(this.searchPane, this.searchBuffer);
       this.requestRender();
     }
   }
@@ -1810,6 +1978,8 @@ class ReviewApp {
     if (data === "g") { this.pendingVimSequence = "g"; return; }
     if (data === "G") { this.jumpToBoundary("end"); return; }
     if (data === "/") { this.openSearch(); return; }
+    if (matchesKey(data, Key.ctrl("f"))) { this.moveFocusedSelection(this.state.focus === "navigator" ? this.navigatorPageSize : this.state.focus === "diff" ? this.diffPageSize : this.commentsPageSize); return; }
+    if (matchesKey(data, Key.ctrl("b"))) { this.moveFocusedSelection(-(this.state.focus === "navigator" ? this.navigatorPageSize : this.state.focus === "diff" ? this.diffPageSize : this.commentsPageSize)); return; }
     if (matchesKey(data, Key.escape) || matchesKey(data, Key.ctrl("c"))) { this.requestCancel(); return; }
     if (data === "h") { this.toggleCommentsPane(); return; }
     if (data === "w") { this.state = setWrapLines(this.state, !this.state.wrapLines); this.requestRender(); return; }
@@ -1818,6 +1988,8 @@ class ReviewApp {
     if (data === "s") { this.submit(); return; }
     if (data === "l") { this.editFileComment(); return; }
     if (data === "a") { this.editAllNote(); return; }
+    if (data === "n" && this.jumpSearch(1)) { return; }
+    if (data === "N" && this.jumpSearch(-1)) { return; }
     if (data === "n") { this.moveHunk(1); return; }
     if (data === "p") { this.moveHunk(-1); return; }
 
@@ -1836,6 +2008,14 @@ class ReviewApp {
       }
       if (matchesKey(data, Key.ctrl("u"))) {
         this.moveNavigatorSelection(-getHalfPageStep(this.navigatorPageSize));
+        return;
+      }
+      if (matchesKey(data, Key.pageDown)) {
+        this.moveNavigatorSelection(this.navigatorPageSize);
+        return;
+      }
+      if (matchesKey(data, Key.pageUp)) {
+        this.moveNavigatorSelection(-this.navigatorPageSize);
         return;
       }
       if (data === "r") {
@@ -1886,11 +2066,19 @@ class ReviewApp {
           this.moveDiffSelection(-getHalfPageStep(this.diffPageSize));
           return;
         }
+        if (matchesKey(data, Key.pageDown)) {
+          this.moveDiffSelection(this.diffPageSize);
+          return;
+        }
+        if (matchesKey(data, Key.pageUp)) {
+          this.moveDiffSelection(-this.diffPageSize);
+          return;
+        }
         if (data === "o") {
           void this.openSelectedLineInEditor();
           return;
         }
-        if (data === "m") {
+        if (data === "m" || data === "M" || matchesKey(data, Key.enter)) {
           this.editLineCommentWithIntent("modify");
           return;
         }
@@ -1932,6 +2120,14 @@ class ReviewApp {
         this.moveCommentSelection(-getHalfPageStep(this.commentsPageSize));
         return;
       }
+      if (matchesKey(data, Key.pageDown)) {
+        this.moveCommentSelection(this.commentsPageSize);
+        return;
+      }
+      if (matchesKey(data, Key.pageUp)) {
+        this.moveCommentSelection(-this.commentsPageSize);
+        return;
+      }
       if (data === "e" || matchesKey(data, Key.enter)) {
         this.editSelectedComment();
         return;
@@ -1948,7 +2144,11 @@ class ReviewApp {
     const lines: string[] = [];
     const relatedAnchor = this.relatedFilterAnchorFile();
     const relatedSuffix = relatedAnchor == null ? "" : ` • related to ${shortenNavigatorPath(relatedAnchor.path, 24)}`;
-    const titleSuffix = this.searchMode ? ` (${this.searchBuffer || "…"})` : this.state.searchQuery ? ` (${this.state.searchQuery})` : "";
+    const titleSuffix = this.searchMode && this.searchPane === "navigator"
+      ? ` (${this.searchBuffer || "…"})`
+      : this.state.searchQuery
+        ? ` (${this.state.searchQuery})`
+        : "";
     lines.push(this.theme.fg("muted", `${files.length} file${files.length === 1 ? "" : "s"}${titleSuffix}${relatedSuffix}`));
     lines.push("");
 
@@ -1974,14 +2174,20 @@ class ReviewApp {
       const prefixText = `${prefix} ${status} `;
       const pathWidth = Math.max(1, width - 2 - visibleWidth(prefixText) - visibleWidth(changeMarker) - visibleWidth(commentMarker));
       const shortenedPath = shortenNavigatorPath(sanitizeTerminalText(file.path), pathWidth);
-      const pathText = active ? this.theme.fg("accent", shortenedPath) : this.theme.fg("text", shortenedPath);
-      lines.push(`${prefixText}${pathText}${changeMarker}${commentMarker}`);
+      const searchMatched = this.state.searchQuery.trim().length > 0;
+      const pathText = active
+        ? this.theme.fg("accent", shortenedPath)
+        : searchMatched
+          ? this.theme.fg("success", shortenedPath)
+          : this.theme.fg("text", shortenedPath);
+      const rowText = `${prefixText}${pathText}${changeMarker}${commentMarker}`;
+      lines.push(searchMatched ? this.theme.bg("toolPendingBg", rowText) : rowText);
     }
 
     return renderBox("Navigator", width, height, this.theme, lines, this.state.focus === "navigator");
   }
 
-  private renderSideBySideCellLines(cell: SideBySideCell | null, width: number, language: string | undefined, selected: boolean, fileId: string): string[] {
+  private renderSideBySideCellLines(cell: SideBySideCell | null, width: number, language: string | undefined, selected: boolean, searchMatched: boolean, fileId: string): string[] {
     if (cell == null) return [" ".repeat(Math.max(1, width))];
 
     const lineComment = getLineComment(this.state, fileId, this.state.activeScope, cell.side, cell.lineNumber);
@@ -1998,6 +2204,7 @@ class ReviewApp {
 
     return wrapAnsiText(contentText, Math.max(1, width), this.state.wrapLines).map((line) => {
       const paddedLine = padLine(line, Math.max(1, width));
+      if (searchMatched) return this.theme.bg("toolPendingBg", paddedLine);
       if (selected) return this.theme.bg("selectedBg", paddedLine);
       if (cell.tone === "added" || cell.tone === "removed") return applyLineBackground(this.theme, paddedLine, cell.tone);
       return paddedLine;
@@ -2038,8 +2245,10 @@ class ReviewApp {
         && row.newCell.lineNumber <= selectedRange.endLine;
       const oldCurrent = row.oldCell != null && selectedTarget?.side === row.oldCell.side && selectedTarget.line === row.oldCell.lineNumber;
       const newCurrent = row.newCell != null && selectedTarget?.side === row.newCell.side && selectedTarget.line === row.newCell.lineNumber;
-      const oldLines = this.renderSideBySideCellLines(row.oldCell, oldWidth, language, oldSelected, fileId);
-      const newLines = this.renderSideBySideCellLines(row.newCell, newWidth, language, newSelected, fileId);
+      const oldSearchMatched = row.oldCell != null && diffTextMatchesSearch(row.oldCell.text, this.diffSearchQuery);
+      const newSearchMatched = row.newCell != null && diffTextMatchesSearch(row.newCell.text, this.diffSearchQuery);
+      const oldLines = this.renderSideBySideCellLines(row.oldCell, oldWidth, language, oldSelected, oldSearchMatched, fileId);
+      const newLines = this.renderSideBySideCellLines(row.newCell, newWidth, language, newSelected, newSearchMatched, fileId);
       const rowStart = lines.length;
       const rowHeight = Math.max(oldLines.length, newLines.length);
       for (let index = 0; index < rowHeight; index += 1) {
@@ -2079,8 +2288,13 @@ class ReviewApp {
     }
 
     const entry = this.getEntry(file.id, this.state.activeScope);
+    const diffSearchLabel = this.searchMode && this.searchPane === "diff"
+      ? ` • search ${this.searchBuffer || "…"}`
+      : this.diffSearchQuery
+        ? ` • search ${this.diffSearchQuery}`
+        : "";
     lines.push(this.theme.fg("muted", getScopeDisplayPath(file, this.state.activeScope)));
-    lines.push(this.theme.fg("dim", `${formatScopeLabel(this.state.activeScope)} • view ${formatDiffViewModeLabel(this.diffViewMode)} • wrap ${this.state.wrapLines ? "on" : "off"}${this.state.activeScope === "all-files" ? "" : ` • unchanged ${this.state.hideUnchanged ? "hidden" : "shown"}`}`));
+    lines.push(this.theme.fg("dim", `${formatScopeLabel(this.state.activeScope)} • view ${formatDiffViewModeLabel(this.diffViewMode)} • wrap ${this.state.wrapLines ? "on" : "off"}${this.state.activeScope === "all-files" ? "" : ` • unchanged ${this.state.hideUnchanged ? "hidden" : "shown"}`}${diffSearchLabel}`));
     lines.push("");
 
     if (entry == null || entry.status === "loading") {
@@ -2099,7 +2313,7 @@ class ReviewApp {
     const language = detectPiLanguage(file.path);
     this.state = clampSelectedLineTarget(this.state, file.id, this.state.activeScope, visibleTargets);
     const selectedTarget = getSelectedLineTarget(this.state, file.id, this.state.activeScope);
-    lines[1] = this.theme.fg("dim", `${formatScopeLabel(this.state.activeScope)} • view ${formatDiffViewModeLabel(this.diffViewMode)} • ${formatSelectedLineTargetLabel(selectedTarget)} • wrap ${this.state.wrapLines ? "on" : "off"}${this.state.activeScope === "all-files" ? "" : ` • unchanged ${this.state.hideUnchanged ? "hidden" : "shown"}`}`);
+    lines[1] = this.theme.fg("dim", `${formatScopeLabel(this.state.activeScope)} • view ${formatDiffViewModeLabel(this.diffViewMode)} • ${formatSelectedLineTargetLabel(selectedTarget)} • wrap ${this.state.wrapLines ? "on" : "off"}${this.state.activeScope === "all-files" ? "" : ` • unchanged ${this.state.hideUnchanged ? "hidden" : "shown"}`}${diffSearchLabel}`);
     let rendered: string[];
     let selectedIndex = 0;
 
@@ -2131,8 +2345,9 @@ class ReviewApp {
         const lineComment = row.commentLineNumber != null && row.commentSide != null
           ? getLineComment(this.state, file.id, this.state.activeScope, row.commentSide, row.commentLineNumber)
           : undefined;
+        const isSearchMatch = diffTextMatchesSearch(row.codeText, this.diffSearchQuery);
 
-        const memoKey = `${width}\u001f${wrapFlag}\u001f${isSelected ? 1 : 0}\u001f${lineComment?.intent ?? "-"}`;
+        const memoKey = `${width}\u001f${wrapFlag}\u001f${isSelected ? 1 : 0}\u001f${isSearchMatch ? 1 : 0}\u001f${lineComment?.intent ?? "-"}`;
         let memo = rowRenderCache.get(row);
         if (memo == null) {
           memo = new Map();
@@ -2140,7 +2355,7 @@ class ReviewApp {
         }
         let renderedLines = memo.get(memoKey);
         if (renderedLines == null) {
-          renderedLines = this.buildUnifiedRowLines(row, width, language, isSelected, lineComment);
+          renderedLines = this.buildUnifiedRowLines(row, width, language, isSelected, isSearchMatch, lineComment);
           memo.set(memoKey, renderedLines);
         }
 
@@ -2262,7 +2477,12 @@ class ReviewApp {
       return renderBox("Edit comment", width, height, this.theme, lines, true);
     }
 
-    lines.push(this.theme.fg("muted", `${this.state.draft.comments.length} scoped comment${this.state.draft.comments.length === 1 ? "" : "s"}`));
+    const commentSearchLabel = this.searchMode && this.searchPane === "comments"
+      ? ` • search ${this.searchBuffer || "…"}`
+      : this.commentSearchQuery
+        ? ` • search ${this.commentSearchQuery}`
+        : "";
+    lines.push(this.theme.fg("muted", `${this.state.draft.comments.length} scoped comment${this.state.draft.comments.length === 1 ? "" : "s"}${commentSearchLabel}`));
     lines.push(this.theme.fg("dim", this.state.draft.allComment ? `all note set • ${formatIntentLabel(this.state.draft.allIntent).toLowerCase()}` : "all note: none"));
     lines.push("");
 
@@ -2299,9 +2519,15 @@ class ReviewApp {
     for (const [index, item] of items.slice(this.commentsScroll, this.commentsScroll + maxBody).entries()) {
       const absoluteIndex = this.commentsScroll + index;
       const selected = absoluteIndex === activeIndex;
+      const searchMatched = this.commentSearchQuery.trim().length > 0 && this.getCommentSearchText(item).toLowerCase().includes(this.commentSearchQuery.trim().toLowerCase());
       const prefix = selected ? this.theme.fg("accent", "› ") : "  ";
       const label = getPanelItemLabel(this.theme, item);
-      pushWrappedAnsiText(lines, selected ? this.theme.fg("accent", label) : label, contentWidth, prefix);
+      const labelText = selected
+        ? this.theme.fg("accent", label)
+        : searchMatched
+          ? this.theme.fg("success", label)
+          : label;
+      pushWrappedAnsiText(lines, labelText, contentWidth, prefix);
       const body = item.kind === "all" ? item.body : item.comment.body;
       for (const line of buildCommentPanelTextLines(this.theme, width, body, "muted", "   ", 3)) {
         lines.push(line);
@@ -2337,7 +2563,7 @@ class ReviewApp {
       : this.helpMode
         ? "Help open • ? toggle • Esc close"
         : this.message ?? (this.searchMode
-          ? `Search: ${sanitizeTerminalText(this.searchBuffer)}`
+          ? `Search ${formatFocusStatus(this.searchPane).replace("Focus: ", "")}: ${sanitizeTerminalText(this.searchBuffer)}`
           : this.editTarget != null
             ? `Editing ${formatIntentLabel(this.editTarget.intent).toLowerCase()} comment`
             : `${formatFocusStatus(this.state.focus)} • ${layoutStatus}Tab focus • / search • t templates • v diff view • ? help • 1/2/3 scopes • h ${this.commentsHidden ? "show" : "hide"} comments • o open in $EDITOR • s submit • Esc exit • Ctrl+C exit`);

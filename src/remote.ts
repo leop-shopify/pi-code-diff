@@ -1,8 +1,10 @@
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
+import { mkdir } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { getDefaultBranchRef } from "./git.js";
+import { getShortcutConfigPath } from "./shortcuts.js";
 
 export interface RemoteParseResult {
   branch: string;
@@ -36,9 +38,7 @@ export interface RemoteReviewTarget {
   pullRequest?: PullRequestMetadata;
 }
 
-function shellQuote(value: string): string {
-  return `'${value.replace(/'/g, `'\\''`)}'`;
-}
+export type RemoteProgress = (message: string) => void;
 
 function originRef(branch: string): string {
   return `refs/remotes/origin/${branch}`;
@@ -67,30 +67,110 @@ export function extractBranchFromRemote(input: string): RemoteParseResult | null
   return null;
 }
 
-function getWorldRoot(fallbackCwd: string): string {
-  const rootSrc = join(homedir(), "world", "trees", "root", "src");
-  return existsSync(rootSrc) ? rootSrc : fallbackCwd;
+interface RemoteRepositoryConfig {
+  cwd?: unknown;
+  path?: unknown;
 }
 
-async function resolveRepoRoot(pi: ExtensionAPI, fallbackCwd: string, repo: string | undefined, explicitCwd: string | undefined): Promise<{ gitRoot: string; crossRepo: boolean }> {
-  if (explicitCwd != null) return { gitRoot: explicitCwd, crossRepo: false };
-  if (repo == null || repo.toLowerCase() === "example/widgets") return { gitRoot: getWorldRoot(fallbackCwd), crossRepo: false };
+interface CodeDiffConfigFile {
+  repositories?: Record<string, string | RemoteRepositoryConfig>;
+}
 
-  const repoShortName = repo.split("/").pop() ?? repo;
-  if (!/^[\w.-]+$/.test(repoShortName)) return { gitRoot: getWorldRoot(fallbackCwd), crossRepo: true };
+function normalizeRepoName(repo: string): string {
+  return repo.trim().toLowerCase();
+}
 
-  const devCdResult = await pi.exec("bash", ["-lc", `dev cd ${shellQuote(repoShortName)} && pwd`], { cwd: fallbackCwd, timeout: 10000 });
-  const devCdPath = devCdResult.code === 0 ? devCdResult.stdout.trim().split("\n").pop()?.trim() : undefined;
-  if (devCdPath != null && devCdPath.length > 0 && existsSync(devCdPath)) return { gitRoot: devCdPath, crossRepo: false };
+function getCodeDiffConfigPath(): string {
+  return process.env.PI_CODE_DIFF_CONFIG_PATH ?? getShortcutConfigPath();
+}
 
-  return { gitRoot: getWorldRoot(fallbackCwd), crossRepo: true };
+function getConfiguredRepoRoot(repo: string): string | undefined {
+  const configPath = getCodeDiffConfigPath();
+  if (!existsSync(configPath)) return undefined;
+
+  try {
+    const config = JSON.parse(readFileSync(configPath, "utf8")) as CodeDiffConfigFile;
+    const repositories = config.repositories ?? {};
+    const entry = repositories[repo] ?? repositories[normalizeRepoName(repo)];
+    const candidate = typeof entry === "string" ? entry : typeof entry?.cwd === "string" ? entry.cwd : typeof entry?.path === "string" ? entry.path : undefined;
+    return candidate != null && existsSync(candidate) ? candidate : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function repoMatchesRemoteUrl(repo: string, remoteUrl: string): boolean {
+  const normalizedRepo = normalizeRepoName(repo).replace(/\.git$/, "");
+  const normalizedRemote = remoteUrl.trim().toLowerCase().replace(/\.git$/, "");
+  return normalizedRemote.endsWith(`/${normalizedRepo}`) || normalizedRemote.endsWith(`:${normalizedRepo}`);
+}
+
+async function getMatchingLocalRepoRoot(pi: ExtensionAPI, cwd: string, repo: string): Promise<string | undefined> {
+  const rootResult = await pi.exec("git", ["rev-parse", "--show-toplevel"], { cwd, timeout: 10000 });
+  if (rootResult.code !== 0) return undefined;
+
+  const gitRoot = rootResult.stdout.trim();
+  if (gitRoot.length === 0) return undefined;
+
+  const remoteResult = await pi.exec("git", ["remote", "get-url", "origin"], { cwd: gitRoot, timeout: 10000 });
+  if (remoteResult.code !== 0 || !repoMatchesRemoteUrl(repo, remoteResult.stdout)) return undefined;
+  return gitRoot;
+}
+
+function getRemoteCacheRoot(repo: string): string {
+  const safeParts = repo.split("/").map((part) => part.replace(/[^\w.-]/g, "_")).filter(Boolean);
+  const root = process.env.PI_CODE_DIFF_REMOTE_CACHE_ROOT ?? join(homedir(), ".pi", "agent", "cache", "pi-code-diff", "remotes");
+  return join(root, ...safeParts);
+}
+
+async function ensureRemoteCacheRepo(pi: ExtensionAPI, repo: string, onProgress?: RemoteProgress): Promise<string> {
+  const gitRoot = getRemoteCacheRoot(repo);
+  onProgress?.(`Preparing remote review cache for ${repo}…`);
+  await mkdir(gitRoot, { recursive: true });
+  if (!existsSync(join(gitRoot, ".git"))) {
+    const result = await pi.exec("git", ["init"], { cwd: gitRoot, timeout: 10000 });
+    if (result.code !== 0) throw new Error(result.stderr || result.stdout || `Could not initialize remote review cache for ${repo}.`);
+  }
+
+  const ok = await pi.exec("git", ["rev-parse", "--show-toplevel"], { cwd: gitRoot, timeout: 10000 });
+  if (ok.code !== 0) throw new Error(`Remote review cache is not a usable git repository at ${gitRoot}.`);
+  return ok.stdout.trim() || gitRoot;
+}
+
+async function resolveRepoRoot(pi: ExtensionAPI, fallbackCwd: string, repo: string | undefined, explicitCwd: string | undefined, onProgress?: RemoteProgress): Promise<{ gitRoot: string; fetchRemote?: string }> {
+  if (explicitCwd != null) {
+    onProgress?.(`Using local checkout ${explicitCwd}…`);
+    return { gitRoot: explicitCwd };
+  }
+  if (repo == null) {
+    onProgress?.("Using current repository for remote branch review…");
+    return { gitRoot: fallbackCwd };
+  }
+
+  const configuredRoot = getConfiguredRepoRoot(repo);
+  if (configuredRoot != null) {
+    onProgress?.(`Using configured checkout for ${repo}…`);
+    return { gitRoot: configuredRoot };
+  }
+
+  const localRoot = await getMatchingLocalRepoRoot(pi, fallbackCwd, repo);
+  if (localRoot != null) {
+    onProgress?.(`Using current checkout for ${repo}…`);
+    return { gitRoot: localRoot };
+  }
+
+  return {
+    gitRoot: await ensureRemoteCacheRepo(pi, repo, onProgress),
+    fetchRemote: `https://github.com/${repo}.git`,
+  };
 }
 
 function ghArgs(args: string[], repo: string | undefined): string[] {
   return repo == null ? args : [...args, "--repo", repo];
 }
 
-export async function getPullRequestMetadata(pi: ExtensionAPI, gitRoot: string, prNumber: string, repo?: string): Promise<PullRequestMetadata> {
+export async function getPullRequestMetadata(pi: ExtensionAPI, gitRoot: string, prNumber: string, repo?: string, onProgress?: RemoteProgress): Promise<PullRequestMetadata> {
+  onProgress?.(`Fetching PR #${prNumber} metadata${repo == null ? "" : ` from ${repo}`}…`);
   const result = await pi.exec("provider-cli", ghArgs(["pr", "view", prNumber, "--json", "title,body,additions,deletions,changedFiles,author,reviews,state,headRefName,headRefOid,baseRefName"], repo), { cwd: gitRoot, timeout: 15000 });
   if (result.code !== 0 || result.stdout.trim().length === 0) {
     throw new Error(`Could not resolve PR #${prNumber}: ${result.stderr || "empty provider-cli response"}`);
@@ -129,50 +209,51 @@ export async function getPullRequestMetadata(pi: ExtensionAPI, gitRoot: string, 
   };
 }
 
-async function fetchRemoteRefs(pi: ExtensionAPI, gitRoot: string, refspecs: string[]): Promise<void> {
-  const result = await pi.exec("git", ["--no-pager", "fetch", "--no-tags", "origin", ...refspecs], { cwd: gitRoot, timeout: 15000 });
+async function fetchRemoteRefs(pi: ExtensionAPI, gitRoot: string, refspecs: string[], remote = "origin", onProgress?: RemoteProgress): Promise<void> {
+  onProgress?.(`Fetching remote refs from ${remote === "origin" ? "origin" : "GitHub"}…`);
+  const result = await pi.exec("git", ["--no-pager", "fetch", "--no-tags", remote, ...refspecs], { cwd: gitRoot, timeout: 15000 });
   if (result.killed) throw new Error(`Timed out fetching remote refs after 15s. stderr: ${result.stderr || "(none)"}`);
   if (result.code !== 0) throw new Error(result.stderr || result.stdout || "Failed to fetch remote refs.");
 }
 
-async function fetchPullRequestRefs(pi: ExtensionAPI, gitRoot: string, metadata: PullRequestMetadata): Promise<{ baseRef: string; headRef: string }> {
+async function fetchPullRequestRefs(pi: ExtensionAPI, gitRoot: string, metadata: PullRequestMetadata, remote = "origin", onProgress?: RemoteProgress): Promise<{ baseRef: string; headRef: string }> {
   const baseBranch = metadata.baseRefName || "main";
   try {
     await fetchRemoteRefs(pi, gitRoot, [
       `+${baseBranch}:${originRef(baseBranch)}`,
       `+${metadata.headRefName}:${originRef(metadata.headRefName)}`,
-    ]);
+    ], remote, onProgress);
     return { baseRef: originShortRef(baseBranch), headRef: originShortRef(metadata.headRefName) };
   } catch {
     const prHeadBranch = `pr/${metadata.number}/head`;
     await fetchRemoteRefs(pi, gitRoot, [
       `+${baseBranch}:${originRef(baseBranch)}`,
       `+refs/pull/${metadata.number}/head:${originRef(prHeadBranch)}`,
-    ]);
+    ], remote, onProgress);
     return { baseRef: originShortRef(baseBranch), headRef: originShortRef(prHeadBranch) };
   }
 }
 
-async function fetchPlainRemoteBranch(pi: ExtensionAPI, gitRoot: string, branch: string): Promise<{ baseRef: string; headRef: string }> {
+async function fetchPlainRemoteBranch(pi: ExtensionAPI, gitRoot: string, branch: string, onProgress?: RemoteProgress): Promise<{ baseRef: string; headRef: string }> {
   const defaultBranchRef = await getDefaultBranchRef(pi, gitRoot);
   const baseBranch = stripOriginPrefix(defaultBranchRef ?? "origin/main");
   await fetchRemoteRefs(pi, gitRoot, [
     `+${baseBranch}:${originRef(baseBranch)}`,
     `+${branch}:${originRef(branch)}`,
-  ]);
+  ], "origin", onProgress);
   return { baseRef: originShortRef(baseBranch), headRef: originShortRef(branch) };
 }
 
-export async function resolveRemoteReviewTarget(pi: ExtensionAPI, fallbackCwd: string, remote: string, explicitCwd?: string): Promise<RemoteReviewTarget> {
+export async function resolveRemoteReviewTarget(pi: ExtensionAPI, fallbackCwd: string, remote: string, explicitCwd?: string, onProgress?: RemoteProgress): Promise<RemoteReviewTarget> {
   const parsed = extractBranchFromRemote(remote);
   if (parsed == null) throw new Error(`Could not extract branch name from: ${remote}`);
 
-  const { gitRoot, crossRepo } = await resolveRepoRoot(pi, fallbackCwd, parsed.repo, explicitCwd);
-  if (crossRepo) throw new Error(`Repository ${parsed.repo} is not checked out locally; cross-repo PR diffs are not supported in pi-code-diff yet.`);
+  onProgress?.(`Preparing remote review for ${remote}…`);
+  const { gitRoot, fetchRemote } = await resolveRepoRoot(pi, fallbackCwd, parsed.repo, explicitCwd, onProgress);
 
   if (parsed.prNumber != null) {
-    const pullRequest = await getPullRequestMetadata(pi, gitRoot, parsed.prNumber, parsed.repo);
-    const refs = await fetchPullRequestRefs(pi, gitRoot, pullRequest);
+    const pullRequest = await getPullRequestMetadata(pi, gitRoot, parsed.prNumber, parsed.repo, onProgress);
+    const refs = await fetchPullRequestRefs(pi, gitRoot, pullRequest, fetchRemote, onProgress);
     return {
       gitRoot,
       baseRef: refs.baseRef,
@@ -184,7 +265,7 @@ export async function resolveRemoteReviewTarget(pi: ExtensionAPI, fallbackCwd: s
     };
   }
 
-  const refs = await fetchPlainRemoteBranch(pi, gitRoot, parsed.branch);
+  const refs = await fetchPlainRemoteBranch(pi, gitRoot, parsed.branch, onProgress);
   return {
     gitRoot,
     baseRef: refs.baseRef,
