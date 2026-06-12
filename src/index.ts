@@ -206,6 +206,7 @@ export default function codeDiffExtension(pi: ExtensionAPI) {
         repoRoot,
         loadFileContents: (file, scope) => loadReviewFileContents(pi, repoRoot, file, scope, branchBaseRevision, modifiedRevision),
         commentShortcuts: shortcutConfig.shortcuts,
+        allowEmptySubmit: remoteTarget?.pullRequest != null,
       });
 
       if (result.type === "cancel") {
