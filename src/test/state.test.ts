@@ -98,8 +98,34 @@ describe("review state", () => {
 
     expect(state.draft.comments).toHaveLength(2);
     expect(getLineComment(state, "src/a.ts", "git-diff", "added", 12)?.body).toBe("Second");
-    expect(getLineComment(state, "src/a.ts", "git-diff", "added", 12)?.intent).toBe("fix");
+    expect(getLineComment(state, "src/a.ts", "git-diff", "added", 12)?.intent).toBe("discuss");
     expect(getLineComment(state, "src/a.ts", "git-diff", "deleted", 12)?.body).toBe("Removed note");
+  });
+
+  it("persists a modify intent on a line comment", () => {
+    const files = [makeFile("src/a.ts")];
+    let state = createInitialReviewState(files);
+    state = upsertLineComment(state, "src/a.ts", "git-diff", "added", 12, "user = fetchUser(id)", "modify");
+
+    expect(getLineComment(state, "src/a.ts", "git-diff", "added", 12)?.intent).toBe("modify");
+  });
+
+  it("captures the original line text on a modify edit", () => {
+    const files = [makeFile("src/a.ts")];
+    let state = createInitialReviewState(files);
+    state = upsertLineComment(state, "src/a.ts", "git-diff", "added", 12, "const x = compute(1, true)", "modify", 12, "const x = compute(1)");
+
+    const comment = getLineComment(state, "src/a.ts", "git-diff", "added", 12);
+    expect(comment?.originalText).toBe("const x = compute(1)");
+    expect(comment?.body).toBe("const x = compute(1, true)");
+  });
+
+  it("omits originalText when none is provided", () => {
+    const files = [makeFile("src/a.ts")];
+    let state = createInitialReviewState(files);
+    state = upsertLineComment(state, "src/a.ts", "git-diff", "added", 12, "Consider a clearer name", "comment");
+
+    expect(getLineComment(state, "src/a.ts", "git-diff", "added", 12)?.originalText).toBeUndefined();
   });
 
   it("supports line comment ranges", () => {
@@ -115,7 +141,7 @@ describe("review state", () => {
   it("replaces overlapping line comment ranges", () => {
     const files = [makeFile("src/a.ts")];
     let state = createInitialReviewState(files);
-    state = upsertLineComment(state, "src/a.ts", "git-diff", "added", 12, "Range note", "fix", 14);
+    state = upsertLineComment(state, "src/a.ts", "git-diff", "added", 12, "Range note", "comment", 14);
     state = upsertLineComment(state, "src/a.ts", "git-diff", "added", 13, "Middle note");
 
     expect(state.draft.comments).toHaveLength(1);
@@ -126,11 +152,11 @@ describe("review state", () => {
     const files = [makeFile("src/a.ts")];
     let state = createInitialReviewState(files);
     state = upsertFileComment(state, "src/a.ts", "git-diff", "One", "discuss");
-    state = upsertFileComment(state, "src/a.ts", "git-diff", "Two", "fix");
+    state = upsertFileComment(state, "src/a.ts", "git-diff", "Two", "comment");
 
     expect(state.draft.comments).toHaveLength(1);
     expect(getFileComment(state, "src/a.ts", "git-diff")?.body).toBe("Two");
-    expect(getFileComment(state, "src/a.ts", "git-diff")?.intent).toBe("fix");
+    expect(getFileComment(state, "src/a.ts", "git-diff")?.intent).toBe("comment");
   });
 
   it("filters files using search query", () => {

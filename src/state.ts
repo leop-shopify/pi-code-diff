@@ -89,7 +89,7 @@ export function createInitialReviewState(files: ReviewFile[]): ReviewState {
     selectedLineTargetByScopeFile: {},
     draft: {
       allComment: "",
-      allIntent: "fix",
+      allIntent: "discuss",
       comments: [],
     },
   };
@@ -289,8 +289,9 @@ export function upsertLineComment(
   side: Exclude<CommentSide, "file">,
   line: number,
   body: string,
-  intent: CommentIntent = "fix",
+  intent: CommentIntent = "discuss",
   endLine = line,
+  originalText?: string,
 ): ReviewState {
   const trimmed = withTrimmedBody(body);
   const nextRange = normalizeRange(line, endLine);
@@ -312,6 +313,7 @@ export function upsertLineComment(
         startLine: nextRange.startLine,
         endLine: nextRange.endLine,
         body: trimmed,
+        ...(originalText != null ? { originalText } : {}),
       };
 
   return replaceComment(
@@ -325,7 +327,7 @@ export function upsertLineComment(
   );
 }
 
-export function upsertFileComment(state: ReviewState, fileId: string, scope: ReviewScope, body: string, intent: CommentIntent = "fix"): ReviewState {
+export function upsertFileComment(state: ReviewState, fileId: string, scope: ReviewScope, body: string, intent: CommentIntent = "comment"): ReviewState {
   const trimmed = withTrimmedBody(body);
   const existing = getFileComment(state, fileId, scope);
   const nextComment = trimmed.length === 0

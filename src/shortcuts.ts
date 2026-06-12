@@ -41,20 +41,20 @@ export interface LoadedCommentShortcuts {
   path: string;
 }
 
-const CONFIG_FILE_NAME = "slopchop.json";
+const CONFIG_FILE_NAME = "code-diff.json";
 export const DEFAULT_GLOBAL_SHORTCUT: KeyId = "alt+s";
 
 export const BUILTIN_COMMENT_SHORTCUTS: CommentShortcut[] = [
   { id: "explain-added", key: "e", label: "explain", intent: "discuss", side: "added", text: "Explain what this code is doing." },
   { id: "why-added", key: "w", label: "why", intent: "discuss", side: "added", text: "Why was this added?" },
   { id: "intent-added", key: "i", label: "intent", intent: "discuss", side: "added", text: "What problem is this solving?" },
-  { id: "rename-added", key: "r", label: "rename", intent: "fix", side: "added", text: "Consider a clearer name here." },
-  { id: "simplify-added", key: "s", label: "simplify", intent: "fix", side: "added", text: "Can this be simplified?" },
-  { id: "tests-added", key: "t", label: "tests", intent: "fix", side: "added", text: "Add or update tests covering this change." },
+  { id: "rename-added", key: "r", label: "rename", intent: "comment", side: "added", text: "Consider a clearer name here." },
+  { id: "simplify-added", key: "s", label: "simplify", intent: "comment", side: "added", text: "Can this be simplified?" },
+  { id: "tests-added", key: "t", label: "tests", intent: "comment", side: "added", text: "Add or update tests covering this change." },
   { id: "explain-deleted", key: "e", label: "explain", intent: "discuss", side: "deleted", text: "Explain what this deleted code was doing." },
   { id: "why-deleted", key: "w", label: "why", intent: "discuss", side: "deleted", text: "Why was this deleted?" },
   { id: "impact-deleted", key: "i", label: "impact", intent: "discuss", side: "deleted", text: "What behavior changed because of this deletion?" },
-  { id: "restore-deleted", key: "k", label: "restore", intent: "fix", side: "deleted", text: "This may need to be restored." },
+  { id: "restore-deleted", key: "k", label: "restore", intent: "comment", side: "deleted", text: "This may need to be restored." },
 ];
 
 function overlaps(a: ShortcutSide, b: ShortcutSide): boolean {
@@ -144,8 +144,8 @@ function validateShortcut(entry: ShortcutConfigEntry, index: number, warnings: s
     warnings.push(`Ignoring shortcut \"${entry.id}\": label must be a non-empty string.`);
     return null;
   }
-  if (entry.intent !== "fix" && entry.intent !== "discuss") {
-    warnings.push(`Ignoring shortcut \"${entry.id}\": intent must be 'fix' or 'discuss'.`);
+  if (entry.intent !== "discuss" && entry.intent !== "comment") {
+    warnings.push(`Ignoring shortcut \"${entry.id}\": intent must be 'discuss' or 'comment'.`);
     return null;
   }
   if (entry.side !== "added" && entry.side !== "deleted" && entry.side !== "both") {
@@ -173,7 +173,7 @@ export function parseShortcutConfig(config: unknown): { shortcuts: CommentShortc
   const globalShortcut = parseGlobalShortcut(parsed.globalShortcut, warnings);
 
   if (parsed.version != null && parsed.version !== 1) {
-    warnings.push(`Unsupported slopchop shortcut config version: ${String(parsed.version)}. Expected version 1.`);
+    warnings.push(`Unsupported code-diff shortcut config version: ${String(parsed.version)}. Expected version 1.`);
   }
 
   const disabledBuiltinIds = new Set<string>();

@@ -1,67 +1,401 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { getReviewWindowData, loadReviewFileContents } from "./git.js";
+import { Type } from "typebox";
+import { getReviewWindowData, getReviewWindowDataForRevisionRange, loadReviewFileContents, type ReviewWindowData } from "./git.js";
 import { composeReviewPrompt } from "./prompt.js";
+import { formatPullRequestContext, resolveRemoteReviewTarget, type RemoteReviewTarget } from "./remote.js";
+import { buildInlineComments, submitPullRequestReview, type ReviewInlineComment, type ReviewVerdict } from "./review-submit.js";
 import { loadCommentShortcuts } from "./shortcuts.js";
 import { runReviewApp } from "./ui/review-app.js";
+import type { ReviewSubmitPayload } from "./types.js";
 
-export default function slopReviewExtension(pi: ExtensionAPI) {
+type InteractiveReviewMode = "working" | "staged" | "branch" | "custom";
+
+interface InteractiveReviewParams {
+  mode?: InteractiveReviewMode;
+  ref?: string;
+  resume?: string;
+  tree?: string;
+  branch?: string;
+  project?: string;
+  remote?: string;
+  cwd?: string;
+  includeGenerated?: boolean;
+}
+
+interface ReviewRunStatus {
+  started: boolean;
+  message?: string;
+  prompt?: string;
+  context?: string;
+}
+
+const MODE_VALUES = new Set(["working", "staged", "branch", "custom"]);
+
+function parseInteractiveReviewArgs(args: string): InteractiveReviewParams {
+  const tokens = args.trim().split(/\s+/).filter(Boolean);
+  const params: InteractiveReviewParams = {};
+
+  for (let index = 0; index < tokens.length; index += 1) {
+    const token = tokens[index]!;
+    const next = () => tokens[++index];
+
+    if (MODE_VALUES.has(token)) {
+      params.mode = token as InteractiveReviewMode;
+      continue;
+    }
+
+    if (token === "--ref" || token === "--custom") params.ref = next();
+    else if (token === "--resume") params.resume = next();
+    else if (token === "--tree") params.tree = next();
+    else if (token === "--branch") params.branch = next();
+    else if (token === "--project") params.project = next();
+    else if (token === "--remote") params.remote = next();
+    else if (token === "--cwd") params.cwd = next();
+    else if (token === "--include-generated") params.includeGenerated = true;
+  }
+
+  if (params.ref != null) params.mode = "custom";
+  return params;
+}
+
+function unsupported(message: string, ctx: ExtensionContext): ReviewRunStatus {
+  if (ctx.hasUI) ctx.ui.notify(message, "warning");
+  return { started: false, message };
+}
+
+function composeRemoteReviewPrompt(target: RemoteReviewTarget, reviewPrompt: string): string {
+  const lines: string[] = [];
+  if (target.pullRequest != null) {
+    const context = formatPullRequestContext(target.pullRequest);
+    lines.push("GitHub PR review feedback.");
+    lines.push("");
+    lines.push(context);
+    if (target.repo != null) lines.push(`URL: https://github.com/${target.repo}/pull/${target.pullRequest.number}`);
+    lines.push(`Head commit: ${target.pullRequest.headRefOid}`);
+  } else {
+    lines.push(`Remote branch review feedback for ${target.branch}.`);
+  }
+  lines.push("");
+  lines.push("Rules for GitHub actions:");
+  lines.push("- Do not post comments, approve, or request changes until the user explicitly confirms the exact public action.");
+  lines.push("- For line-specific GitHub comments, verify the path, side, line, and head commit before constructing the review request.");
+  lines.push("- Deleted-side comments may need to be posted as general review body comments if exact LEFT-side mapping is uncertain.");
+  lines.push("");
+  lines.push(reviewPrompt);
+  return lines.join("\n").trim();
+}
+
+function composeReviewSubmissionHandoff(target: RemoteReviewTarget, verdict: ReviewVerdict, body: string, comments: ReviewInlineComment[]): string {
+  const pr = target.pullRequest!;
+  const args = {
+    repo: target.repo,
+    prNumber: pr.number,
+    commitId: pr.headRefOid,
+    verdict,
+    prAuthorLogin: pr.authorLogin,
+    cwd: target.gitRoot,
+    body: body.trim().length > 0 ? body.trim() : undefined,
+    comments: comments.length > 0 ? comments : undefined,
+  };
+  const verdictLabel = verdict === "request_changes" ? "REQUEST CHANGES" : verdict.toUpperCase();
+  return [
+    `Submit a GitHub review on PR #${pr.number} (${target.repo ?? "this repo"}): ${pr.title}.`,
+    "",
+    `Verdict: ${verdictLabel}`,
+    "",
+    "Steps:",
+    "1. Fix only grammar and English in the review body and each inline comment body below. Do not change their meaning.",
+    "2. Show me the final body and comments and ask me to confirm.",
+    "3. After I confirm, call the submit_pr_review tool with the arguments below, applying your grammar fixes to the body and comment bodies.",
+    `4. Do not approve this PR if I (${pr.authorLogin}) authored it; the tool refuses self-approval.`,
+    "",
+    "submit_pr_review arguments:",
+    "```json",
+    JSON.stringify(args, null, 2),
+    "```",
+  ].join("\n");
+}
+
+export default function codeDiffExtension(pi: ExtensionAPI) {
   const initialShortcutConfig = loadCommentShortcuts();
   let activeReview = false;
 
   function notifyShortcutWarnings(ctx: ExtensionContext, warnings: string[]): void {
     if (warnings.length === 0 || !ctx.hasUI) return;
-    ctx.ui.notify(`slopchop config: ${warnings.join(" ")}`, "warning");
+    ctx.ui.notify(`code-diff config: ${warnings.join(" ")}`, "warning");
   }
 
-  async function openReview(ctx: ExtensionContext): Promise<void> {
+  async function openReviewData(ctx: ExtensionContext, data: ReviewWindowData, remoteTarget?: RemoteReviewTarget): Promise<ReviewRunStatus> {
     if (activeReview) {
-      ctx.ui.notify("A review session is already open.", "warning");
-      return;
+      const message = "A review session is already open.";
+      ctx.ui.notify(message, "warning");
+      return { started: false, message };
     }
 
     activeReview = true;
     try {
-      const { repoRoot, files } = await getReviewWindowData(pi, ctx.cwd);
+      const { repoRoot, files, branchBaseRevision, modifiedRevision } = data;
       const shortcutConfig = loadCommentShortcuts();
       if (files.length === 0) {
-        ctx.ui.notify("No reviewable files found for git diff, last commit, or all files.", "info");
-        return;
+        const message = "No reviewable files found for this diff.";
+        ctx.ui.notify(message, "info");
+        return { started: false, message };
       }
 
       notifyShortcutWarnings(ctx, shortcutConfig.warnings);
 
+      if (remoteTarget?.pullRequest != null) {
+        ctx.ui.notify(formatPullRequestContext(remoteTarget.pullRequest), "info");
+      }
+
       const result = await runReviewApp(ctx, {
         files,
         repoRoot,
-        loadFileContents: (file, scope) => loadReviewFileContents(pi, repoRoot, file, scope),
+        loadFileContents: (file, scope) => loadReviewFileContents(pi, repoRoot, file, scope, branchBaseRevision, modifiedRevision),
         commentShortcuts: shortcutConfig.shortcuts,
       });
 
       if (result.type === "cancel") {
-        ctx.ui.notify("Review cancelled.", "info");
-        return;
+        const message = "Review cancelled.";
+        ctx.ui.notify(message, "info");
+        return { started: true, message };
       }
 
-      const prompt = composeReviewPrompt(files, result);
+      if (remoteTarget?.pullRequest != null) {
+        return finishRemotePrReview(ctx, files, result, remoteTarget);
+      }
+
+      const reviewPrompt = composeReviewPrompt(files, result);
+      const prompt = remoteTarget == null ? reviewPrompt : composeRemoteReviewPrompt(remoteTarget, reviewPrompt);
       ctx.ui.setEditorText(prompt);
       ctx.ui.notify("Inserted review feedback into the editor.", "info");
+      return { started: true, prompt };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       ctx.ui.notify(`Could not open review UI: ${message}`, "error");
+      return { started: false, message };
     } finally {
       activeReview = false;
     }
   }
 
+  async function finishRemotePrReview(ctx: ExtensionContext, files: Parameters<typeof composeReviewPrompt>[0], result: ReviewSubmitPayload, target: RemoteReviewTarget): Promise<ReviewRunStatus> {
+    const pr = target.pullRequest!;
+    const inlineComments = buildInlineComments(files, result.comments);
+    const localPrompt = composeRemoteReviewPrompt(target, composeReviewPrompt(files, result));
+
+    const approveChoice = "Approve";
+    const requestChoice = "Request changes";
+    const commentChoice = "Comment";
+    const agentChoice = "Send feedback to the agent (no GitHub post)";
+    const choice = await ctx.ui.select(`PR #${pr.number}: ${pr.title}`, [approveChoice, requestChoice, commentChoice, agentChoice]);
+    if (choice == null) {
+      ctx.ui.notify("Review kept as a draft; nothing was submitted.", "info");
+      return { started: true, message: "No end action selected." };
+    }
+
+    if (choice === agentChoice) {
+      ctx.ui.setEditorText(localPrompt);
+      ctx.ui.notify("Inserted review feedback into the editor.", "info");
+      return { started: true, prompt: localPrompt };
+    }
+
+    const verdict: ReviewVerdict = choice === approveChoice ? "approve" : choice === requestChoice ? "request_changes" : "comment";
+    const confirmed = await ctx.ui.confirm(
+      `Submit ${choice} to PR #${pr.number}?`,
+      "The agent will grammar-fix the text, confirm with you, then post via gh api. Nothing is posted yet.",
+    );
+    if (!confirmed) {
+      ctx.ui.notify("GitHub submission cancelled.", "info");
+      return { started: true, message: "Submission cancelled." };
+    }
+
+    const handoff = composeReviewSubmissionHandoff(target, verdict, result.allComment, inlineComments);
+    ctx.ui.setEditorText(handoff);
+    ctx.ui.notify("Prepared a GitHub review submission. Review it and send to let the agent post it.", "info");
+    return { started: true, prompt: handoff, context: formatPullRequestContext(pr) };
+  }
+
+  async function openReview(ctx: ExtensionContext, cwd = ctx.cwd): Promise<ReviewRunStatus> {
+    return openReviewData(ctx, await getReviewWindowData(pi, cwd));
+  }
+
+  async function runInteractiveReview(params: InteractiveReviewParams, ctx: ExtensionContext): Promise<ReviewRunStatus> {
+    if (!ctx.hasUI) return { started: false, message: "Interactive review requires a TUI session." };
+    if (params.resume != null) return unsupported("Resume support is being ported into pi-code-diff next.", ctx);
+    if (params.tree != null || params.branch != null || params.project != null) return unsupported("Tree, branch, and project resolution are being ported into pi-code-diff next.", ctx);
+    if (params.mode === "staged") return unsupported("Staged diff mode is being ported into pi-code-diff next.", ctx);
+
+    if (params.remote != null) {
+      try {
+        const target = await resolveRemoteReviewTarget(pi, ctx.cwd, params.remote, params.cwd);
+        const data = await getReviewWindowDataForRevisionRange(pi, target.gitRoot, target.baseRef, target.headRef);
+        return openReviewData(ctx, data, target);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        ctx.ui.notify(`Could not prepare remote review: ${message}`, "error");
+        return { started: false, message };
+      }
+    }
+
+    if (params.mode === "custom") {
+      const range = params.ref;
+      if (range == null || !range.includes("..")) return unsupported("Custom review requires a ref range like base..head.", ctx);
+      const [baseRef, headRef] = range.split(/\.\.\.?/, 2);
+      if (baseRef == null || headRef == null || baseRef.length === 0 || headRef.length === 0) return unsupported("Custom review requires a ref range like base..head.", ctx);
+      return openReviewData(ctx, await getReviewWindowDataForRevisionRange(pi, params.cwd ?? ctx.cwd, baseRef, headRef));
+    }
+
+    return openReview(ctx, params.cwd ?? ctx.cwd);
+  }
+
+  async function openDiffMenu(ctx: ExtensionContext): Promise<ReviewRunStatus> {
+    if (!ctx.hasUI) return openReview(ctx);
+    const localChoice = "Local changes (working tree, last commit, all files)";
+    const remoteChoice = "Remote branch or GitHub PR";
+    const customChoice = "Custom range (base..head)";
+    const choice = await ctx.ui.select("Review scope", [localChoice, remoteChoice, customChoice]);
+    if (choice == null) return { started: false, message: "Review cancelled." };
+    if (choice === remoteChoice) {
+      const value = await ctx.ui.input("Remote branch, GitHub/Graphite PR URL, or owner/repo#number");
+      if (value == null || value.trim().length === 0) return { started: false, message: "Review cancelled." };
+      return runInteractiveReview({ remote: value.trim() }, ctx);
+    }
+    if (choice === customChoice) {
+      const range = await ctx.ui.input("Ref range (base..head)");
+      if (range == null || range.trim().length === 0) return { started: false, message: "Review cancelled." };
+      return runInteractiveReview({ mode: "custom", ref: range.trim() }, ctx);
+    }
+    return openReview(ctx);
+  }
+
+  async function runDiff(args: string, ctx: ExtensionContext): Promise<ReviewRunStatus> {
+    const trimmed = args.trim();
+    if (trimmed.length === 0) return openDiffMenu(ctx);
+
+    const firstToken = trimmed.split(/\s+/)[0]!;
+    if (trimmed.startsWith("-") || MODE_VALUES.has(firstToken)) {
+      return runInteractiveReview(parseInteractiveReviewArgs(trimmed), ctx);
+    }
+    if (trimmed.includes("..")) {
+      return runInteractiveReview({ mode: "custom", ref: trimmed }, ctx);
+    }
+    return runInteractiveReview({ remote: trimmed }, ctx);
+  }
+
   const reviewCommand = {
-    description: "Review and annotate code changes",
-    handler: async (_args: string, ctx: ExtensionContext) => {
-      await openReview(ctx);
+    description: "Review and annotate code changes. /diff [pr-url | base..head | branch] or no args for a scope menu",
+    handler: async (args: string, ctx: ExtensionContext) => {
+      await runDiff(args, ctx);
     },
   };
 
-  pi.registerCommand("slopchop", reviewCommand);
+  pi.registerCommand("code", reviewCommand);
+  pi.registerCommand("code-diff", reviewCommand);
   pi.registerCommand("diff", reviewCommand);
+
+  pi.registerTool({
+    name: "interactive_review",
+    label: "interactive-review",
+    description: "Launch the pi-code-diff interactive review TUI for reviewing git diffs. Supports local diffs, custom ref ranges, remote branches, and same-repo GitHub or Graphite PR URLs.",
+    promptSnippet: "Open the interactive diff review TUI. Use when the user wants to review code changes visually.",
+    promptGuidelines: [
+      "Use interactive_review when the user asks to review code, diffs, or changes.",
+      "For remote PRs, pass the PR URL or branch name in the remote parameter.",
+      "For local changes: omit remote, optionally pass cwd for non-world repos.",
+      "For custom refs, pass ref as a base..head or base...head range.",
+      "Mode defaults to working. Branch mode uses pi-code-diff's stack-aware parent branch behavior.",
+      "This is the same unified review as /diff (also /code, /code-diff). /diff with no args shows a scope menu; with a PR URL, base..head range, or branch it opens that mode directly.",
+    ],
+    parameters: Type.Object({
+      mode: Type.Optional(Type.Union([
+        Type.Literal("working"),
+        Type.Literal("staged"),
+        Type.Literal("branch"),
+        Type.Literal("custom"),
+      ], { description: "Diff mode: working, staged, branch, or custom. Default: working" })),
+      ref: Type.Optional(Type.String({ description: "Custom git diff range for custom mode" })),
+      resume: Type.Optional(Type.String({ description: "Resume token from an interrupted interactive review ask" })),
+      tree: Type.Optional(Type.String({ description: "Worktree name or absolute path to a git working directory" })),
+      branch: Type.Optional(Type.String({ description: "Branch name that resolves to a worktree" })),
+      project: Type.Optional(Type.String({ description: "Project zone resolved via dev cd" })),
+      remote: Type.Optional(Type.String({ description: "Remote branch name, GitHub PR URL, or Graphite URL" })),
+      cwd: Type.Optional(Type.String({ description: "Explicit working directory path for non-world repos" })),
+      includeGenerated: Type.Optional(Type.Boolean({ description: "Include generated files when supported" })),
+    }),
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const status = await runInteractiveReview(params as InteractiveReviewParams, ctx);
+      const text = status.started
+        ? `Interactive review session completed.${status.message ? ` ${status.message}` : ""}`
+        : `Interactive review did not start.${status.message ? ` ${status.message}` : ""}`;
+      return {
+        content: [{ type: "text" as const, text }],
+        details: { status },
+      };
+    },
+  });
+
+  pi.registerTool({
+    name: "submit_pr_review",
+    label: "submit-pr-review",
+    description: "Submit a GitHub pull request review (approve, request changes, or comment) via gh api. Refuses to approve a PR authored by the current user.",
+    promptSnippet: "Submit a GitHub PR review verdict via gh api after the user confirms.",
+    promptGuidelines: [
+      "Only call submit_pr_review after the user explicitly confirms the exact verdict and text.",
+      "Fix only grammar and English in the body and comment text; never change their meaning.",
+      "Never approve a pull request the user authored; the tool blocks self-approval and you should not retry as approve.",
+      "Pass repo as owner/repo, the prNumber, the commitId (PR head SHA), and prAuthorLogin so self-approval can be blocked.",
+      "Pass cwd to the local checkout of the repository so gh runs in the right place.",
+    ],
+    parameters: Type.Object({
+      repo: Type.String({ description: "Repository as owner/repo" }),
+      prNumber: Type.String({ description: "Pull request number" }),
+      commitId: Type.String({ description: "PR head commit SHA (headRefOid)" }),
+      verdict: Type.Union([
+        Type.Literal("approve"),
+        Type.Literal("request_changes"),
+        Type.Literal("comment"),
+      ], { description: "Review verdict" }),
+      body: Type.Optional(Type.String({ description: "Overall review body text" })),
+      comments: Type.Optional(Type.Array(Type.Object({
+        path: Type.String(),
+        line: Type.Number(),
+        side: Type.Union([Type.Literal("LEFT"), Type.Literal("RIGHT")]),
+        body: Type.String(),
+        start_line: Type.Optional(Type.Number()),
+        start_side: Type.Optional(Type.Union([Type.Literal("LEFT"), Type.Literal("RIGHT")])),
+      }), { description: "Inline review comments mirroring GitHub (path, line, side, body)" })),
+      prAuthorLogin: Type.Optional(Type.String({ description: "PR author login, used to block self-approval" })),
+      cwd: Type.Optional(Type.String({ description: "Local checkout directory to run gh in" })),
+    }),
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const input = params as {
+        repo: string;
+        prNumber: string;
+        commitId: string;
+        verdict: ReviewVerdict;
+        body?: string;
+        comments?: ReviewInlineComment[];
+        prAuthorLogin?: string;
+        cwd?: string;
+      };
+      const result = await submitPullRequestReview(pi, {
+        repo: input.repo,
+        prNumber: input.prNumber,
+        commitId: input.commitId,
+        verdict: input.verdict,
+        body: input.body,
+        comments: input.comments,
+        prAuthorLogin: input.prAuthorLogin,
+        gitRoot: input.cwd,
+      });
+      if (ctx.hasUI) ctx.ui.notify(result.message, result.ok ? "info" : "warning");
+      return {
+        content: [{ type: "text" as const, text: result.message }],
+        details: { result },
+      };
+    },
+  });
 
   pi.registerShortcut(initialShortcutConfig.globalShortcut, {
     description: "Open review UI",
@@ -70,9 +404,6 @@ export default function slopReviewExtension(pi: ExtensionAPI) {
     },
   });
 
-  // The global shortcut is registered once at load and cannot be re-bound for the
-  // rest of the session, so surface any config problems up front rather than
-  // waiting for the first review to open.
   pi.on("session_start", async (event, ctx) => {
     if (event.reason === "startup" || event.reason === "reload") {
       notifyShortcutWarnings(ctx, initialShortcutConfig.warnings);

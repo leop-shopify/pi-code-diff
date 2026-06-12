@@ -36,7 +36,7 @@ export interface ReviewFileContents {
 
 export type CommentSide = "added" | "deleted" | "file";
 
-export type CommentIntent = "fix" | "discuss";
+export type CommentIntent = "discuss" | "comment" | "modify";
 
 export interface DiffReviewComment {
   id: string;
@@ -47,6 +47,8 @@ export interface DiffReviewComment {
   startLine: number | null;
   endLine: number | null;
   body: string;
+  /** Original source text of the edited line(s), captured when a CHANGE edit is started. */
+  originalText?: string;
 }
 
 export interface ReviewDraft {
@@ -101,7 +103,8 @@ export function scopeFileKey(scope: ReviewScope, fileId: string): string {
 
 export function formatIntentLabel(intent: CommentIntent): string {
   switch (intent) {
-    case "fix": return "FIX";
     case "discuss": return "DISCUSS";
+    case "comment": return "COMMENT";
+    case "modify": return "MODIFY";
   }
 }

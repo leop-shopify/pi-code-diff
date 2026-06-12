@@ -32,7 +32,7 @@ function makeState(draft?: Partial<ReviewState["draft"]>): ReviewState {
     selectedLineTargetByScopeFile: {},
     draft: {
       allComment: "",
-      allIntent: "fix",
+      allIntent: "discuss",
       comments: [],
       ...draft,
     },
@@ -44,7 +44,7 @@ const lineComment: DiffReviewComment = {
   fileId: "src/app.ts",
   scope: "git-diff",
   side: "added",
-  intent: "fix",
+  intent: "comment",
   startLine: 2,
   endLine: 2,
   body: "Rename this.",
@@ -269,7 +269,7 @@ describe("action and shortcut help rendering", () => {
   it("wraps full help text to the comments sidebar width", () => {
     const lines = buildHelpPanelLines(plainTheme as any, 24, [
       { id: "explain-added", key: "e", label: "explain", intent: "discuss", side: "added", text: "Explain what this code is doing." },
-    ], "/home/user/.pi/agent/extensions/slopchop.json");
+    ], "/home/user/.pi/agent/extensions/code-diff.json");
 
     expect(lines).toContain("Navigation");
     expect(lines).toContain("Diff actions");
@@ -280,7 +280,7 @@ describe("action and shortcut help rendering", () => {
   it("wraps comments-panel guidance to the comments width", () => {
     const lines = buildCommentPanelEmptyStateLines(plainTheme as any, 24);
 
-    expect(lines.join(" ")).toContain("Use f/d/c");
+    expect(lines.join(" ")).toContain("m modify");
     expect(lines.length).toBeGreaterThan(2);
     expect(lines.every((line) => visibleWidth(line) <= 22)).toBe(true);
   });
