@@ -104,7 +104,8 @@ describe("composeReviewPrompt", () => {
     });
 
     expect(prompt).toBe([
-      "The following are review comments about the change. Respond to them in prose; only edit if a comment clearly requires it.",
+      "Treat the following review comments as actionable feedback about the change.",
+      "Answer questions in prose, and make local edits when a comment asks for a change or states a preferred implementation.",
       "",
       "COMMENT",
       "",
@@ -268,8 +269,9 @@ describe("composeReviewPrompt", () => {
     });
 
     expect(prompt).toContain("- For MODIFY items: apply the exact code change shown (LINE CHANGED old -> new) as a local edit.");
-    expect(prompt).toContain("- For COMMENT and DISCUSS items: respond only in prose.");
-    expect(prompt).toContain("- Apply the MODIFY items; answer the other items separately in prose.");
+    expect(prompt).toContain("- For COMMENT items: treat them as actionable review feedback. Answer questions in prose, and make local edits when a comment asks for a change or states a preferred implementation.");
+    expect(prompt).toContain("- For DISCUSS items: respond only in prose.");
+    expect(prompt).toContain("- Keep responses or edits scoped to the feedback under each item.");
     expect(prompt.indexOf("\nMODIFY\n")).toBeLessThan(prompt.indexOf("\nCOMMENT\n"));
     expect(prompt.indexOf("\nCOMMENT\n")).toBeLessThan(prompt.indexOf("\nDISCUSS\n"));
   });

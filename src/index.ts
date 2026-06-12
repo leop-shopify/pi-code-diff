@@ -3,7 +3,7 @@ import { Type } from "typebox";
 import { getReviewWindowData, getReviewWindowDataForRevisionRange, loadReviewFileContents, type ReviewWindowData } from "./git.js";
 import { composeReviewPrompt } from "./prompt.js";
 import { formatPullRequestContext, resolveRemoteReviewTarget, type RemoteReviewTarget } from "./remote.js";
-import { buildInlineComments, submitPullRequestReview, type ReviewInlineComment, type ReviewVerdict } from "./review-submit.js";
+import { buildInlineComments, buildReviewBody, submitPullRequestReview, type ReviewInlineComment, type ReviewVerdict } from "./review-submit.js";
 import { loadCommentShortcuts } from "./shortcuts.js";
 import { runReviewApp } from "./ui/review-app.js";
 import type { ReviewSubmitPayload } from "./types.js";
@@ -63,6 +63,53 @@ function unsupported(message: string, ctx: ExtensionContext): ReviewRunStatus {
   return { started: false, message };
 }
 
+function setRemoteProgress(ctx: ExtensionContext, message: string | undefined): void {
+  ctx.ui.setWidget("pi-code-diff-remote", message == null ? undefined : [message]);
+}
+
+export function composeReviewSubmissionPrompt(target: RemoteReviewTarget, verdict: ReviewVerdict, body: string | undefined, comments: ReviewInlineComment[]): string {
+  const pr = target.pullRequest!;
+  const args = {
+    repo: target.repo,
+    prNumber: pr.number,
+    commitId: pr.headRefOid,
+    verdict,
+    prAuthorLogin: pr.authorLogin,
+    cwd: target.gitRoot,
+    body: body == null || body.trim().length === 0 ? undefined : body.trim(),
+    comments: comments.length > 0 ? comments : undefined,
+  };
+  const verdictLabel = verdict === "request_changes" ? "REQUEST CHANGES" : verdict.toUpperCase();
+  return [
+    `Prepare a GitHub PR review submission for PR #${pr.number} (${target.repo ?? "this repo"}): ${pr.title}.`,
+    "",
+    `Verdict: ${verdictLabel}`,
+    "",
+    "Hard constraints:",
+    "- This is not a request to review, inspect, or understand the code. The user already selected the exact review locations.",
+    "- Do not read files, search the repository, run commands, run tests, inspect diffs, open plans, create todos, or enter plan mode.",
+    "- Do not change path, line, side, verdict, PR number, commit id, repo, cwd, or author fields.",
+    "- Only use submit_pr_review after the user confirms the cleaned text.",
+    "",
+    "Your job:",
+    "1. Fix only grammar, spelling, capitalization, and punctuation in the review body and inline comment bodies. Do not change meaning.",
+    "2. Resolve changed text items one at a time using this exact style for each item:",
+    "   Comment 1: <path>:<line-or-range> (<side>)",
+    "   Original: <original text>",
+    "   Fixed   : <fixed text>",
+    "   Choices: Approve, Edit, Skip",
+    "3. Ask for one item's decision at a time using the available local confirmation/asking tooling. Do not ask for all decisions in one combined prompt. If the tooling can queue multiple questions at once, each queued question must still be one item only.",
+    "4. For approved items, use the fixed text. For edited items, use the user's replacement text. For skipped items, remove that body/comment from the submission.",
+    "5. The user's Approve choice is the confirmation to submit that item. After the last item is approved, edited, or skipped, call submit_pr_review immediately with the arguments below, replacing only body/comment text with the approved or edited text and omitting skipped items. Do not ask for a second/final submission confirmation.",
+    `6. Do not approve this PR if the current GitHub user (${pr.authorLogin}) authored it; the tool refuses self-approval.`,
+    "",
+    "submit_pr_review arguments:",
+    "```json",
+    JSON.stringify(args, null, 2),
+    "```",
+  ].join("\n");
+}
+
 function composeRemoteReviewPrompt(target: RemoteReviewTarget, reviewPrompt: string): string {
   const lines: string[] = [];
   if (target.pullRequest != null) {
@@ -83,37 +130,6 @@ function composeRemoteReviewPrompt(target: RemoteReviewTarget, reviewPrompt: str
   lines.push("");
   lines.push(reviewPrompt);
   return lines.join("\n").trim();
-}
-
-function composeReviewSubmissionHandoff(target: RemoteReviewTarget, verdict: ReviewVerdict, body: string, comments: ReviewInlineComment[]): string {
-  const pr = target.pullRequest!;
-  const args = {
-    repo: target.repo,
-    prNumber: pr.number,
-    commitId: pr.headRefOid,
-    verdict,
-    prAuthorLogin: pr.authorLogin,
-    cwd: target.gitRoot,
-    body: body.trim().length > 0 ? body.trim() : undefined,
-    comments: comments.length > 0 ? comments : undefined,
-  };
-  const verdictLabel = verdict === "request_changes" ? "REQUEST CHANGES" : verdict.toUpperCase();
-  return [
-    `Submit a GitHub review on PR #${pr.number} (${target.repo ?? "this repo"}): ${pr.title}.`,
-    "",
-    `Verdict: ${verdictLabel}`,
-    "",
-    "Steps:",
-    "1. Fix only grammar and English in the review body and each inline comment body below. Do not change their meaning.",
-    "2. Show me the final body and comments and ask me to confirm.",
-    "3. After I confirm, call the submit_pr_review tool with the arguments below, applying your grammar fixes to the body and comment bodies.",
-    `4. Do not approve this PR if I (${pr.authorLogin}) authored it; the tool refuses self-approval.`,
-    "",
-    "submit_pr_review arguments:",
-    "```json",
-    JSON.stringify(args, null, 2),
-    "```",
-  ].join("\n");
 }
 
 export default function codeDiffExtension(pi: ExtensionAPI) {
@@ -201,19 +217,11 @@ export default function codeDiffExtension(pi: ExtensionAPI) {
     }
 
     const verdict: ReviewVerdict = choice === approveChoice ? "approve" : choice === requestChoice ? "request_changes" : "comment";
-    const confirmed = await ctx.ui.confirm(
-      `Submit ${choice} to PR #${pr.number}?`,
-      "The agent will grammar-fix the text, confirm with you, then post via gh api. Nothing is posted yet.",
-    );
-    if (!confirmed) {
-      ctx.ui.notify("GitHub submission cancelled.", "info");
-      return { started: true, message: "Submission cancelled." };
-    }
-
-    const handoff = composeReviewSubmissionHandoff(target, verdict, result.allComment, inlineComments);
-    ctx.ui.setEditorText(handoff);
-    ctx.ui.notify("Prepared a GitHub review submission. Review it and send to let the agent post it.", "info");
-    return { started: true, prompt: handoff, context: formatPullRequestContext(pr) };
+    const body = buildReviewBody(files, result);
+    const prompt = composeReviewSubmissionPrompt(target, verdict, body, inlineComments);
+    pi.sendUserMessage(prompt);
+    ctx.ui.notify("Sent review submission instructions to the agent.", "info");
+    return { started: true, prompt, context: formatPullRequestContext(pr) };
   }
 
   async function openReview(ctx: ExtensionContext, cwd = ctx.cwd): Promise<ReviewRunStatus> {
@@ -228,10 +236,14 @@ export default function codeDiffExtension(pi: ExtensionAPI) {
 
     if (params.remote != null) {
       try {
-        const target = await resolveRemoteReviewTarget(pi, ctx.cwd, params.remote, params.cwd);
+        const reportProgress = (message: string) => setRemoteProgress(ctx, message);
+        const target = await resolveRemoteReviewTarget(pi, ctx.cwd, params.remote, params.cwd, reportProgress);
+        reportProgress(`Preparing diff for ${target.repo ?? target.branch}…`);
         const data = await getReviewWindowDataForRevisionRange(pi, target.gitRoot, target.baseRef, target.headRef);
+        setRemoteProgress(ctx, undefined);
         return openReviewData(ctx, data, target);
       } catch (error) {
+        setRemoteProgress(ctx, undefined);
         const message = error instanceof Error ? error.message : String(error);
         ctx.ui.notify(`Could not prepare remote review: ${message}`, "error");
         return { started: false, message };
@@ -285,12 +297,12 @@ export default function codeDiffExtension(pi: ExtensionAPI) {
   pi.registerTool({
     name: "interactive_review",
     label: "interactive-review",
-    description: "Launch the pi-code-diff interactive review TUI for reviewing git diffs. Supports local diffs, custom ref ranges, remote branches, and same-repo GitHub or Graphite PR URLs.",
+    description: "Launch the pi-code-diff interactive review TUI for reviewing git diffs. Supports local diffs, custom ref ranges, remote branches, and GitHub or Graphite PR URLs.",
     promptSnippet: "Open the interactive diff review TUI. Use when the user wants to review code changes visually.",
     promptGuidelines: [
       "Use interactive_review when the user asks to review code, diffs, or changes.",
       "For remote PRs, pass the PR URL or branch name in the remote parameter.",
-      "For local changes: omit remote, optionally pass cwd for non-world repos.",
+      "For local changes: omit remote, optionally pass cwd for an explicit local checkout.",
       "For custom refs, pass ref as a base..head or base...head range.",
       "Mode defaults to working. Branch mode uses pi-code-diff's stack-aware parent branch behavior.",
       "This is the same unified review as /diff (also /code, /code-diff). /diff with no args reviews local changes; /diff remote <url|branch> reviews a remote branch or PR; /diff base..head reviews a custom range.",
@@ -308,7 +320,7 @@ export default function codeDiffExtension(pi: ExtensionAPI) {
       branch: Type.Optional(Type.String({ description: "Branch name that resolves to a worktree" })),
       project: Type.Optional(Type.String({ description: "Project zone resolved via dev cd" })),
       remote: Type.Optional(Type.String({ description: "Remote branch name, GitHub PR URL, or Graphite URL" })),
-      cwd: Type.Optional(Type.String({ description: "Explicit working directory path for non-world repos" })),
+      cwd: Type.Optional(Type.String({ description: "Explicit working directory path for a local checkout" })),
       includeGenerated: Type.Optional(Type.Boolean({ description: "Include generated files when supported" })),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
