@@ -2,7 +2,7 @@ import { visibleWidth } from "@earendil-works/pi-tui";
 import { describe, expect, it } from "vitest";
 import { buildStructuredDiff } from "../diff.js";
 import type { DiffReviewComment, ReviewFile, ReviewState } from "../types.js";
-import { buildCommentPanelEmptyStateLines, buildCommentPanelTextLines, buildDisplayRows, buildEditorLaunchCommand, buildFooterLines, buildHelpPanelLines, buildSideBySideDisplayRows, formatFocusStatus, formatPaneTitle, formatSelectedLineTargetLabel, getCancelAction, getDraftCommentCount, getEditorLineForTarget, getHalfPageStep, getPaneLayout, getRelatedFileMarker, getRelatedFilePaths, getSideBySidePairedLineTarget, getStackedPaneLayout, parseMouseWheelInput, renderCenteredOverlay, shouldStackPanes } from "../ui/review-app.js";
+import { buildCommentPanelEmptyStateLines, buildCommentPanelTextLines, buildDisplayRows, buildEditorLaunchCommand, buildFooterLines, buildHelpPanelLines, buildSideBySideDisplayRows, formatFocusStatus, formatPaneTitle, formatSelectedLineTargetLabel, getCancelAction, getDraftCommentCount, getEditorLineForTarget, getHalfPageStep, getPaneLayout, getRelatedFileMarker, getRelatedFilePanelSections, getRelatedFilePaths, getSideBySidePairedLineTarget, getStackedPaneLayout, parseMouseWheelInput, renderCenteredOverlay, shouldStackPanes } from "../ui/review-app.js";
 
 function makeFile(path: string, flags?: Partial<ReviewFile>): ReviewFile {
   return {
@@ -170,6 +170,27 @@ describe("related navigator helpers", () => {
     });
 
     expect([...getRelatedFilePaths(active)].sort()).toEqual(["src/both.ts", "src/in.ts", "src/out.ts"]);
+  });
+
+  it("builds right-panel sections for all-files related context", () => {
+    const active = makeFile("src/active.ts", {
+      allFilesOutgoingReferences: ["src/out.ts", "src/both.ts"],
+      allFilesIncomingReferences: ["src/in.ts", "src/both.ts"],
+    });
+
+    expect(getRelatedFilePanelSections(active, "all-files")).toEqual([
+      { title: "Imports changed files", paths: ["src/both.ts", "src/out.ts"] },
+      { title: "Imported by changed files", paths: ["src/both.ts", "src/in.ts"] },
+    ]);
+  });
+
+  it("hides related right-panel sections outside all-files scope", () => {
+    const active = makeFile("src/active.ts", {
+      allFilesOutgoingReferences: ["src/out.ts"],
+      allFilesIncomingReferences: ["src/in.ts"],
+    });
+
+    expect(getRelatedFilePanelSections(active, "git-diff")).toEqual([]);
   });
 });
 

@@ -215,11 +215,29 @@ type PaneName = "navigator" | "diff" | "comments";
 
 type RelatedFileMarker = "→" | "←" | "↔";
 
+export interface RelatedFilePanelSection {
+  title: string;
+  paths: string[];
+}
+
 export function getRelatedFilePaths(file: ReviewFile | null): Set<string> {
   return new Set([
     ...(file?.allFilesOutgoingReferences ?? []),
     ...(file?.allFilesIncomingReferences ?? []),
   ]);
+}
+
+export function getRelatedFilePanelSections(file: ReviewFile | null, scope: ReviewScope): RelatedFilePanelSection[] {
+  if (file == null || scope !== "all-files") return [];
+
+  const outgoing = [...new Set(file.allFilesOutgoingReferences ?? [])].sort((a, b) => a.localeCompare(b));
+  const incoming = [...new Set(file.allFilesIncomingReferences ?? [])].sort((a, b) => a.localeCompare(b));
+  const sections: RelatedFilePanelSection[] = [];
+
+  if (outgoing.length > 0) sections.push({ title: "Imports changed files", paths: outgoing });
+  if (incoming.length > 0) sections.push({ title: "Imported by changed files", paths: incoming });
+
+  return sections;
 }
 
 export function getRelatedFileMarker(file: ReviewFile, activeFile: ReviewFile | null, scope: ReviewScope): RelatedFileMarker | null {
@@ -513,6 +531,31 @@ export function buildCommentPanelEmptyStateLines(theme: Theme, width: number): s
     ...buildCommentPanelTextLines(theme, width, "No comments yet.", "dim"),
     ...buildCommentPanelTextLines(theme, width, "Use m modify, c comment, d discuss for a line or range, l for file, or a for all.", "dim"),
   ];
+}
+
+export function buildRelatedFilePanelLines(theme: Theme, width: number, file: ReviewFile | null, scope: ReviewScope, maxPathsPerSection = 6): string[] {
+  const sections = getRelatedFilePanelSections(file, scope);
+  if (sections.length === 0) return [];
+
+  const lines: string[] = [];
+  const contentWidth = Math.max(1, width - 2);
+  lines.push(theme.fg("muted", "related files:"));
+
+  for (const section of sections) {
+    const hiddenCount = Math.max(0, section.paths.length - maxPathsPerSection);
+    const title = `${section.title} (${section.paths.length})`;
+    pushWrappedText(lines, theme, title, contentWidth, "dim", "  ");
+
+    for (const path of section.paths.slice(0, maxPathsPerSection)) {
+      pushWrappedText(lines, theme, shortenNavigatorPath(path, Math.max(8, contentWidth - 4)), contentWidth, "muted", "    ");
+    }
+
+    if (hiddenCount > 0) {
+      pushWrappedText(lines, theme, `… ${hiddenCount} more`, contentWidth, "dim", "    ");
+    }
+  }
+
+  return lines;
 }
 
 export function buildFooterLines(theme: Theme, promptStatus: string, frameInnerWidth: number): string[] {
@@ -1921,27 +1964,17 @@ class ReviewApp {
     if (activeIndex < this.navigatorScroll) this.navigatorScroll = activeIndex;
     if (activeIndex >= this.navigatorScroll + maxBody) this.navigatorScroll = activeIndex - maxBody + 1;
     const visible = files.slice(this.navigatorScroll, this.navigatorScroll + maxBody);
-    const activeFile = this.activeFile();
-    const relationSource = relatedAnchor ?? activeFile;
-    const relatedFilterActive = relatedAnchor != null;
-
     for (const file of visible) {
       const active = file.id === this.state.activeFileId;
-      const relationMarker = getRelatedFileMarker(file, relationSource, this.state.activeScope);
-      const related = relationMarker != null;
-      const prefix = relationMarker == null
-        ? active && !relatedFilterActive ? this.theme.fg("accent", "›") : " "
-        : this.theme.fg(active || !relatedFilterActive ? "accent" : "muted", relationMarker);
-      const status = this.theme.fg(active || (!relatedFilterActive && related) ? "accent" : "muted", getStatusLabel(file, this.state.activeScope));
+      const prefix = active ? this.theme.fg("accent", "›") : " ";
+      const status = this.theme.fg(active ? "accent" : "muted", getStatusLabel(file, this.state.activeScope));
       const count = getFileCommentCount(this.state, file.id, this.state.activeScope);
       const changeMarker = getChangeCountLabel(this.theme, file, this.state.activeScope);
       const commentMarker = count > 0 ? this.theme.fg("success", ` ${count}●`) : this.theme.fg("dim", "  ·");
       const prefixText = `${prefix} ${status} `;
       const pathWidth = Math.max(1, width - 2 - visibleWidth(prefixText) - visibleWidth(changeMarker) - visibleWidth(commentMarker));
       const shortenedPath = shortenNavigatorPath(sanitizeTerminalText(file.path), pathWidth);
-      const pathText = active || (!relatedFilterActive && related)
-        ? this.theme.fg("accent", shortenedPath)
-        : this.theme.fg("text", shortenedPath);
+      const pathText = active ? this.theme.fg("accent", shortenedPath) : this.theme.fg("text", shortenedPath);
       lines.push(`${prefixText}${pathText}${changeMarker}${commentMarker}`);
     }
 
@@ -2244,6 +2277,12 @@ class ReviewApp {
         ? "line —: none"
         : `${formatLineSideLabel(selectedTarget.side).toLowerCase()} ${formatLineRangeLabel(getLineTargetRange(selectedTarget).startLine, getLineTargetRange(selectedTarget).endLine)}: ${lineComment ? "commented" : "none"}`));
       lines.push("");
+
+      const relatedLines = buildRelatedFilePanelLines(this.theme, width, file, this.state.activeScope);
+      if (relatedLines.length > 0) {
+        lines.push(...relatedLines);
+        lines.push("");
+      }
     }
 
     if (items.length === 0) {
