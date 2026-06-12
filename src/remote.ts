@@ -48,6 +48,10 @@ function originShortRef(branch: string): string {
   return `origin/${branch}`;
 }
 
+function sourceBranchRef(branch: string): string {
+  return `refs/heads/${branch}`;
+}
+
 function stripOriginPrefix(ref: string): string {
   return ref.replace(/^origin\//, "");
 }
@@ -211,26 +215,37 @@ export async function getPullRequestMetadata(pi: ExtensionAPI, gitRoot: string, 
 
 async function fetchRemoteRefs(pi: ExtensionAPI, gitRoot: string, refspecs: string[], remote = "origin", onProgress?: RemoteProgress): Promise<void> {
   onProgress?.(`Fetching remote refs from ${remote === "origin" ? "origin" : "GitHub"}…`);
-  const result = await pi.exec("git", ["--no-pager", "fetch", "--no-tags", remote, ...refspecs], { cwd: gitRoot, timeout: 15000 });
-  if (result.killed) throw new Error(`Timed out fetching remote refs after 15s. stderr: ${result.stderr || "(none)"}`);
+  const result = await pi.exec("git", ["--no-pager", "fetch", "--no-tags", remote, ...refspecs], { cwd: gitRoot, timeout: 60000 });
+  if (result.killed) throw new Error(`Timed out fetching remote refs after 60s. stderr: ${result.stderr || "(none)"}`);
   if (result.code !== 0) throw new Error(result.stderr || result.stdout || "Failed to fetch remote refs.");
+}
+
+async function getMergeBase(pi: ExtensionAPI, gitRoot: string, baseRef: string, headRef: string): Promise<string> {
+  const result = await pi.exec("git", ["merge-base", baseRef, headRef], { cwd: gitRoot, timeout: 10000 });
+  const mergeBase = result.code === 0 ? result.stdout.trim().split("\n").pop()?.trim() : undefined;
+  return mergeBase != null && mergeBase.length > 0 ? mergeBase : baseRef;
 }
 
 async function fetchPullRequestRefs(pi: ExtensionAPI, gitRoot: string, metadata: PullRequestMetadata, remote = "origin", onProgress?: RemoteProgress): Promise<{ baseRef: string; headRef: string }> {
   const baseBranch = metadata.baseRefName || "main";
   try {
     await fetchRemoteRefs(pi, gitRoot, [
-      `+${baseBranch}:${originRef(baseBranch)}`,
-      `+${metadata.headRefName}:${originRef(metadata.headRefName)}`,
+      `+${sourceBranchRef(baseBranch)}:${originRef(baseBranch)}`,
+      `+${sourceBranchRef(metadata.headRefName)}:${originRef(metadata.headRefName)}`,
     ], remote, onProgress);
-    return { baseRef: originShortRef(baseBranch), headRef: originShortRef(metadata.headRefName) };
+    const baseRef = originShortRef(baseBranch);
+    const headRef = originShortRef(metadata.headRefName);
+    return { baseRef: await getMergeBase(pi, gitRoot, baseRef, headRef), headRef };
   } catch {
     const prHeadBranch = `pr/${metadata.number}/head`;
+    const pullRemote = metadata.repo == null || remote !== "origin" ? remote : `https://github.com/${metadata.repo}.git`;
     await fetchRemoteRefs(pi, gitRoot, [
-      `+${baseBranch}:${originRef(baseBranch)}`,
+      `+${sourceBranchRef(baseBranch)}:${originRef(baseBranch)}`,
       `+refs/pull/${metadata.number}/head:${originRef(prHeadBranch)}`,
-    ], remote, onProgress);
-    return { baseRef: originShortRef(baseBranch), headRef: originShortRef(prHeadBranch) };
+    ], pullRemote, onProgress);
+    const baseRef = originShortRef(baseBranch);
+    const headRef = originShortRef(prHeadBranch);
+    return { baseRef: await getMergeBase(pi, gitRoot, baseRef, headRef), headRef };
   }
 }
 
@@ -238,8 +253,8 @@ async function fetchPlainRemoteBranch(pi: ExtensionAPI, gitRoot: string, branch:
   const defaultBranchRef = await getDefaultBranchRef(pi, gitRoot);
   const baseBranch = stripOriginPrefix(defaultBranchRef ?? "origin/main");
   await fetchRemoteRefs(pi, gitRoot, [
-    `+${baseBranch}:${originRef(baseBranch)}`,
-    `+${branch}:${originRef(branch)}`,
+    `+${sourceBranchRef(baseBranch)}:${originRef(baseBranch)}`,
+    `+${sourceBranchRef(branch)}:${originRef(branch)}`,
   ], "origin", onProgress);
   return { baseRef: originShortRef(baseBranch), headRef: originShortRef(branch) };
 }
