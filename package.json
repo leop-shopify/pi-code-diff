@@ -1,10 +1,10 @@
 {
   "name": "pi-code-diff",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "private": true,
   "packageManager": "pnpm@10.28.0",
   "type": "module",
-  "description": "Leo-owned local Pi package for code diff review and annotation workflows.",
+  "description": "Interactive code diff editor for Pi with comments, AI-assisted review handoff, GitHub PR integration, and local or remote diff support.",
   "author": "Leonardo Pereira",
   "license": "MIT",
   "files": [
@@ -32,7 +32,11 @@
     "diff-review",
     "code-diff",
     "code-review",
+    "diff-editor",
     "annotation",
+    "github-pr",
+    "remote-diff",
+    "ai-review",
     "terminal"
   ],
   "pi": {
