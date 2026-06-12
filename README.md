@@ -38,10 +38,42 @@ The review UI does **not** auto-send the prompt. It stages the next message for 
 ### Install
 
 ```bash
-pi install /Users/leonardopereira/src/pi-code-diff
+pi install https://github.com/leop-example/pi-code-diff
 ```
 
 Then restart Pi or run `/reload`.
+
+<details>
+<summary>Manual install</summary>
+
+```bash
+# Clone
+git clone https://github.com/leop-example/pi-code-diff.git \
+  ~/.pi/agent/git/github.com/leop-example/pi-code-diff
+
+# Install dependencies
+cd ~/.pi/agent/git/github.com/leop-example/pi-code-diff
+npm install
+
+# Symlink the extension entry
+ln -sf ~/.pi/agent/git/github.com/leop-example/pi-code-diff/src/index.ts \
+  ~/.pi/agent/extensions/pi-code-diff.ts
+```
+
+Then `/reload` in pi.
+</details>
+
+<details>
+<summary>Local development</summary>
+
+While iterating on the extension itself, install from a local checkout path:
+
+```bash
+pi install /absolute/path/to/pi-code-diff
+```
+
+Run `/reload` after changes. Pi loads `src/index.ts` directly through jiti, so there is no build step.
+</details>
 
 ### Run it
 
