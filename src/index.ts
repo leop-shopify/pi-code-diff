@@ -1,4 +1,5 @@
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
+import { truncateToWidth, type Component, type TUI } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { getReviewWindowData, getReviewWindowDataForRevisionRange, loadReviewFileContents, type ReviewWindowData } from "./git.js";
 import { composeReviewPrompt } from "./prompt.js";
@@ -63,8 +64,40 @@ function unsupported(message: string, ctx: ExtensionContext): ReviewRunStatus {
   return { started: false, message };
 }
 
+const REMOTE_PROGRESS_FRAMES = ["-", "\\", "|", "/"];
+
+class RemoteProgressWidget implements Component {
+  private frame = 0;
+  private timer: ReturnType<typeof setInterval>;
+
+  constructor(private tui: TUI, private theme: Theme, private message: string) {
+    this.timer = setInterval(() => {
+      this.frame = (this.frame + 1) % REMOTE_PROGRESS_FRAMES.length;
+      this.tui.requestRender?.();
+    }, 120);
+  }
+
+  render(width: number): string[] {
+    const safeWidth = Math.max(1, width);
+    const border = this.theme.fg("borderMuted", "─".repeat(safeWidth));
+    const text = `${REMOTE_PROGRESS_FRAMES[this.frame]} ${this.message}`;
+    return [border, truncateToWidth(this.theme.fg("muted", text), safeWidth, "…", false)];
+  }
+
+  invalidate(): void {}
+
+  dispose(): void {
+    clearInterval(this.timer);
+  }
+}
+
 function setRemoteProgress(ctx: ExtensionContext, message: string | undefined): void {
-  ctx.ui.setWidget("pi-code-diff-remote", message == null ? undefined : [message]);
+  ctx.ui.setWidget("pi-code-diff-remote", message == null ? undefined : (tui, theme) => new RemoteProgressWidget(tui, theme, message));
+}
+
+export function mergeReviewBodies(...bodies: Array<string | undefined>): string | undefined {
+  const parts = bodies.map((body) => body?.trim()).filter((body): body is string => body != null && body.length > 0);
+  return parts.length > 0 ? parts.join("\n\n") : undefined;
 }
 
 export function composeReviewSubmissionPrompt(target: RemoteReviewTarget, verdict: ReviewVerdict, body: string | undefined, comments: ReviewInlineComment[]): string {
@@ -80,6 +113,7 @@ export function composeReviewSubmissionPrompt(target: RemoteReviewTarget, verdic
     comments: comments.length > 0 ? comments : undefined,
   };
   const verdictLabel = verdict === "request_changes" ? "REQUEST CHANGES" : verdict.toUpperCase();
+  const prUrl = target.repo == null ? target.remote : `https://github.com/${target.repo}/pull/${pr.number}`;
   return [
     `Prepare a GitHub PR review submission for PR #${pr.number} (${target.repo ?? "this repo"}): ${pr.title}.`,
     "",
@@ -88,8 +122,9 @@ export function composeReviewSubmissionPrompt(target: RemoteReviewTarget, verdic
     "Hard constraints:",
     "- This is not a request to review, inspect, or understand the code. The user already selected the exact review locations.",
     "- Do not read files, search the repository, run commands, run tests, inspect diffs, open plans, create todos, or enter plan mode.",
-    "- Do not change path, line, side, verdict, PR number, commit id, repo, cwd, or author fields.",
+    "- Do not change path, line, side, verdict, PR number, commit id, repo, cwd, author fields, or remove existing inline comments.",
     "- Only use submit_pr_review after the user confirms the cleaned text.",
+    "- Call submit_pr_review once with the full arguments below. The tool handles approval plus inline comments safely.",
     "",
     "Your job:",
     "1. Fix only grammar, spelling, capitalization, and punctuation in the review body and inline comment bodies. Do not change meaning.",
@@ -102,6 +137,7 @@ export function composeReviewSubmissionPrompt(target: RemoteReviewTarget, verdic
     "4. For approved items, use the fixed text. For edited items, use the user's replacement text. For skipped items, remove that body/comment from the submission.",
     "5. The user's Approve choice is the confirmation to submit that item. After the last item is approved, edited, or skipped, call submit_pr_review immediately with the arguments below, replacing only body/comment text with the approved or edited text and omitting skipped items. Do not ask for a second/final submission confirmation.",
     `6. Do not approve this PR if the current GitHub user (${pr.authorLogin}) authored it; the tool refuses self-approval.`,
+    `7. After submit_pr_review succeeds, reply with the PR link and the short action summary returned by the tool. PR link: ${prUrl}`,
     "",
     "submit_pr_review arguments:",
     "```json",
@@ -135,6 +171,7 @@ function composeRemoteReviewPrompt(target: RemoteReviewTarget, reviewPrompt: str
 export default function codeDiffExtension(pi: ExtensionAPI) {
   const initialShortcutConfig = loadCommentShortcuts();
   let activeReview = false;
+  let reviewRunInFlight = false;
 
   function notifyShortcutWarnings(ctx: ExtensionContext, warnings: string[]): void {
     if (warnings.length === 0 || !ctx.hasUI) return;
@@ -217,7 +254,9 @@ export default function codeDiffExtension(pi: ExtensionAPI) {
     }
 
     const verdict: ReviewVerdict = choice === approveChoice ? "approve" : choice === requestChoice ? "request_changes" : "comment";
-    const body = buildReviewBody(files, result);
+    const reviewBody = buildReviewBody(files, result);
+    const optionalBody = verdict === "comment" ? undefined : await ctx.ui.editor(`${choice}: optional review body comment`, "");
+    const body = mergeReviewBodies(optionalBody, reviewBody);
     const prompt = composeReviewSubmissionPrompt(target, verdict, body, inlineComments);
     pi.sendUserMessage(prompt);
     ctx.ui.notify("Sent review submission instructions to the agent.", "info");
@@ -283,10 +322,28 @@ export default function codeDiffExtension(pi: ExtensionAPI) {
     return runInteractiveReview({ remote: trimmed }, ctx);
   }
 
+  function startDiff(args: string, ctx: ExtensionContext): ReviewRunStatus {
+    if (reviewRunInFlight || activeReview) {
+      const message = "A review session is already open.";
+      ctx.ui.notify(message, "warning");
+      return { started: false, message };
+    }
+
+    reviewRunInFlight = true;
+    void runDiff(args, ctx).catch((error: unknown) => {
+      const message = error instanceof Error ? error.message : String(error);
+      ctx.ui.notify(`Could not start review: ${message}`, "error");
+    }).finally(() => {
+      reviewRunInFlight = false;
+    });
+
+    return { started: true, message: "Review is starting." };
+  }
+
   const reviewCommand = {
     description: "Review and annotate code changes. /diff (local), /diff remote <url | branch>, or /diff base..head",
     handler: async (args: string, ctx: ExtensionContext) => {
-      await runDiff(args, ctx);
+      startDiff(args, ctx);
     },
   };
 
@@ -338,12 +395,14 @@ export default function codeDiffExtension(pi: ExtensionAPI) {
   pi.registerTool({
     name: "submit_pr_review",
     label: "submit-pr-review",
-    description: "Submit a GitHub pull request review (approve, request changes, or comment) via gh api. Refuses to approve a PR authored by the current user.",
+    description: "Submit a GitHub pull request review (approve, request changes, or comment) via gh api. Refuses to approve a PR authored by the current user. Approvals with inline comments post the comments first, then approve.",
     promptSnippet: "Submit a GitHub PR review verdict via gh api after the user confirms.",
     promptGuidelines: [
       "Only call submit_pr_review after the user explicitly confirms the exact verdict and text.",
       "Fix only grammar and English in the body and comment text; never change their meaning.",
       "Never approve a pull request the user authored; the tool blocks self-approval and you should not retry as approve.",
+      "Keep existing inline comments in the comments array for approve, request_changes, and comment verdicts.",
+      "After a successful submission, report the PR link and short summary returned by the tool.",
       "Pass repo as owner/repo, the prNumber, the commitId (PR head SHA), and prAuthorLogin so self-approval can be blocked.",
       "Pass cwd to the local checkout of the repository so gh runs in the right place.",
     ],

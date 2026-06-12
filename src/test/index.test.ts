@@ -25,7 +25,7 @@ vi.mock("../ui/review-app.js", () => ({
   runReviewApp: mocks.runReviewApp,
 }));
 
-const { composeReviewSubmissionPrompt, default: codeDiffExtension } = await import("../index.js");
+const { composeReviewSubmissionPrompt, mergeReviewBodies, default: codeDiffExtension } = await import("../index.js");
 
 describe("code diff extension", () => {
   beforeEach(() => {
@@ -75,8 +75,15 @@ describe("code diff extension", () => {
     expect(prompt).toContain("each queued question must still be one item only");
     expect(prompt).toContain("The user's Approve choice is the confirmation to submit that item.");
     expect(prompt).toContain("Do not ask for a second/final submission confirmation.");
+    expect(prompt).toContain("Call submit_pr_review once with the full arguments below");
+    expect(prompt).toContain("reply with the PR link and the short action summary returned by the tool");
     expect(prompt).toContain('"body": "Shouwlwn be as MagicModules"');
     expect(prompt).toContain('"repo": "example/widgets"');
+  });
+
+  it("merges optional review body comments with existing review body text", () => {
+    expect(mergeReviewBodies("LGTM", "src/app.ts:\nNice catch")).toBe("LGTM\n\nsrc/app.ts:\nNice catch");
+    expect(mergeReviewBodies("  ", undefined)).toBeUndefined();
   });
 
   it("registers code, code-diff, and diff commands", () => {
@@ -94,6 +101,38 @@ describe("code diff extension", () => {
     expect(pi.registerCommand).toHaveBeenCalledWith("diff", expect.any(Object));
     expect(pi.registerCommand).not.toHaveBeenCalledWith("interactive-review", expect.any(Object));
     expect(pi.registerTool).toHaveBeenCalledWith(expect.objectContaining({ name: "interactive_review" }));
+  });
+
+  it("does not block the diff command while review data loads", async () => {
+    const commands = new Map<string, { handler: (args: string, ctx: any) => Promise<void> }>();
+    let resolveData: (data: unknown) => void = () => {};
+    mocks.getReviewWindowData.mockReturnValue(new Promise((resolve) => { resolveData = resolve; }));
+    const pi = {
+      registerCommand: vi.fn((name: string, command) => commands.set(name, command)),
+      registerTool: vi.fn(),
+      registerShortcut: vi.fn(),
+      on: vi.fn(),
+    };
+    const ctx = {
+      hasUI: true,
+      cwd: "/repo",
+      ui: {
+        notify: vi.fn(),
+        setWidget: vi.fn(),
+        setEditorText: vi.fn(),
+      },
+    };
+
+    codeDiffExtension(pi as never);
+    const command = commands.get("diff")!;
+
+    await expect(command.handler("", ctx)).resolves.toBeUndefined();
+    expect(mocks.getReviewWindowData).toHaveBeenCalledWith(pi, "/repo");
+    expect(mocks.runReviewApp).not.toHaveBeenCalled();
+
+    resolveData({ repoRoot: "/repo", files: [], branchBaseRevision: "main", modifiedRevision: "HEAD" });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(ctx.ui.notify).toHaveBeenCalledWith("No reviewable files found for this diff.", "info");
   });
 
   it("surfaces initial shortcut config warnings on startup and reload", async () => {

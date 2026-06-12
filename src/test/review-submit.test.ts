@@ -141,7 +141,41 @@ describe("submitPullRequestReview", () => {
     });
 
     expect(result.ok).toBe(true);
+    expect(result.message).toContain("https://github.com/o/r/pull/42");
+    expect(result.message).toContain("PR was approved at");
     expect(payload).toEqual({ event: "APPROVE", body: "looks good" });
+  });
+
+  it("posts inline comments before approving when approval includes comments", async () => {
+    const payloads: unknown[] = [];
+    const pi = {
+      exec: async (_cmd: string, args: string[]) => {
+        if (args.includes("user")) return { stdout: "reviewer\n", stderr: "", code: 0, killed: false };
+        const inputIndex = args.indexOf("--input");
+        if (inputIndex >= 0) payloads.push(JSON.parse(readFileSync(args[inputIndex + 1]!, "utf8")));
+        return { stdout: "{}", stderr: "", code: 0, killed: false };
+      },
+    };
+
+    const result = await submitPullRequestReview(pi as never, {
+      repo: "o/r",
+      prNumber: "42",
+      commitId: "sha",
+      verdict: "approve",
+      prAuthorLogin: "leo",
+      body: "looks good",
+      comments: [{ path: "src/app.ts", line: 12, side: "RIGHT", body: "Inline note" }],
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.message).toContain("https://github.com/o/r/pull/42");
+    expect(result.message).toContain("PR was approved at");
+    expect(result.message).toContain("1 inline comment was added.");
+    expect(result.message).toContain("Your review body comment was included in the approval.");
+    expect(payloads).toEqual([
+      { event: "COMMENT", commit_id: "sha", comments: [{ path: "src/app.ts", line: 12, side: "RIGHT", body: "Inline note" }] },
+      { event: "APPROVE", body: "looks good" },
+    ]);
   });
 
   it("rejects request_changes with no body or comments before calling gh", async () => {

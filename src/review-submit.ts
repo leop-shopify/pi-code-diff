@@ -32,6 +32,12 @@ export interface SubmitReviewResult {
   blockedSelfApproval?: boolean;
 }
 
+interface ReviewSubmission {
+  verdict: ReviewVerdict;
+  body?: string;
+  comments?: ReviewInlineComment[];
+}
+
 const EVENT_BY_VERDICT: Record<ReviewVerdict, string> = {
   approve: "APPROVE",
   request_changes: "REQUEST_CHANGES",
@@ -113,6 +119,41 @@ export function buildReviewPayload(input: SubmitReviewInput): Record<string, unk
   return payload;
 }
 
+function formatReviewSummary(input: SubmitReviewInput, commentCount: number, bodyIncluded: boolean): string {
+  const url = `https://github.com/${input.repo}/pull/${input.prNumber}`;
+  const time = new Intl.DateTimeFormat("en-US", { hour: "2-digit", minute: "2-digit", hour12: false }).format(new Date());
+  const action = input.verdict === "approve" ? "PR was approved" : input.verdict === "request_changes" ? "Changes were requested" : "Review comment was posted";
+  const comments = commentCount === 0 ? "No inline comments were added." : `${commentCount} inline comment${commentCount === 1 ? " was" : "s were"} added.`;
+  const body = bodyIncluded
+    ? input.verdict === "approve"
+      ? "Your review body comment was included in the approval."
+      : input.verdict === "request_changes"
+        ? "Your review body comment was included in the change request."
+        : "Your review body comment was included."
+    : undefined;
+  return [url, `${action} at ${time}.`, comments, body].filter((line): line is string => line != null).join("\n");
+}
+
+async function postReview(pi: ExtensionAPI, input: SubmitReviewInput, submission: ReviewSubmission): Promise<SubmitReviewResult> {
+  const payload = buildReviewPayload({ ...input, verdict: submission.verdict, body: submission.body, comments: submission.comments });
+  const dir = mkdtempSync(join(tmpdir(), "pi-code-diff-review-"));
+  const payloadPath = join(dir, "review.json");
+  try {
+    writeFileSync(payloadPath, JSON.stringify(payload), "utf8");
+    const result = await pi.exec(
+      "gh",
+      ["api", `repos/${input.repo}/pulls/${input.prNumber}/reviews`, "--method", "POST", "--input", payloadPath],
+      { cwd: input.gitRoot, timeout: 20000 },
+    );
+    if (result.code !== 0) {
+      return { ok: false, message: result.stderr.trim() || result.stdout.trim() || "gh api review submission failed." };
+    }
+    return { ok: true, message: "submitted" };
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
 export async function submitPullRequestReview(pi: ExtensionAPI, input: SubmitReviewInput): Promise<SubmitReviewResult> {
   if (input.verdict === "approve") {
     const me = await getCurrentGitHubLogin(pi, input.gitRoot);
@@ -131,21 +172,19 @@ export async function submitPullRequestReview(pi: ExtensionAPI, input: SubmitRev
     return { ok: false, message: "Request changes needs a review body or at least one inline comment." };
   }
 
-  const payload = buildReviewPayload(input);
-  const dir = mkdtempSync(join(tmpdir(), "pi-code-diff-review-"));
-  const payloadPath = join(dir, "review.json");
-  try {
-    writeFileSync(payloadPath, JSON.stringify(payload), "utf8");
-    const result = await pi.exec(
-      "gh",
-      ["api", `repos/${input.repo}/pulls/${input.prNumber}/reviews`, "--method", "POST", "--input", payloadPath],
-      { cwd: input.gitRoot, timeout: 20000 },
-    );
-    if (result.code !== 0) {
-      return { ok: false, message: result.stderr.trim() || result.stdout.trim() || "gh api review submission failed." };
-    }
-    return { ok: true, message: `Submitted ${EVENT_BY_VERDICT[input.verdict]} review on PR #${input.prNumber}.` };
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
+  const body = input.body?.trim();
+  const comments = input.comments ?? [];
+
+  if (input.verdict === "approve" && comments.length > 0) {
+    const commentResult = await postReview(pi, input, { verdict: "comment", comments });
+    if (!commentResult.ok) return { ok: false, message: `Could not add review comments before approval: ${commentResult.message}` };
+
+    const approvalResult = await postReview(pi, input, { verdict: "approve", body });
+    if (!approvalResult.ok) return { ok: false, message: `Review comments were added, but approval failed: ${approvalResult.message}` };
+    return { ok: true, message: formatReviewSummary(input, comments.length, body != null && body.length > 0) };
   }
+
+  const result = await postReview(pi, input, { verdict: input.verdict, body, comments });
+  if (!result.ok) return result;
+  return { ok: true, message: formatReviewSummary(input, comments.length, body != null && body.length > 0) };
 }
