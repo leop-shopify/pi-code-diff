@@ -70,6 +70,7 @@ interface ReviewAppOptions {
   repoRoot: string;
   loadFileContents: (file: ReviewFile, scope: ReviewScope) => Promise<ReviewFileContents>;
   commentShortcuts: CommentShortcut[];
+  allowEmptySubmit?: boolean;
   notify: ExtensionContext["ui"]["notify"];
 }
 
@@ -1492,7 +1493,7 @@ class ReviewApp {
   }
 
   private submit(): void {
-    if (!hasDraftContent(this.state)) {
+    if (!hasDraftContent(this.state) && this.options.allowEmptySubmit !== true) {
       this.setMessage("Add at least one line comment, file comment, or all note before submitting.");
       this.requestRender();
       return;
