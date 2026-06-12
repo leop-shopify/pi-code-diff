@@ -44,26 +44,6 @@ pi install https://github.com/leop-shopify/pi-code-diff
 Then restart Pi or run `/reload`.
 
 <details>
-<summary>Manual install</summary>
-
-```bash
-# Clone
-git clone https://github.com/leop-shopify/pi-code-diff.git \
-  ~/.pi/agent/git/github.com/leop-shopify/pi-code-diff
-
-# Install dependencies
-cd ~/.pi/agent/git/github.com/leop-shopify/pi-code-diff
-npm install
-
-# Symlink the extension entry
-ln -sf ~/.pi/agent/git/github.com/leop-shopify/pi-code-diff/src/index.ts \
-  ~/.pi/agent/extensions/pi-code-diff.ts
-```
-
-Then `/reload` in pi.
-</details>
-
-<details>
 <summary>Local development</summary>
 
 While iterating on the extension itself, install from a local checkout path:
@@ -102,16 +82,15 @@ Configure the shortcut with `globalShortcut` in `~/.pi/agent/extensions/code-dif
 
 `/diff` (and `/code`, `/code-diff`) is the single entry point for every kind of review.
 
-- `/diff` with no arguments opens a scope menu: local changes, a remote branch or GitHub PR, or a custom range.
-- `/diff <pr-url>` or `/diff owner/repo#123` or a Graphite PR URL opens that GitHub PR review directly.
-- `/diff <base>..<head>` (or `base...head`) opens that custom range.
-- `/diff <branch>` reviews a remote branch.
+- `/diff` with no arguments reviews local changes.
+- `/diff remote <url | branch>` reviews a remote branch or GitHub PR. It accepts a remote branch, a GitHub or Graphite PR URL, or `owner/repo#123`.
+- `/diff <base>..<head>` (or `base...head`) reviews that custom range.
 
 Local changes open the in-UI scope switcher described below.
 
 ### Basic flow
 
-1. Run `/diff`, `/code`, or `/code-diff` and choose local changes (or pass an argument)
+1. Run `/diff`, `/code`, or `/code-diff` for local changes (or pass an argument)
 2. Pick a scope:
    - `git diff` — review your current uncommitted working tree changes against `HEAD`
    - `last commit` — review the most recent commit against its parent

@@ -249,31 +249,19 @@ export default function codeDiffExtension(pi: ExtensionAPI) {
     return openReview(ctx, params.cwd ?? ctx.cwd);
   }
 
-  async function openDiffMenu(ctx: ExtensionContext): Promise<ReviewRunStatus> {
-    if (!ctx.hasUI) return openReview(ctx);
-    const localChoice = "Local changes (working tree, last commit, all files)";
-    const remoteChoice = "Remote branch or GitHub PR";
-    const customChoice = "Custom range (base..head)";
-    const choice = await ctx.ui.select("Review scope", [localChoice, remoteChoice, customChoice]);
-    if (choice == null) return { started: false, message: "Review cancelled." };
-    if (choice === remoteChoice) {
-      const value = await ctx.ui.input("Remote branch, GitHub/Graphite PR URL, or owner/repo#number");
-      if (value == null || value.trim().length === 0) return { started: false, message: "Review cancelled." };
-      return runInteractiveReview({ remote: value.trim() }, ctx);
-    }
-    if (choice === customChoice) {
-      const range = await ctx.ui.input("Ref range (base..head)");
-      if (range == null || range.trim().length === 0) return { started: false, message: "Review cancelled." };
-      return runInteractiveReview({ mode: "custom", ref: range.trim() }, ctx);
-    }
-    return openReview(ctx);
-  }
-
   async function runDiff(args: string, ctx: ExtensionContext): Promise<ReviewRunStatus> {
     const trimmed = args.trim();
-    if (trimmed.length === 0) return openDiffMenu(ctx);
+    if (trimmed.length === 0) return openReview(ctx);
 
-    const firstToken = trimmed.split(/\s+/)[0]!;
+    const tokens = trimmed.split(/\s+/);
+    const firstToken = tokens[0]!;
+
+    if (firstToken.toLowerCase() === "remote") {
+      const target = trimmed.slice(firstToken.length).trim();
+      if (target.length === 0) return unsupported("Usage: /diff remote <url | branch>", ctx);
+      return runInteractiveReview({ remote: target }, ctx);
+    }
+
     if (trimmed.startsWith("-") || MODE_VALUES.has(firstToken)) {
       return runInteractiveReview(parseInteractiveReviewArgs(trimmed), ctx);
     }
@@ -284,7 +272,7 @@ export default function codeDiffExtension(pi: ExtensionAPI) {
   }
 
   const reviewCommand = {
-    description: "Review and annotate code changes. /diff [pr-url | base..head | branch] or no args for a scope menu",
+    description: "Review and annotate code changes. /diff (local), /diff remote <url | branch>, or /diff base..head",
     handler: async (args: string, ctx: ExtensionContext) => {
       await runDiff(args, ctx);
     },
@@ -305,7 +293,7 @@ export default function codeDiffExtension(pi: ExtensionAPI) {
       "For local changes: omit remote, optionally pass cwd for non-world repos.",
       "For custom refs, pass ref as a base..head or base...head range.",
       "Mode defaults to working. Branch mode uses pi-code-diff's stack-aware parent branch behavior.",
-      "This is the same unified review as /diff (also /code, /code-diff). /diff with no args shows a scope menu; with a PR URL, base..head range, or branch it opens that mode directly.",
+      "This is the same unified review as /diff (also /code, /code-diff). /diff with no args reviews local changes; /diff remote <url|branch> reviews a remote branch or PR; /diff base..head reviews a custom range.",
     ],
     parameters: Type.Object({
       mode: Type.Optional(Type.Union([
