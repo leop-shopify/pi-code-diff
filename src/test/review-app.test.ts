@@ -2,7 +2,7 @@ import { visibleWidth } from "@earendil-works/pi-tui";
 import { describe, expect, it } from "vitest";
 import { buildStructuredDiff } from "../diff.js";
 import type { DiffReviewComment, ReviewFile, ReviewState } from "../types.js";
-import { buildCommentPanelEmptyStateLines, buildCommentPanelTextLines, buildDisplayRows, buildEditorLaunchCommand, buildFooterLines, buildHelpPanelLines, buildSideBySideDisplayRows, diffTextMatchesSearch, formatFocusStatus, formatPaneTitle, formatSelectedLineTargetLabel, getCancelAction, getDraftCommentCount, getEditorLineForTarget, getHalfPageStep, getMatchingDiffLineTargets, getNavigatorMoveIndex, getNextSearchIndex, getPaneLayout, getRelatedFileMarker, getRelatedFilePanelSections, getRelatedFilePaths, getSideBySidePairedLineTarget, getStackedPaneLayout, parseMouseWheelInput, renderCenteredOverlay, shouldStackPanes } from "../ui/review-app.js";
+import { buildCommentPanelEmptyStateLines, buildCommentPanelTextLines, buildDisplayRows, buildEditorLaunchCommand, buildFooterLines, buildHelpPanelLines, buildSideBySideDisplayRows, diffTextMatchesSearch, formatFocusStatus, formatPaneTitle, formatSelectedLineTargetLabel, getCancelAction, getDraftCommentCount, getEditorLineForTarget, getHalfPageStep, getMatchingDiffLineTargets, getNavigatorMoveIndex, getNextSearchIndex, getPaneLayout, getRelatedFileMarker, getRelatedFilePanelSections, getRelatedFilePaths, getSideBySideColumnTarget, getSideBySideLineTargets, getSideBySidePairedLineTarget, getStackedPaneLayout, parseMouseWheelInput, renderCenteredOverlay, shouldStackPanes } from "../ui/review-app.js";
 
 function makeFile(path: string, flags?: Partial<ReviewFile>): ReviewFile {
   return {
@@ -83,15 +83,52 @@ describe("side-by-side diff helpers", () => {
     expect(replacement?.newCell).toMatchObject({ side: "added", lineNumber: 2, text: "new value" });
   });
 
-  it("finds the paired side for replacement selections", () => {
+  it("builds per-side navigation targets for side-by-side movement", () => {
+    const diff = buildStructuredDiff(
+      ["alpha", "old value", "removed", "omega"].join("\n") + "\n",
+      ["alpha", "new value", "added", "omega"].join("\n") + "\n",
+      3,
+    );
+
+    const rows = buildSideBySideDisplayRows(diff);
+
+    expect(getSideBySideLineTargets(rows, "deleted")).toEqual([
+      { side: "deleted", line: 1 },
+      { side: "deleted", line: 2 },
+      { side: "deleted", line: 3 },
+      { side: "deleted", line: 4 },
+    ]);
+    expect(getSideBySideLineTargets(rows, "added")).toEqual([
+      { side: "added", line: 1 },
+      { side: "added", line: 2 },
+      { side: "added", line: 3 },
+      { side: "added", line: 4 },
+    ]);
+  });
+
+  it("finds the paired side for side-by-side selections", () => {
     const diff = buildStructuredDiff(
       ["alpha", "old value", "omega"].join("\n") + "\n",
       ["alpha", "new value", "omega"].join("\n") + "\n",
       3,
     );
 
+    expect(getSideBySidePairedLineTarget(diff, { side: "deleted", line: 1 })).toEqual({ side: "added", line: 1 });
+    expect(getSideBySidePairedLineTarget(diff, { side: "added", line: 1 })).toEqual({ side: "deleted", line: 1 });
     expect(getSideBySidePairedLineTarget(diff, { side: "deleted", line: 2 })).toEqual({ side: "added", line: 2 });
     expect(getSideBySidePairedLineTarget(diff, { side: "added", line: 2 })).toEqual({ side: "deleted", line: 2 });
+  });
+
+  it("jumps to the previous available target-side line when crossing out of an insertion block", () => {
+    const diff = buildStructuredDiff(
+      ["same", "after"].join("\n") + "\n",
+      ["same", "inserted a", "inserted b", "after"].join("\n") + "\n",
+      3,
+    );
+
+    const rows = buildSideBySideDisplayRows(diff);
+
+    expect(getSideBySideColumnTarget(rows, { side: "added", line: 3 }, "deleted")).toEqual({ side: "deleted", line: 1 });
   });
 
   it("describes the selected side and range", () => {
