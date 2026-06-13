@@ -453,7 +453,7 @@ function renderOuterFrame(
   return [top, ...body, bottom];
 }
 
-const FOOTER_ACTION_HINT = "Tab focus • / search • ? help/actions • v diff view • s submit • Esc exit";
+const FOOTER_ACTION_HINT = "Tab/←/→ focus • / search • ? help/actions • v diff view • s submit • Esc exit";
 
 const HELP_KEY_SECTIONS = [
   {
@@ -475,6 +475,7 @@ const HELP_KEY_SECTIONS = [
       "navigator: ↑↓/j/k files",
       "Ctrl+d/u half-page • Ctrl+f/b full page",
       "PageDown/PageUp page • gg/G top/bottom",
+      "←/→ move between files/code/comments",
       "r related filter • Enter focus diff",
     ],
   },
@@ -482,8 +483,9 @@ const HELP_KEY_SECTIONS = [
     title: "Diff actions",
     lines: [
       "diff: ↑↓/j/k lines",
+      "side-by-side: ↑↓/j/k stay on selected side",
+      "side-by-side: ←/→ cross old/new before pane focus",
       "Shift+↑↓ extend range",
-      "←/→ choose side in side-by-side view",
       "Ctrl+d/u half-page • Ctrl+f/b full page",
       "PageDown/PageUp page • gg/G top/bottom",
       "n/N next/prev search, or n/p hunk without search",
@@ -849,13 +851,53 @@ export function buildSideBySideDisplayRows(diff: StructuredDiff): SideBySideDisp
   return rows;
 }
 
-export function getSideBySidePairedLineTarget(diff: StructuredDiff, target: ReviewLineTarget): ReviewLineTarget | null {
-  for (const row of diff.rows) {
-    if (row.kind !== "replace" || row.oldLineNumber == null || row.newLineNumber == null) continue;
-    if (target.side === "deleted" && target.line === row.oldLineNumber) return { side: "added", line: row.newLineNumber };
-    if (target.side === "added" && target.line === row.newLineNumber) return { side: "deleted", line: row.oldLineNumber };
+export function getSideBySideLineTargets(rows: SideBySideDisplayRow[], side?: ReviewLineTarget["side"]): ReviewLineTarget[] {
+  const seen = new Set<string>();
+  const targets: ReviewLineTarget[] = [];
+  const pushCell = (cell: SideBySideCell | null): void => {
+    if (cell == null || (side != null && cell.side !== side)) return;
+    const key = `${cell.side}:${cell.lineNumber}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    targets.push({ side: cell.side, line: cell.lineNumber });
+  };
+
+  for (const row of rows) {
+    if (row.kind === "gap") continue;
+    pushCell(row.oldCell);
+    pushCell(row.newCell);
   }
-  return null;
+
+  return targets;
+}
+
+export function getSideBySideColumnTarget(rows: SideBySideDisplayRow[], current: ReviewLineTarget, targetSide: ReviewLineTarget["side"]): ReviewLineTarget | null {
+  const candidates: Array<{ target: ReviewLineTarget; rowIndex: number }> = [];
+  let currentRowIndex = -1;
+
+  rows.forEach((row, rowIndex) => {
+    if (row.kind === "gap") return;
+    const cells = [row.oldCell, row.newCell];
+    for (const cell of cells) {
+      if (cell == null) continue;
+      if (cell.side === current.side && cell.lineNumber === current.line) currentRowIndex = rowIndex;
+      if (cell.side === targetSide) candidates.push({ target: { side: cell.side, line: cell.lineNumber }, rowIndex });
+    }
+  });
+
+  if (candidates.length === 0) return null;
+  if (currentRowIndex < 0) return candidates[0]!.target;
+
+  let previousCandidate: { target: ReviewLineTarget; rowIndex: number } | null = null;
+  for (const candidate of candidates) {
+    if (candidate.rowIndex <= currentRowIndex) previousCandidate = candidate;
+  }
+  return (previousCandidate ?? candidates[0]!).target;
+}
+
+export function getSideBySidePairedLineTarget(diff: StructuredDiff, target: ReviewLineTarget): ReviewLineTarget | null {
+  const targetSide = target.side === "deleted" ? "added" : "deleted";
+  return getSideBySideColumnTarget(buildSideBySideDisplayRows(diff), target, targetSide);
 }
 
 export function formatSelectedLineTargetLabel(target: ReviewLineTarget | null): string {
@@ -1115,7 +1157,22 @@ class ReviewApp {
   }
 
   private getVisibleLineTargets(fileId: string | null, scope: ReviewScope): ReviewLineTarget[] {
-    return this.getDiffLayout(fileId, scope)?.commentableTargets ?? [];
+    const layout = this.getDiffLayout(fileId, scope);
+    if (layout == null) return [];
+    if (this.diffViewMode === "side-by-side") return getSideBySideLineTargets(layout.sideBySideRows);
+    return layout.commentableTargets;
+  }
+
+  private getDiffMovementTargets(fileId: string, scope: ReviewScope): ReviewLineTarget[] {
+    const visibleTargets = this.getVisibleLineTargets(fileId, scope);
+    if (this.diffViewMode !== "side-by-side") return visibleTargets;
+
+    const selectedTarget = getSelectedLineTarget(this.state, fileId, scope);
+    const selectedSide = selectedTarget?.side ?? visibleTargets[0]?.side;
+    if (selectedSide == null) return visibleTargets;
+
+    const sideTargets = getSideBySideLineTargets(this.getDiffLayout(fileId, scope)?.sideBySideRows ?? [], selectedSide);
+    return sideTargets.length > 0 ? sideTargets : visibleTargets;
   }
 
   private relatedFilterAnchorFile(): ReviewFile | null {
@@ -1539,7 +1596,7 @@ class ReviewApp {
     const diff = this.getDisplayDiff(file?.id ?? null, this.state.activeScope);
     if (file == null || diff == null || diff.hunks.length === 0) return;
 
-    const visibleTargets = this.getVisibleLineTargets(file.id, this.state.activeScope);
+    const visibleTargets = this.getDiffMovementTargets(file.id, this.state.activeScope);
     const current = getSelectedLineTarget(this.state, file.id, this.state.activeScope) ?? visibleTargets[0] ?? null;
     const targets = diff.hunks
       .map((hunk) => visibleTargets.find((target) => {
@@ -1606,18 +1663,24 @@ class ReviewApp {
     this.requestRender();
   }
 
-  private selectSideBySidePair(side: ReviewLineTarget["side"]): boolean {
+  private selectSideBySideColumn(targetSide: ReviewLineTarget["side"]): boolean {
     if (this.diffViewMode !== "side-by-side" || this.state.focus !== "diff") return false;
     const file = this.activeFile();
-    const diff = this.getDisplayDiff(file?.id ?? null, this.state.activeScope);
+    const layout = this.getDiffLayout(file?.id ?? null, this.state.activeScope);
     const current = getSelectedLineTarget(this.state, file?.id ?? null, this.state.activeScope);
-    if (file == null || diff == null || current == null || current.side === side) return false;
+    if (file == null || layout == null || current == null || current.side === targetSide) return false;
 
-    const paired = getSideBySidePairedLineTarget(diff, current);
-    if (paired == null || paired.side !== side) return false;
-    this.state = setSelectedLineTarget(this.state, file.id, this.state.activeScope, paired);
+    const target = getSideBySideColumnTarget(layout.sideBySideRows, current, targetSide);
+    if (target == null) return false;
+    this.state = setSelectedLineTarget(this.state, file.id, this.state.activeScope, target);
     this.requestRender();
     return true;
+  }
+
+  private moveFocusHorizontally(direction: -1 | 1): void {
+    if (direction < 0 && this.selectSideBySideColumn("deleted")) return;
+    if (direction > 0 && this.selectSideBySideColumn("added")) return;
+    this.cycleVisibleFocus(direction < 0);
   }
 
   private toggleCommentsPane(): void {
@@ -1695,7 +1758,7 @@ class ReviewApp {
   private moveDiffSelection(delta: number): void {
     const file = this.activeFile();
     if (file == null) return;
-    const visibleTargets = this.getVisibleLineTargets(file.id, this.state.activeScope);
+    const visibleTargets = this.getDiffMovementTargets(file.id, this.state.activeScope);
     this.state = moveSelectedLineTarget(this.state, file.id, this.state.activeScope, visibleTargets, delta);
     this.requestRender();
   }
@@ -1703,7 +1766,7 @@ class ReviewApp {
   private extendDiffSelection(delta: number): void {
     const file = this.activeFile();
     if (file == null) return;
-    const visibleTargets = this.getVisibleLineTargets(file.id, this.state.activeScope);
+    const visibleTargets = this.getDiffMovementTargets(file.id, this.state.activeScope);
     this.state = extendSelectedLineTarget(this.state, file.id, this.state.activeScope, visibleTargets, delta);
     this.requestRender();
   }
@@ -1822,7 +1885,7 @@ class ReviewApp {
     if (this.state.focus === "diff") {
       const file = this.activeFile();
       if (file == null) return;
-      const visibleTargets = this.getVisibleLineTargets(file.id, this.state.activeScope);
+      const visibleTargets = this.getDiffMovementTargets(file.id, this.state.activeScope);
       if (visibleTargets.length === 0) return;
       const target = direction === "start" ? visibleTargets[0]! : visibleTargets[visibleTargets.length - 1]!;
       this.state = setSelectedLineTarget(this.state, file.id, this.state.activeScope, target);
@@ -1976,6 +2039,8 @@ class ReviewApp {
     if (data === "3") { this.setScope("all-files"); return; }
     if (matchesKey(data, Key.shift("tab"))) { this.cycleVisibleFocus(true); return; }
     if (matchesKey(data, Key.tab)) { this.cycleVisibleFocus(); return; }
+    if (matchesKey(data, Key.left)) { this.moveFocusHorizontally(-1); return; }
+    if (matchesKey(data, Key.right)) { this.moveFocusHorizontally(1); return; }
     if (data === "g") { this.pendingVimSequence = "g"; return; }
     if (data === "G") { this.jumpToBoundary("end"); return; }
     if (data === "/") { this.openSearch(); return; }
@@ -2052,12 +2117,6 @@ class ReviewApp {
         if (matchesKey(data, Key.up) || data === "k") {
           this.moveDiffSelection(-1);
           return;
-        }
-        if (matchesKey(data, Key.left)) {
-          if (this.selectSideBySidePair("deleted")) return;
-        }
-        if (matchesKey(data, Key.right)) {
-          if (this.selectSideBySidePair("added")) return;
         }
         if (matchesKey(data, Key.ctrl("d"))) {
           this.moveDiffSelection(getHalfPageStep(this.diffPageSize));
@@ -2310,7 +2369,7 @@ class ReviewApp {
 
     const layout = this.getDiffLayout(file.id, this.state.activeScope)!;
     const diff = layout.displayDiff;
-    const visibleTargets = layout.commentableTargets;
+    const visibleTargets = this.getVisibleLineTargets(file.id, this.state.activeScope);
     const language = detectPiLanguage(file.path);
     this.state = clampSelectedLineTarget(this.state, file.id, this.state.activeScope, visibleTargets);
     const selectedTarget = getSelectedLineTarget(this.state, file.id, this.state.activeScope);
@@ -2567,7 +2626,7 @@ class ReviewApp {
           ? `Search ${formatFocusStatus(this.searchPane).replace("Focus: ", "")}: ${sanitizeTerminalText(this.searchBuffer)}`
           : this.editTarget != null
             ? `Editing ${formatIntentLabel(this.editTarget.intent).toLowerCase()} comment`
-            : `${formatFocusStatus(this.state.focus)} • ${layoutStatus}Tab focus • / search • t templates • v diff view • ? help • 1/2/3 scopes • h ${this.commentsHidden ? "show" : "hide"} comments • o open in $EDITOR • s submit • Esc exit • Ctrl+C exit`);
+            : `${formatFocusStatus(this.state.focus)} • ${layoutStatus}Tab/←/→ focus • / search • t templates • v diff view • ? help • 1/2/3 scopes • h ${this.commentsHidden ? "show" : "hide"} comments • o open in $EDITOR • s submit • Esc exit • Ctrl+C exit`);
 
     const scopeTabs = SEARCHABLE_SCOPES.map((scope, index) => {
       const active = this.state.activeScope === scope;
