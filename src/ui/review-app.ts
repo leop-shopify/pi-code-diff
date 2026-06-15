@@ -541,6 +541,20 @@ export function buildCommentPanelEmptyStateLines(theme: Theme, width: number): s
   ];
 }
 
+export function buildDiffActionHintLine(theme: Theme, width: number): string {
+  const sep = theme.fg("dim", " • ");
+  const part = (key: string, label: string, color: "accent" | "success" | "warning" | "muted") =>
+    `${theme.fg(color, key)} ${theme.fg("dim", label)}`;
+  const hint = [
+    part("Enter/m", "modify", "accent"),
+    part("c", "comment", "success"),
+    part("d", "discuss", "warning"),
+    part("l", "file", "muted"),
+    part("a", "all", "muted"),
+  ].join(sep);
+  return truncateToWidth(hint, Math.max(1, width - 2), "…", false);
+}
+
 export function buildRelatedFilePanelLines(theme: Theme, width: number, file: ReviewFile | null, scope: ReviewScope, maxPathsPerSection = 6): string[] {
   const sections = getRelatedFilePanelSections(file, scope);
   if (sections.length === 0) return [];
@@ -2367,7 +2381,7 @@ class ReviewApp {
         : "";
     lines.push(this.theme.fg("muted", getScopeDisplayPath(file, this.state.activeScope)));
     lines.push(this.theme.fg("dim", `${formatScopeLabel(this.state.activeScope)} • view ${formatDiffViewModeLabel(this.diffViewMode)} • wrap ${this.state.wrapLines ? "on" : "off"}${this.state.activeScope === "all-files" ? "" : ` • unchanged ${this.state.hideUnchanged ? "hidden" : "shown"}`}${diffSearchLabel}`));
-    lines.push("");
+    lines.push(buildDiffActionHintLine(this.theme, width));
 
     if (entry == null || entry.status === "loading") {
       lines.push(this.theme.fg("muted", "Loading file contents…"));
