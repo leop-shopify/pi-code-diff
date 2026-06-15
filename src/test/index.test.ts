@@ -100,7 +100,8 @@ describe("code diff extension", () => {
     expect(pi.registerCommand).toHaveBeenCalledWith("code-diff", expect.any(Object));
     expect(pi.registerCommand).toHaveBeenCalledWith("diff", expect.any(Object));
     expect(pi.registerCommand).not.toHaveBeenCalledWith("interactive-review", expect.any(Object));
-    expect(pi.registerTool).toHaveBeenCalledWith(expect.objectContaining({ name: "interactive_review" }));
+    expect(pi.registerTool).not.toHaveBeenCalledWith(expect.objectContaining({ name: "interactive_review" }));
+    expect(pi.registerTool).toHaveBeenCalledWith(expect.objectContaining({ name: "submit_pr_review" }));
   });
 
   it("does not block the diff command while review data loads", async () => {

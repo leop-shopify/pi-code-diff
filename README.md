@@ -117,13 +117,13 @@ Local changes open the in-UI scope switcher described below.
 5. Press `s` to insert the review prompt into the editor
 6. Read it, tweak it if you want, then send it normally
 
-### Agent tool and remote reviews
+### Remote reviews
 
-There is no separate `/interactive-review` command; everything is `/diff`. Agents launch the same review surface through the `interactive_review` tool (the name is kept for Commander and existing prompts):
+There is no separate `/interactive-review` command and no agent review tool; everything is `/diff`:
 
-- `remote` accepts a plain remote branch, a GitHub PR URL, a Graphite PR URL, or `owner/repo#number`
-- `cwd` points at an explicit local checkout when you want to review against a specific local repo
-- `ref` accepts a `base..head` or `base...head` custom range
+- `/diff remote <branch | url>` accepts a plain remote branch, a GitHub PR URL, a Graphite PR URL, or `owner/repo#number`
+- `/diff` with no args reviews local working-tree changes against the configured or detected checkout
+- `/diff base..head` reviews a `base..head` or `base...head` custom range
 
 Remote branch and GitHub PR reviews fetch with `--no-tags` and a 15 second timeout, then review the fetched base/head range in the `/diff` UI. PR URLs and `owner/repo#number` do not require a checkout; if no matching local checkout is configured or detected, pi-code-diff uses a lightweight git cache under `~/.pi/agent/cache/pi-code-diff/remotes/`.
 
