@@ -353,47 +353,6 @@ export default function codeDiffExtension(pi: ExtensionAPI) {
   pi.registerCommand("diff", reviewCommand);
 
   pi.registerTool({
-    name: "interactive_review",
-    label: "interactive-review",
-    description: "Launch the pi-code-diff interactive review TUI for reviewing git diffs. Supports local diffs, custom ref ranges, remote branches, and GitHub or stack-host PR URLs.",
-    promptSnippet: "Open the interactive diff review TUI. Use when the user wants to review code changes visually.",
-    promptGuidelines: [
-      "Use interactive_review when the user asks to review code, diffs, or changes.",
-      "For remote PRs, pass the PR URL or branch name in the remote parameter.",
-      "For local changes: omit remote, optionally pass cwd for an explicit local checkout.",
-      "For custom refs, pass ref as a base..head or base...head range.",
-      "Mode defaults to working. Branch mode uses pi-code-diff's stack-aware parent branch behavior.",
-      "This is the same unified review as /diff (also /code, /code-diff). /diff with no args reviews local changes; /diff remote <url|branch> reviews a remote branch or PR; /diff base..head reviews a custom range.",
-    ],
-    parameters: Type.Object({
-      mode: Type.Optional(Type.Union([
-        Type.Literal("working"),
-        Type.Literal("staged"),
-        Type.Literal("branch"),
-        Type.Literal("custom"),
-      ], { description: "Diff mode: working, staged, branch, or custom. Default: working" })),
-      ref: Type.Optional(Type.String({ description: "Custom git diff range for custom mode" })),
-      resume: Type.Optional(Type.String({ description: "Resume token from an interrupted interactive review ask" })),
-      tree: Type.Optional(Type.String({ description: "Worktree name or absolute path to a git working directory" })),
-      branch: Type.Optional(Type.String({ description: "Branch name that resolves to a worktree" })),
-      project: Type.Optional(Type.String({ description: "Project zone resolved via dev cd" })),
-      remote: Type.Optional(Type.String({ description: "Remote branch name, GitHub PR URL, or stack-host URL" })),
-      cwd: Type.Optional(Type.String({ description: "Explicit working directory path for a local checkout" })),
-      includeGenerated: Type.Optional(Type.Boolean({ description: "Include generated files when supported" })),
-    }),
-    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      const status = await runInteractiveReview(params as InteractiveReviewParams, ctx);
-      const text = status.started
-        ? `Interactive review session completed.${status.message ? ` ${status.message}` : ""}`
-        : `Interactive review did not start.${status.message ? ` ${status.message}` : ""}`;
-      return {
-        content: [{ type: "text" as const, text }],
-        details: { status },
-      };
-    },
-  });
-
-  pi.registerTool({
     name: "submit_pr_review",
     label: "submit-pr-review",
     description: "Submit a GitHub pull request review (approve, request changes, or comment) via provider-cli api. Refuses to approve a PR authored by the current user. Approvals with inline comments post the comments first, then approve.",
