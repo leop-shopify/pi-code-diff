@@ -187,7 +187,7 @@ export default function codeDiffExtension(pi: ExtensionAPI) {
 
     activeReview = true;
     try {
-      const { repoRoot, files, branchBaseRevision, modifiedRevision } = data;
+      const { repoRoot, files, branchBaseRevision, modifiedRevision, visibleScopes } = data;
       const shortcutConfig = loadCommentShortcuts();
       if (files.length === 0) {
         const message = "No reviewable files found for this diff.";
@@ -207,6 +207,7 @@ export default function codeDiffExtension(pi: ExtensionAPI) {
         loadFileContents: (file, scope) => loadReviewFileContents(pi, repoRoot, file, scope, branchBaseRevision, modifiedRevision),
         commentShortcuts: shortcutConfig.shortcuts,
         allowEmptySubmit: remoteTarget?.pullRequest != null,
+        visibleScopes,
       });
 
       if (result.type === "cancel") {

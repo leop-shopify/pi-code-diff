@@ -19,6 +19,7 @@ export interface ReviewWindowData {
   files: ReviewFile[];
   branchBaseRevision: string | null;
   modifiedRevision?: string;
+  visibleScopes: ReviewScope[];
 }
 
 export const MAX_REVIEW_FILE_BYTES = 1_000_000;
@@ -639,7 +640,7 @@ export async function getReviewWindowData(pi: ExtensionAPI, cwd: string): Promis
   }
 
   const files = limitReviewItems([...seeds.values()].map(createReviewFile).sort(compareReviewFiles));
-  return { repoRoot, files, branchBaseRevision };
+  return { repoRoot, files, branchBaseRevision, visibleScopes: ["git-diff", "last-commit"] };
 }
 
 export async function getReviewWindowDataForRevisionRange(pi: ExtensionAPI, cwd: string, branchBaseRevision: string, modifiedRevision: string): Promise<ReviewWindowData> {
@@ -670,7 +671,7 @@ export async function getReviewWindowDataForRevisionRange(pi: ExtensionAPI, cwd:
   }
 
   const files = limitReviewItems([...seeds.values()].map(createReviewFile).sort(compareReviewFiles));
-  return { repoRoot, files, branchBaseRevision, modifiedRevision };
+  return { repoRoot, files, branchBaseRevision, modifiedRevision, visibleScopes: ["all-files"] };
 }
 
 export async function loadReviewFileContents(pi: ExtensionAPI, repoRoot: string, file: ReviewFile, scope: ReviewScope, branchBaseRevision?: string | null, modifiedRevision = "HEAD"): Promise<ReviewFileContents> {

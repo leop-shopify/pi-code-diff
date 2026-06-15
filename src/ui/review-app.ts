@@ -71,6 +71,7 @@ interface ReviewAppOptions {
   loadFileContents: (file: ReviewFile, scope: ReviewScope) => Promise<ReviewFileContents>;
   commentShortcuts: CommentShortcut[];
   allowEmptySubmit?: boolean;
+  visibleScopes?: ReviewScope[];
   notify: ExtensionContext["ui"]["notify"];
 }
 
@@ -88,6 +89,7 @@ interface MousePaneLayout {
 }
 
 const SEARCHABLE_SCOPES: ReviewScope[] = ["git-diff", "last-commit", "all-files"];
+const DEFAULT_VISIBLE_SCOPES: ReviewScope[] = ["git-diff", "last-commit"];
 const DEFAULT_CONTEXT_LINES = 3;
 const STACKED_LAYOUT_MAX_WIDTH = 99;
 
@@ -969,6 +971,9 @@ class ReviewApp {
     private readonly options: ReviewAppOptions,
   ) {
     this.state = ensureActiveFile(createInitialReviewState(options.files), options.files);
+    if (!this.visibleScopes().includes(this.state.activeScope)) {
+      this.state = setScope(this.state, options.files, this.visibleScopes()[0]!);
+    }
     this.searchBuffer = this.state.searchQuery;
 
     const editorTheme: EditorTheme = {
@@ -1102,6 +1107,11 @@ class ReviewApp {
 
   private setMessage(message: string): void {
     this.message = sanitizeTerminalText(message);
+  }
+
+  private visibleScopes(): ReviewScope[] {
+    const scopes = this.options.visibleScopes?.filter((scope) => SEARCHABLE_SCOPES.includes(scope)) ?? [];
+    return scopes.length > 0 ? scopes : DEFAULT_VISIBLE_SCOPES;
   }
 
   private activeFile(): ReviewFile | null {
@@ -2034,9 +2044,11 @@ class ReviewApp {
     if (data === "?") { this.toggleHelpMode(); return; }
     if (this.helpMode && matchesKey(data, Key.escape)) { this.helpMode = false; this.requestRender(); return; }
 
-    if (data === "1") { this.setScope("git-diff"); return; }
-    if (data === "2") { this.setScope("last-commit"); return; }
-    if (data === "3") { this.setScope("all-files"); return; }
+    if (/^[1-9]$/.test(data)) {
+      const scopes = this.visibleScopes();
+      const index = Number.parseInt(data, 10) - 1;
+      if (scopes.length > 1 && index < scopes.length) { this.setScope(scopes[index]!); return; }
+    }
     if (matchesKey(data, Key.shift("tab"))) { this.cycleVisibleFocus(true); return; }
     if (matchesKey(data, Key.tab)) { this.cycleVisibleFocus(); return; }
     if (matchesKey(data, Key.left)) { this.moveFocusHorizontally(-1); return; }
@@ -2614,8 +2626,20 @@ class ReviewApp {
     const terminalCols = this.tui?.terminal?.columns ?? this.lastWidth;
     const overlayOriginCol = Math.max(0, Math.floor((terminalCols - this.lastWidth) / 2));
     const overlayOriginRow = Math.max(0, Math.floor((terminalRows - totalHeight) / 2));
-    const bodyTop = overlayOriginRow + 1 + MODAL_INNER_PADDING_Y + 1;
     const contentLeft = overlayOriginCol + 1 + MODAL_INNER_PADDING_X;
+
+    const visibleScopes = this.visibleScopes();
+    const scopeHint = visibleScopes.length > 1 ? `${visibleScopes.map((_, index) => index + 1).join("/")} scopes • ` : "";
+    const headerLines = visibleScopes.length > 1
+      ? [truncateToWidth(visibleScopes.map((scope, index) => {
+          const active = this.state.activeScope === scope;
+          const count = getScopedFiles(this.options.files, scope).length;
+          const text = `${index + 1}:${formatScopeLabel(scope)}(${count})`;
+          return active ? this.theme.bg("selectedBg", this.theme.fg("text", ` ${text} `)) : this.theme.fg("muted", ` ${text} `);
+        }).join(" "), frameInnerWidth, "", false)]
+      : [];
+
+    const bodyTop = overlayOriginRow + 1 + MODAL_INNER_PADDING_Y + headerLines.length;
 
     const layoutStatus = stackPanes ? "stacked layout • " : "";
     const promptStatus = this.shortcutMode
@@ -2626,18 +2650,7 @@ class ReviewApp {
           ? `Search ${formatFocusStatus(this.searchPane).replace("Focus: ", "")}: ${sanitizeTerminalText(this.searchBuffer)}`
           : this.editTarget != null
             ? `Editing ${formatIntentLabel(this.editTarget.intent).toLowerCase()} comment`
-            : `${formatFocusStatus(this.state.focus)} • ${layoutStatus}Tab/←/→ focus • / search • t templates • v diff view • ? help • 1/2/3 scopes • h ${this.commentsHidden ? "show" : "hide"} comments • o open in $EDITOR • s submit • Esc exit • Ctrl+C exit`);
-
-    const scopeTabs = SEARCHABLE_SCOPES.map((scope, index) => {
-      const active = this.state.activeScope === scope;
-      const count = getScopedFiles(this.options.files, scope).length;
-      const text = `${index + 1}:${formatScopeLabel(scope)}(${count})`;
-      return active ? this.theme.bg("selectedBg", this.theme.fg("text", ` ${text} `)) : this.theme.fg("muted", ` ${text} `);
-    }).join(" ");
-
-    const headerLines = [
-      truncateToWidth(scopeTabs, frameInnerWidth, "", false),
-    ];
+            : `${formatFocusStatus(this.state.focus)} • ${layoutStatus}Tab/←/→ focus • / search • t templates • v diff view • ? help • ${scopeHint}h ${this.commentsHidden ? "show" : "hide"} comments • o open in $EDITOR • s submit • Esc exit • Ctrl+C exit`);
 
     const body: string[] = [];
 
