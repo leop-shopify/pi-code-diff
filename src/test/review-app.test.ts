@@ -2,7 +2,7 @@ import { visibleWidth } from "@earendil-works/pi-tui";
 import { describe, expect, it } from "vitest";
 import { buildStructuredDiff } from "../diff.js";
 import type { DiffReviewComment, ReviewFile, ReviewState } from "../types.js";
-import { buildCommentPanelEmptyStateLines, buildCommentPanelTextLines, buildDisplayRows, buildEditorLaunchCommand, buildFooterLines, buildHelpPanelLines, buildSideBySideDisplayRows, diffTextMatchesSearch, formatFocusStatus, formatPaneTitle, formatSelectedLineTargetLabel, getCancelAction, getDraftCommentCount, getEditorLineForTarget, getHalfPageStep, getMatchingDiffLineTargets, getNavigatorMoveIndex, getNextSearchIndex, getPaneLayout, getRelatedFileMarker, getRelatedFilePanelSections, getRelatedFilePaths, getSideBySideColumnTarget, getSideBySideLineTargets, getSideBySidePairedLineTarget, getStackedPaneLayout, parseMouseWheelInput, renderCenteredOverlay, shouldStackPanes } from "../ui/review-app.js";
+import { buildCommentPanelEmptyStateLines, buildCommentPanelTextLines, buildDiffActionHintLine, buildDisplayRows, buildEditorLaunchCommand, buildFooterLines, buildHelpPanelLines, buildSideBySideDisplayRows, diffTextMatchesSearch, formatFocusStatus, formatPaneTitle, formatSelectedLineTargetLabel, getCancelAction, getDraftCommentCount, getEditorLineForTarget, getHalfPageStep, getMatchingDiffLineTargets, getNavigatorMoveIndex, getNextSearchIndex, getPaneLayout, getRelatedFileMarker, getRelatedFilePanelSections, getRelatedFilePaths, getSideBySideColumnTarget, getSideBySideLineTargets, getSideBySidePairedLineTarget, getStackedPaneLayout, parseMouseWheelInput, renderCenteredOverlay, shouldStackPanes } from "../ui/review-app.js";
 
 function makeFile(path: string, flags?: Partial<ReviewFile>): ReviewFile {
   return {
@@ -388,5 +388,13 @@ describe("action and shortcut help rendering", () => {
     expect(lines.length).toBe(3);
     expect(lines.every((line) => line.startsWith("   "))).toBe(true);
     expect(lines.every((line) => visibleWidth(line) <= 22)).toBe(true);
+  });
+
+  it("shows line action keys in the diff pane hint", () => {
+    const hint = buildDiffActionHintLine(plainTheme as any, 120);
+
+    for (const token of ["Enter/m", "modify", "c", "comment", "d", "discuss", "l", "file", "a", "all"]) {
+      expect(hint).toContain(token);
+    }
   });
 });
