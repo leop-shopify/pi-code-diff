@@ -153,7 +153,7 @@ The three GitHub verdicts use an agent-mediated submission flow:
 1. You pick a verdict in the review UI.
 2. pi-code-diff sends the agent a structured submission handoff with the exact repo, PR number, commit, file paths, lines, sides, verdict, body, and inline comments.
 3. The agent must not inspect code or change review locations. It only fixes grammar, spelling, capitalization, and punctuation in the supplied review text.
-4. The agent asks you to approve/edit/skip each changed text item. Approving an item is the confirmation to submit that item; after the last item is resolved, the agent calls `submit_pr_review` without a second confirmation.
+4. The agent asks you to approve/edit/skip each changed text item, batching separate item questions when the current ask tool supports it. Approving an item is the confirmation to submit that item; after the last item is resolved, the agent calls `submit_pr_review` without a second confirmation.
 5. `COMMENT` line items are posted as GitHub inline comments. `MODIFY` line edits are posted as inline comments containing a suggested diff. `COMMENT` file items and review-wide `COMMENT` notes become the review body. `DISCUSS` items are never sent to GitHub.
 6. Approval refuses self-approval with a clear message, and `request changes` requires a body or at least one inline comment.
 

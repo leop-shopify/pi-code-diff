@@ -72,9 +72,9 @@ describe("code diff extension", () => {
     expect(prompt).toContain("Original: <original text>");
     expect(prompt).toContain("Fixed   : <fixed text>");
     expect(prompt).toContain("Choices: Approve, Edit, Skip");
-    expect(prompt).toContain("Resolve changed text items one at a time");
-    expect(prompt).toContain("Do not ask for all decisions in one combined prompt.");
-    expect(prompt).toContain("each queued question must still be one item only");
+    expect(prompt).toContain("Present each changed text item using this exact style");
+    expect(prompt).toContain("If the current ask tool can queue multiple questions, batch the changed text items in one ask call");
+    expect(prompt).toContain("one separate question per item");
     expect(prompt).toContain("The user's Approve choice is the confirmation to submit that item.");
     expect(prompt).toContain("Do not ask for a second/final submission confirmation.");
     expect(prompt).toContain("Call submit_pr_review once with the full arguments below");
