@@ -146,8 +146,13 @@ export function composeReviewSubmissionPrompt(target: RemoteReviewTarget, verdic
   ].join("\n");
 }
 
-function composeRemoteReviewPrompt(target: RemoteReviewTarget, reviewPrompt: string): string {
+export function composeRemoteReviewPrompt(target: RemoteReviewTarget, reviewPrompt: string): string {
   const lines: string[] = [];
+  const restoreCall = {
+    args: `remote ${target.remote}`,
+    cwd: target.gitRoot,
+  };
+
   if (target.pullRequest != null) {
     const context = formatPullRequestContext(target.pullRequest);
     lines.push("GitHub PR review feedback.");
@@ -158,6 +163,14 @@ function composeRemoteReviewPrompt(target: RemoteReviewTarget, reviewPrompt: str
   } else {
     lines.push(`Remote branch review feedback for ${target.branch}.`);
   }
+  lines.push("");
+  lines.push("Remote review agent-only flow:");
+  lines.push("- This handoff is for the agent only. Do not post comments, approve, request changes, or take any public GitHub action from this prompt.");
+  lines.push("- DISCUSS items are agent-only questions. Answer them in prose; do not edit files or post to GitHub to satisfy DISCUSS items unless the user explicitly asks for a separate change.");
+  lines.push("- When you are done, restore this same diff by calling open_code_diff with the original remote args and cwd:");
+  lines.push("```json");
+  lines.push(JSON.stringify(restoreCall, null, 2));
+  lines.push("```");
   lines.push("");
   lines.push("Rules for GitHub actions:");
   lines.push("- Do not post comments, approve, or request changes until the user explicitly confirms the exact public action.");
@@ -269,7 +282,7 @@ export default function codeDiffExtension(pi: ExtensionAPI) {
     return openReviewData(ctx, await getReviewWindowData(pi, cwd));
   }
 
-  async function runInteractiveReview(params: InteractiveReviewParams, ctx: ExtensionContext): Promise<ReviewRunStatus> {
+  async function runInteractiveReview(params: InteractiveReviewParams, ctx: ExtensionContext, fallbackCwd = ctx.cwd): Promise<ReviewRunStatus> {
     if (!ctx.hasUI) return { started: false, message: "Interactive review requires a TUI session." };
     if (params.resume != null) return unsupported("Resume support is being ported into pi-code-diff next.", ctx);
     if (params.tree != null || params.branch != null || params.project != null) return unsupported("Tree, branch, and project resolution are being ported into pi-code-diff next.", ctx);
@@ -278,7 +291,7 @@ export default function codeDiffExtension(pi: ExtensionAPI) {
     if (params.remote != null) {
       try {
         const reportProgress = (message: string) => setRemoteProgress(ctx, message);
-        const target = await resolveRemoteReviewTarget(pi, ctx.cwd, params.remote, params.cwd, reportProgress);
+        const target = await resolveRemoteReviewTarget(pi, fallbackCwd, params.remote, params.cwd, reportProgress);
         reportProgress(`Preparing diff for ${target.repo ?? target.branch}…`);
         const data = await getReviewWindowDataForRevisionRange(pi, target.gitRoot, target.baseRef, target.headRef);
         setRemoteProgress(ctx, undefined);
@@ -296,15 +309,17 @@ export default function codeDiffExtension(pi: ExtensionAPI) {
       if (range == null || !range.includes("..")) return unsupported("Custom review requires a ref range like base..head.", ctx);
       const [baseRef, headRef] = range.split(/\.\.\.?/, 2);
       if (baseRef == null || headRef == null || baseRef.length === 0 || headRef.length === 0) return unsupported("Custom review requires a ref range like base..head.", ctx);
-      return openReviewData(ctx, await getReviewWindowDataForRevisionRange(pi, params.cwd ?? ctx.cwd, baseRef, headRef));
+      return openReviewData(ctx, await getReviewWindowDataForRevisionRange(pi, params.cwd ?? fallbackCwd, baseRef, headRef));
     }
 
-    return openReview(ctx, params.cwd ?? ctx.cwd);
+    return openReview(ctx, params.cwd ?? fallbackCwd);
   }
 
-  async function runDiff(args: string, ctx: ExtensionContext): Promise<ReviewRunStatus> {
+  async function runDiff(args: string, ctx: ExtensionContext, cwd = ctx.cwd): Promise<ReviewRunStatus> {
+    if (!ctx.hasUI) return { started: false, message: "Interactive review requires a TUI session." };
+
     const trimmed = args.trim();
-    if (trimmed.length === 0) return openReview(ctx);
+    if (trimmed.length === 0) return openReview(ctx, cwd);
 
     const tokens = trimmed.split(/\s+/);
     const firstToken = tokens[0]!;
@@ -312,16 +327,29 @@ export default function codeDiffExtension(pi: ExtensionAPI) {
     if (firstToken.toLowerCase() === "remote") {
       const target = trimmed.slice(firstToken.length).trim();
       if (target.length === 0) return unsupported("Usage: /diff remote <url | branch>", ctx);
-      return runInteractiveReview({ remote: target }, ctx);
+      return runInteractiveReview({ remote: target }, ctx, cwd);
     }
 
     if (trimmed.startsWith("-") || MODE_VALUES.has(firstToken)) {
-      return runInteractiveReview(parseInteractiveReviewArgs(trimmed), ctx);
+      return runInteractiveReview(parseInteractiveReviewArgs(trimmed), ctx, cwd);
     }
     if (trimmed.includes("..")) {
-      return runInteractiveReview({ mode: "custom", ref: trimmed }, ctx);
+      return runInteractiveReview({ mode: "custom", ref: trimmed }, ctx, cwd);
     }
-    return runInteractiveReview({ remote: trimmed }, ctx);
+    return runInteractiveReview({ remote: trimmed }, ctx, cwd);
+  }
+
+  function formatOpenCodeDiffToolText(status: ReviewRunStatus, args: string, cwd: string): string {
+    const displayArgs = args.trim().length === 0 ? "(empty — local working-tree/uncommitted changes)" : args.trim();
+    const lines = [
+      status.started ? "Code diff review finished." : "Code diff review did not start.",
+      `Args: ${displayArgs}`,
+      `Cwd: ${cwd}`,
+    ];
+    if (status.message != null) lines.push(`Message: ${status.message}`);
+    if (status.context != null) lines.push("", "Context:", status.context);
+    if (status.prompt != null) lines.push("", "Prompt:", status.prompt);
+    return lines.join("\n");
   }
 
   function startDiff(args: string, ctx: ExtensionContext): ReviewRunStatus {
@@ -352,6 +380,59 @@ export default function codeDiffExtension(pi: ExtensionAPI) {
   pi.registerCommand("code", reviewCommand);
   pi.registerCommand("code-diff", reviewCommand);
   pi.registerCommand("diff", reviewCommand);
+
+  pi.registerTool({
+    name: "open_code_diff",
+    label: "open-code-diff",
+    description: "Open the pi-code-diff interactive review UI with the same target syntax as /diff. Empty args review local working-tree/uncommitted changes.",
+    promptSnippet: "Open the interactive code diff review UI. Use empty args for local working-tree/uncommitted changes; do not ask the user to commit first.",
+    promptGuidelines: [
+      "Call open_code_diff when the user asks to open /diff, review current changes, review a remote branch/PR, or restore/reopen a diff.",
+      "Pass args exactly as you would after /diff: empty for local working-tree/uncommitted changes, remote <url | branch> for remote reviews, or base..head/base...head for custom ranges.",
+      "Do not ask the user to commit before review; empty args reviews uncommitted working-tree changes, including untracked files.",
+      "Pass cwd when you know the checkout/repository directory. Otherwise the current Pi cwd is used.",
+      "Wait for the tool result. It returns message, prompt, and context details after the interactive UI finishes.",
+      "For agent-only remote DISCUSS follow-ups, answer in prose and then call open_code_diff again with the original remote args and cwd when the prompt asks you to restore the diff.",
+    ],
+    parameters: Type.Object({
+      args: Type.Optional(Type.String({ description: "Same target syntax as /diff, for example empty string, 'remote <url | branch>', or 'base..head'." })),
+      cwd: Type.Optional(Type.String({ description: "Directory to run the review from. Defaults to Pi's current cwd." })),
+    }),
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const input = params as { args?: string; cwd?: string };
+      const args = input.args ?? "";
+      const cwd = input.cwd ?? ctx.cwd;
+
+      if (reviewRunInFlight || activeReview) {
+        const message = "A review session is already open.";
+        if (ctx.hasUI) ctx.ui.notify(message, "warning");
+        const status: ReviewRunStatus = { started: false, message };
+        return {
+          content: [{ type: "text" as const, text: formatOpenCodeDiffToolText(status, args, cwd) }],
+          details: { ...status, args, cwd },
+        };
+      }
+
+      reviewRunInFlight = true;
+      try {
+        const status = await runDiff(args, ctx, cwd);
+        return {
+          content: [{ type: "text" as const, text: formatOpenCodeDiffToolText(status, args, cwd) }],
+          details: { ...status, args, cwd },
+        };
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (ctx.hasUI) ctx.ui.notify(`Could not start review: ${message}`, "error");
+        const status: ReviewRunStatus = { started: false, message };
+        return {
+          content: [{ type: "text" as const, text: formatOpenCodeDiffToolText(status, args, cwd) }],
+          details: { ...status, args, cwd },
+        };
+      } finally {
+        reviewRunInFlight = false;
+      }
+    },
+  });
 
   pi.registerTool({
     name: "submit_pr_review",

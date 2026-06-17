@@ -33,6 +33,116 @@ describe("remote review helpers", () => {
     })).toContain("reviewer (approved)");
   });
 
+  it("formats stacked pull request context", () => {
+    const baseOnly = formatPullRequestContext({
+      number: "123",
+      repo: "example/widgets",
+      title: "Child change",
+      body: "",
+      additions: 10,
+      deletions: 4,
+      changedFiles: 3,
+      authorLogin: "leo",
+      state: "OPEN",
+      reviews: [],
+      headRefName: "child/review",
+      headRefOid: "abc123",
+      baseRefName: "parent/review",
+    });
+    expect(baseOnly).toContain("Base branch: parent/review");
+
+    const withParent = formatPullRequestContext({
+      number: "123",
+      repo: "example/widgets",
+      title: "Child change",
+      body: "",
+      additions: 10,
+      deletions: 4,
+      changedFiles: 3,
+      authorLogin: "leo",
+      state: "OPEN",
+      reviews: [],
+      headRefName: "child/review",
+      headRefOid: "abc123",
+      baseRefName: "parent/review",
+      stackParent: {
+        number: "6",
+        title: "Parent change",
+        headRefName: "parent/review",
+        state: "MERGED",
+        url: "https://github.com/example/widgets/pull/6",
+      },
+    });
+    expect(withParent).toContain("Stack parent: PR #6 Parent change (parent/review, merged)");
+  });
+
+  it("resolves stacked GitHub PRs to the closest ancestor PR even when GitHub base is main", async () => {
+    const fetchCalls: string[][] = [];
+    const exec = vi.fn(async (command: string, args: string[]) => {
+      if (command === "gh" && args[0] === "pr" && args[1] === "view") {
+        return {
+          code: 0,
+          stdout: JSON.stringify({
+            title: "Child change",
+            body: "Body",
+            additions: 10,
+            deletions: 4,
+            changedFiles: 3,
+            author: { login: "leo" },
+            state: "OPEN",
+            reviews: [],
+            headRefName: "child/review",
+            headRefOid: "abc123",
+            baseRefName: "main",
+          }),
+          stderr: "",
+          killed: false,
+        };
+      }
+      if (command === "gh" && args[0] === "pr" && args[1] === "list") {
+        return {
+          code: 0,
+          stdout: JSON.stringify([
+            { number: 6, title: "Parent change", headRefName: "parent/review", state: "MERGED", url: "https://github.com/example/widgets/pull/6" },
+            { number: 5, title: "Unrelated change", headRefName: "unrelated/review", state: "OPEN", url: "https://github.com/example/widgets/pull/5" },
+          ]),
+          stderr: "",
+          killed: false,
+        };
+      }
+
+      if (command === "git" && args.join(" ") === "merge-base origin/main origin/child/review") return { code: 0, stdout: "main-base\n", stderr: "", killed: false };
+      if (command === "git" && args.join(" ") === "merge-base origin/parent/review origin/child/review") return { code: 0, stdout: "parent-base\n", stderr: "", killed: false };
+      if (command === "git" && args.join(" ") === "merge-base --is-ancestor origin/parent/review origin/child/review") return { code: 0, stdout: "", stderr: "", killed: false };
+      if (command === "git" && args.join(" ") === "merge-base --is-ancestor origin/unrelated/review origin/child/review") return { code: 1, stdout: "", stderr: "not ancestor", killed: false };
+      if (command === "git" && args.join(" ") === "rev-list --count main-base..origin/child/review") return { code: 0, stdout: "7\n", stderr: "", killed: false };
+      if (command === "git" && args.join(" ") === "rev-list --count origin/parent/review..origin/child/review") return { code: 0, stdout: "1\n", stderr: "", killed: false };
+      if (command === "git" && args[1] === "fetch") {
+        fetchCalls.push(args);
+        return { code: 0, stdout: "", stderr: "", killed: false };
+      }
+      return { code: 1, stdout: "", stderr: `unexpected ${command} ${args.join(" ")}`, killed: false };
+    });
+
+    const target = await resolveRemoteReviewTarget({ exec } as never, "/repo", "https://github.com/example/widgets/pull/123", "/repo");
+
+    expect(target).toMatchObject({
+      gitRoot: "/repo",
+      baseRef: "parent-base",
+      headRef: "origin/child/review",
+      branch: "child/review",
+      pullRequest: {
+        number: "123",
+        baseRefName: "main",
+        stackParent: { number: "6", title: "Parent change", headRefName: "parent/review", state: "MERGED" },
+      },
+    });
+    expect(fetchCalls[0]).toContain("+refs/heads/main:refs/remotes/origin/main");
+    expect(fetchCalls[0]).toContain("+refs/heads/child/review:refs/remotes/origin/child/review");
+    expect(fetchCalls[1]).toContain("+refs/heads/parent/review:refs/remotes/origin/parent/review");
+    expect(formatPullRequestContext(target.pullRequest!)).toContain("Stack parent: PR #6 Parent change (parent/review, merged)");
+  });
+
   it("resolves same-repo GitHub PRs to fetched base and head refs", async () => {
     const fetchCalls: string[][] = [];
     const exec = vi.fn(async (command: string, args: string[]) => {
