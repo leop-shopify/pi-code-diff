@@ -74,6 +74,8 @@ You can also use the explicit package commands:
 /code-diff
 ```
 
+Agents can open the same UI with the `open_code_diff` tool. It accepts an `args` string using the same syntax as `/diff`, plus optional `cwd`. Empty `args` reviews local working-tree/uncommitted changes, including untracked files, so you do not need to commit before review.
+
 Or use the global shortcut, which defaults to:
 
 ```text
@@ -86,7 +88,7 @@ Configure the shortcut with `globalShortcut` in `~/.pi/agent/extensions/code-dif
 
 `/diff` (and `/code`, `/code-diff`) is the single entry point for every kind of review.
 
-- `/diff` with no arguments reviews local changes.
+- `/diff` with no arguments reviews local working-tree/uncommitted changes, including untracked files.
 - `/diff remote <url | branch>` reviews a remote branch or GitHub PR. It accepts a remote branch, a GitHub or stack-host PR URL, or `owner/repo#123`.
 - `/diff <base>..<head>` (or `base...head`) reviews that custom range.
 
@@ -119,11 +121,11 @@ Local changes open the in-UI scope switcher described below.
 
 ### Remote reviews
 
-There is no separate `/interactive-review` command and no agent review tool; everything is `/diff`:
+Use `/diff` directly, or have an agent call `open_code_diff` with the same target syntax:
 
-- `/diff remote <branch | url>` accepts a plain remote branch, a GitHub PR URL, a stack-host PR URL, or `owner/repo#number`
-- `/diff` with no args reviews local working-tree changes against the configured or detected checkout
-- `/diff base..head` reviews a `base..head` or `base...head` custom range
+- `/diff remote <branch | url>` or `open_code_diff({ args: "remote <branch | url>" })` accepts a plain remote branch, a GitHub PR URL, a stack-host PR URL, or `owner/repo#number`
+- `/diff` with no args or `open_code_diff({ args: "" })` reviews local working-tree/uncommitted changes, including untracked files, against the configured or detected checkout
+- `/diff base..head` or `open_code_diff({ args: "base..head" })` reviews a `base..head` or `base...head` custom range
 
 Remote branch and GitHub PR reviews fetch with `--no-tags` and a 15 second timeout, then review the fetched base/head range in the `/diff` UI. PR URLs and `owner/repo#number` do not require a checkout; if no matching local checkout is configured or detected, pi-code-diff uses a lightweight git cache under `~/.pi/agent/cache/pi-code-diff/remotes/`.
 

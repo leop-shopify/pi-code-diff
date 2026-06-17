@@ -12,6 +12,14 @@ export interface RemoteParseResult {
   prNumber?: string;
 }
 
+export interface StackParentMetadata {
+  number: string;
+  title: string;
+  headRefName: string;
+  state: string;
+  url?: string;
+}
+
 export interface PullRequestMetadata {
   number: string;
   repo?: string;
@@ -26,6 +34,7 @@ export interface PullRequestMetadata {
   headRefName: string;
   headRefOid: string;
   baseRefName: string;
+  stackParent?: StackParentMetadata;
 }
 
 export interface RemoteReviewTarget {
@@ -173,6 +182,121 @@ function ghArgs(args: string[], repo: string | undefined): string[] {
   return repo == null ? args : [...args, "--repo", repo];
 }
 
+function isDefaultBaseBranch(branch: string): boolean {
+  return branch === "main" || branch === "master";
+}
+
+function toStackParentMetadata(input: { number?: number | string; title?: string; headRefName?: string; state?: string; url?: string }, fallbackHeadRefName: string): StackParentMetadata | undefined {
+  if (input.number == null) return undefined;
+  return {
+    number: String(input.number),
+    title: input.title ?? `(PR #${input.number})`,
+    headRefName: input.headRefName ?? fallbackHeadRefName,
+    state: input.state ?? "UNKNOWN",
+    url: input.url,
+  };
+}
+
+async function getStackParentMetadataForHead(pi: ExtensionAPI, gitRoot: string, headRefName: string, repo?: string, onProgress?: RemoteProgress): Promise<StackParentMetadata | undefined> {
+  if (isDefaultBaseBranch(headRefName)) return undefined;
+
+  onProgress?.(`Checking stack parent PR for ${headRefName}…`);
+  const result = await pi.exec("provider-cli", ghArgs(["pr", "list", "--state", "all", "--head", headRefName, "--json", "number,title,headRefName,state,url", "--limit", "1"], repo), { cwd: gitRoot, timeout: 15000 });
+  if (result.code !== 0 || result.stdout.trim().length === 0) return undefined;
+
+  try {
+    const [parent] = JSON.parse(result.stdout.trim()) as Array<{
+      number?: number | string;
+      title?: string;
+      headRefName?: string;
+      state?: string;
+      url?: string;
+    }>;
+    return parent == null ? undefined : toStackParentMetadata(parent, headRefName);
+  } catch {
+    return undefined;
+  }
+}
+
+async function listStackParentCandidates(pi: ExtensionAPI, gitRoot: string, metadata: PullRequestMetadata, repo?: string, onProgress?: RemoteProgress): Promise<StackParentMetadata[]> {
+  onProgress?.("Checking stack parent PR candidates…");
+  const result = await pi.exec("provider-cli", ghArgs(["pr", "list", "--state", "all", "--json", "number,title,headRefName,state,url", "--limit", "100"], repo), { cwd: gitRoot, timeout: 15000 });
+  if (result.code !== 0 || result.stdout.trim().length === 0) return [];
+
+  try {
+    const parsed = JSON.parse(result.stdout.trim()) as Array<{
+      number?: number | string;
+      title?: string;
+      headRefName?: string;
+      state?: string;
+      url?: string;
+    }>;
+    return parsed
+      .map((candidate) => toStackParentMetadata(candidate, candidate.headRefName ?? ""))
+      .filter((candidate): candidate is StackParentMetadata => candidate != null)
+      .filter((candidate) => candidate.number !== metadata.number)
+      .filter((candidate) => candidate.headRefName.length > 0)
+      .filter((candidate) => candidate.headRefName !== metadata.headRefName)
+      .filter((candidate) => candidate.headRefName !== metadata.baseRefName)
+      .filter((candidate) => !isDefaultBaseBranch(candidate.headRefName));
+  } catch {
+    return [];
+  }
+}
+
+async function getRefDistance(pi: ExtensionAPI, gitRoot: string, baseRef: string, headRef: string): Promise<number | undefined> {
+  const result = await pi.exec("git", ["rev-list", "--count", `${baseRef}..${headRef}`], { cwd: gitRoot, timeout: 10000 });
+  if (result.code !== 0) return undefined;
+  const distance = Number.parseInt(result.stdout.trim(), 10);
+  return Number.isFinite(distance) ? distance : undefined;
+}
+
+async function isAncestorRef(pi: ExtensionAPI, gitRoot: string, candidateRef: string, headRef: string): Promise<boolean> {
+  const result = await pi.exec("git", ["merge-base", "--is-ancestor", candidateRef, headRef], { cwd: gitRoot, timeout: 10000 });
+  return result.code === 0;
+}
+
+async function fetchStackParentCandidateRef(pi: ExtensionAPI, gitRoot: string, candidate: StackParentMetadata, remote = "origin", repo?: string): Promise<string | undefined> {
+  try {
+    await fetchRemoteRefs(pi, gitRoot, [`+${sourceBranchRef(candidate.headRefName)}:${originRef(candidate.headRefName)}`], remote);
+    return originShortRef(candidate.headRefName);
+  } catch {
+    const prHeadBranch = `stack-parent/${candidate.number}/head`;
+    const pullRemote = repo == null || remote !== "origin" ? remote : `https://github.com/${repo}.git`;
+    try {
+      await fetchRemoteRefs(pi, gitRoot, [`+refs/pull/${candidate.number}/head:${originRef(prHeadBranch)}`], pullRemote);
+      return originShortRef(prHeadBranch);
+    } catch {
+      return undefined;
+    }
+  }
+}
+
+async function findClosestStackParent(pi: ExtensionAPI, gitRoot: string, metadata: PullRequestMetadata, currentBaseRef: string, headRef: string, remote = "origin", repo?: string, onProgress?: RemoteProgress): Promise<{ baseRef: string; stackParent: StackParentMetadata } | undefined> {
+  const candidates = await listStackParentCandidates(pi, gitRoot, metadata, repo, onProgress);
+  if (candidates.length === 0) return undefined;
+
+  const currentBaseDistance = await getRefDistance(pi, gitRoot, currentBaseRef, headRef);
+  if (currentBaseDistance == null) return undefined;
+
+  let best: { candidate: StackParentMetadata; ref: string; distance: number } | undefined;
+
+  for (const candidate of candidates) {
+    const candidateRef = await fetchStackParentCandidateRef(pi, gitRoot, candidate, remote, repo);
+    if (candidateRef == null) continue;
+    if (!await isAncestorRef(pi, gitRoot, candidateRef, headRef)) continue;
+
+    const distance = await getRefDistance(pi, gitRoot, candidateRef, headRef);
+    if (distance == null || distance <= 0) continue;
+    if (distance >= currentBaseDistance) continue;
+    if (best == null || distance < best.distance || (distance === best.distance && candidate.headRefName.localeCompare(best.candidate.headRefName) < 0)) {
+      best = { candidate, ref: candidateRef, distance };
+    }
+  }
+
+  return best == null ? undefined : { baseRef: await getMergeBase(pi, gitRoot, best.ref, headRef), stackParent: best.candidate };
+}
+
 export async function getPullRequestMetadata(pi: ExtensionAPI, gitRoot: string, prNumber: string, repo?: string, onProgress?: RemoteProgress): Promise<PullRequestMetadata> {
   onProgress?.(`Fetching PR #${prNumber} metadata${repo == null ? "" : ` from ${repo}`}…`);
   const result = await pi.exec("provider-cli", ghArgs(["pr", "view", prNumber, "--json", "title,body,additions,deletions,changedFiles,author,reviews,state,headRefName,headRefOid,baseRefName"], repo), { cwd: gitRoot, timeout: 15000 });
@@ -196,6 +320,9 @@ export async function getPullRequestMetadata(pi: ExtensionAPI, gitRoot: string, 
 
   if (parsed.headRefName == null || parsed.headRefOid == null) throw new Error(`PR #${prNumber} metadata is missing head ref information.`);
 
+  const baseRefName = parsed.baseRefName ?? "main";
+  const stackParent = await getStackParentMetadataForHead(pi, gitRoot, baseRefName, repo, onProgress);
+
   return {
     number: prNumber,
     repo,
@@ -209,7 +336,8 @@ export async function getPullRequestMetadata(pi: ExtensionAPI, gitRoot: string, 
     reviews: parsed.reviews ?? [],
     headRefName: parsed.headRefName,
     headRefOid: parsed.headRefOid,
-    baseRefName: parsed.baseRefName ?? "main",
+    baseRefName,
+    stackParent,
   };
 }
 
@@ -269,6 +397,11 @@ export async function resolveRemoteReviewTarget(pi: ExtensionAPI, fallbackCwd: s
   if (parsed.prNumber != null) {
     const pullRequest = await getPullRequestMetadata(pi, gitRoot, parsed.prNumber, parsed.repo, onProgress);
     const refs = await fetchPullRequestRefs(pi, gitRoot, pullRequest, fetchRemote, onProgress);
+    const closestStackParent = await findClosestStackParent(pi, gitRoot, pullRequest, refs.baseRef, refs.headRef, fetchRemote, parsed.repo, onProgress);
+    if (closestStackParent != null) {
+      refs.baseRef = closestStackParent.baseRef;
+      pullRequest.stackParent = closestStackParent.stackParent;
+    }
     return {
       gitRoot,
       baseRef: refs.baseRef,
@@ -298,10 +431,14 @@ export function formatPullRequestContext(metadata: PullRequestMetadata): string 
     .map(([login, state]) => `${login} (${state.toLowerCase().replace(/_/g, " ")})`)
     .join(", ") || "none yet";
   const repoLabel = metadata.repo == null ? "" : ` (${metadata.repo})`;
+  const baseContext = metadata.stackParent != null
+    ? `Stack parent: PR #${metadata.stackParent.number} ${metadata.stackParent.title} (${metadata.stackParent.headRefName}, ${metadata.stackParent.state.toLowerCase()})`
+    : isDefaultBaseBranch(metadata.baseRefName) ? undefined : `Base branch: ${metadata.baseRefName}`;
   return [
     `PR #${metadata.number}${repoLabel}: ${metadata.title}`,
     `Author: ${metadata.authorLogin} | State: ${metadata.state.toLowerCase()}`,
     `${metadata.changedFiles} file(s) changed, +${metadata.additions} -${metadata.deletions}`,
+    ...(baseContext == null ? [] : [baseContext]),
     `Reviews: ${reviews}`,
   ].join("\n");
 }
