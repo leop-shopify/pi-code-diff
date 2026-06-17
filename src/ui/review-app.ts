@@ -32,6 +32,7 @@ import {
   upsertLineComment,
 } from "../state.js";
 import { detectPiLanguage, highlightCodeLineWithPi } from "../pi-render.js";
+import { applyResolvedSeedComments, type ResolvedSeedComment } from "../seed-comments.js";
 import { getShortcutConfigPath, getShortcutsForSide, type CommentShortcut } from "../shortcuts.js";
 import { filterFilesBySearch } from "../search.js";
 import { sanitizeTerminalText } from "../sanitize.js";
@@ -72,6 +73,7 @@ interface ReviewAppOptions {
   commentShortcuts: CommentShortcut[];
   allowEmptySubmit?: boolean;
   visibleScopes?: ReviewScope[];
+  seedComments?: ResolvedSeedComment[];
   notify: ExtensionContext["ui"]["notify"];
 }
 
@@ -987,6 +989,9 @@ class ReviewApp {
     this.state = ensureActiveFile(createInitialReviewState(options.files), options.files);
     if (!this.visibleScopes().includes(this.state.activeScope)) {
       this.state = setScope(this.state, options.files, this.visibleScopes()[0]!);
+    }
+    if (options.seedComments != null && options.seedComments.length > 0) {
+      this.state = applyResolvedSeedComments(this.state, options.seedComments);
     }
     this.searchBuffer = this.state.searchQuery;
 

@@ -183,6 +183,143 @@ describe("code diff extension", () => {
     expect(result.content[0].text).toContain("generated review prompt");
   });
 
+  it("open_code_diff seeds prepopulated comments and warns about unresolved ones", async () => {
+    const tools = new Map<string, any>();
+    const files = [{
+      id: "src/app.ts::working::::",
+      path: "src/app.ts",
+      worktreeStatus: "modified",
+      hasWorkingTreeFile: true,
+      inGitDiff: true,
+      inLastCommit: false,
+      inAllFiles: false,
+      gitDiff: { status: "modified", oldPath: "src/app.ts", newPath: "src/app.ts", displayPath: "src/app.ts", hasOriginal: true, hasModified: true },
+      lastCommit: null,
+      allFiles: null,
+    }];
+    mocks.getReviewWindowData.mockResolvedValue({ repoRoot: "/repo", files, branchBaseRevision: null, modifiedRevision: undefined, visibleScopes: ["git-diff"] });
+    mocks.runReviewApp.mockResolvedValue({ type: "submit", allComment: "", allIntent: "discuss", comments: [] });
+    mocks.composeReviewPrompt.mockReturnValue("generated review prompt");
+    const pi = {
+      registerCommand: vi.fn(),
+      registerTool: vi.fn((tool) => tools.set(tool.name, tool)),
+      registerShortcut: vi.fn(),
+      on: vi.fn(),
+    };
+    const ctx = {
+      hasUI: true,
+      cwd: "/repo",
+      ui: {
+        notify: vi.fn(),
+        setWidget: vi.fn(),
+        setEditorText: vi.fn(),
+      },
+    };
+
+    codeDiffExtension(pi as never);
+    await tools.get("open_code_diff").execute("tool-call", {
+      args: "",
+      comments: [
+        { path: "src/app.ts", body: "Handle the nil case.", line: 3, intent: "comment" },
+        { path: "src/missing.ts", body: "Nope", line: 1 },
+      ],
+    }, new AbortController().signal, vi.fn(), ctx);
+
+    expect(mocks.runReviewApp).toHaveBeenCalledWith(ctx, expect.objectContaining({
+      seedComments: [
+        { fileId: "src/app.ts::working::::", scope: "git-diff", side: "added", intent: "comment", startLine: 3, endLine: 3, body: "Handle the nil case." },
+      ],
+    }));
+    expect(ctx.ui.notify).toHaveBeenCalledWith("code-diff: could not place 1 prepopulated comment (src/missing.ts).", "warning");
+  });
+
+  it("open_code_diff seeds prepopulated comments into the all-files scope for a custom range", async () => {
+    const tools = new Map<string, any>();
+    const files = [{
+      id: "src/app.ts::all::base::head",
+      path: "src/app.ts",
+      worktreeStatus: "modified",
+      hasWorkingTreeFile: true,
+      inGitDiff: false,
+      inLastCommit: false,
+      inAllFiles: true,
+      gitDiff: null,
+      lastCommit: null,
+      allFiles: { status: "modified", oldPath: "src/app.ts", newPath: "src/app.ts", displayPath: "src/app.ts", hasOriginal: true, hasModified: true },
+    }];
+    mocks.getReviewWindowDataForRevisionRange.mockResolvedValue({ repoRoot: "/repo", files, branchBaseRevision: "base", modifiedRevision: "head", visibleScopes: ["all-files"] });
+    mocks.runReviewApp.mockResolvedValue({ type: "submit", allComment: "", allIntent: "discuss", comments: [] });
+    mocks.composeReviewPrompt.mockReturnValue("generated review prompt");
+    const pi = {
+      registerCommand: vi.fn(),
+      registerTool: vi.fn((tool) => tools.set(tool.name, tool)),
+      registerShortcut: vi.fn(),
+      on: vi.fn(),
+    };
+    const ctx = {
+      hasUI: true,
+      cwd: "/repo",
+      ui: {
+        notify: vi.fn(),
+        setWidget: vi.fn(),
+        setEditorText: vi.fn(),
+      },
+    };
+
+    codeDiffExtension(pi as never);
+    await tools.get("open_code_diff").execute("tool-call", {
+      args: "base..head",
+      comments: [{ path: "src/app.ts", body: "Range note.", line: 5 }],
+    }, new AbortController().signal, vi.fn(), ctx);
+
+    expect(mocks.getReviewWindowDataForRevisionRange).toHaveBeenCalledWith(pi, "/repo", "base", "head");
+    expect(mocks.runReviewApp).toHaveBeenCalledWith(ctx, expect.objectContaining({
+      seedComments: [
+        { fileId: "src/app.ts::all::base::head", scope: "all-files", side: "added", intent: "comment", startLine: 5, endLine: 5, body: "Range note." },
+      ],
+    }));
+  });
+
+  it("does not seed comments when the diff command is invoked", async () => {
+    const commands = new Map<string, { handler: (args: string, ctx: any) => Promise<void> }>();
+    const files = [{
+      id: "src/app.ts::working::::",
+      path: "src/app.ts",
+      worktreeStatus: "modified",
+      hasWorkingTreeFile: true,
+      inGitDiff: true,
+      inLastCommit: false,
+      inAllFiles: false,
+      gitDiff: { status: "modified", oldPath: "src/app.ts", newPath: "src/app.ts", displayPath: "src/app.ts", hasOriginal: true, hasModified: true },
+      lastCommit: null,
+      allFiles: null,
+    }];
+    mocks.getReviewWindowData.mockResolvedValue({ repoRoot: "/repo", files, branchBaseRevision: null, modifiedRevision: undefined, visibleScopes: ["git-diff"] });
+    mocks.runReviewApp.mockResolvedValue({ type: "submit", allComment: "", allIntent: "discuss", comments: [] });
+    mocks.composeReviewPrompt.mockReturnValue("generated review prompt");
+    const pi = {
+      registerCommand: vi.fn((name: string, command) => commands.set(name, command)),
+      registerTool: vi.fn(),
+      registerShortcut: vi.fn(),
+      on: vi.fn(),
+    };
+    const ctx = {
+      hasUI: true,
+      cwd: "/repo",
+      ui: {
+        notify: vi.fn(),
+        setWidget: vi.fn(),
+        setEditorText: vi.fn(),
+      },
+    };
+
+    codeDiffExtension(pi as never);
+    await commands.get("diff")!.handler("", ctx);
+    await vi.waitFor(() => expect(mocks.runReviewApp).toHaveBeenCalled());
+
+    expect(mocks.runReviewApp).toHaveBeenCalledWith(ctx, expect.objectContaining({ seedComments: [] }));
+  });
+
   it("does not block the diff command while review data loads", async () => {
     const commands = new Map<string, { handler: (args: string, ctx: any) => Promise<void> }>();
     let resolveData: (data: unknown) => void = () => {};
