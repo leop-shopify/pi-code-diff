@@ -107,7 +107,7 @@ describe("code diff extension", () => {
     expect(pi.registerTool).toHaveBeenCalledWith(expect.objectContaining({ name: "submit_pr_review" }));
   });
 
-  it("documents the agent-only remote DISCUSS restore flow", () => {
+  it("keeps the remote DISCUSS handoff prose-only and never tells the agent to reopen the diff", () => {
     const prompt = composeRemoteReviewPrompt({
       gitRoot: "/repo",
       baseRef: "origin/main",
@@ -134,9 +134,25 @@ describe("code diff extension", () => {
 
     expect(prompt).toContain("This handoff is for the agent only.");
     expect(prompt).toContain("DISCUSS items are agent-only questions. Answer them in prose");
-    expect(prompt).toContain("restore this same diff by calling open_code_diff");
-    expect(prompt).toContain('"args": "remote https://github.com/example/widgets/pull/1"');
-    expect(prompt).toContain('"cwd": "/repo"');
+    expect(prompt).not.toMatch(/open_code_diff/);
+    expect(prompt).not.toMatch(/restore|reopen/i);
+  });
+
+  it("only instructs opening open_code_diff on a direct user request", () => {
+    const tools = new Map<string, any>();
+    const pi = {
+      registerCommand: vi.fn(),
+      registerTool: vi.fn((tool) => tools.set(tool.name, tool)),
+      registerShortcut: vi.fn(),
+      on: vi.fn(),
+    };
+
+    codeDiffExtension(pi as never);
+    const guidelines: string[] = tools.get("open_code_diff").promptGuidelines;
+
+    expect(guidelines.some((line) => /only when the user directly asks/i.test(line))).toBe(true);
+    expect(guidelines.some((line) => /do not call .*open_code_diff.*(?:on your own|automatically|because a prompt)/i.test(line))).toBe(true);
+    expect(guidelines.join("\n")).not.toMatch(/restore\/reopen|restore the diff/i);
   });
 
   it("open_code_diff waits for local review completion and returns prompt details", async () => {
