@@ -5,6 +5,7 @@ import { getReviewWindowData, getReviewWindowDataForRevisionRange, loadReviewFil
 import { composeReviewPrompt } from "./prompt.js";
 import { formatPullRequestContext, resolveRemoteReviewTarget, type RemoteReviewTarget } from "./remote.js";
 import { buildInlineComments, buildReviewBody, submitPullRequestReview, type ReviewInlineComment, type ReviewVerdict } from "./review-submit.js";
+import { resolveSeedComments, type SeedReviewComment } from "./seed-comments.js";
 import { loadCommentShortcuts } from "./shortcuts.js";
 import { runReviewApp } from "./ui/review-app.js";
 import type { ReviewSubmitPayload } from "./types.js";
@@ -191,7 +192,7 @@ export default function codeDiffExtension(pi: ExtensionAPI) {
     ctx.ui.notify(`code-diff config: ${warnings.join(" ")}`, "warning");
   }
 
-  async function openReviewData(ctx: ExtensionContext, data: ReviewWindowData, remoteTarget?: RemoteReviewTarget): Promise<ReviewRunStatus> {
+  async function openReviewData(ctx: ExtensionContext, data: ReviewWindowData, remoteTarget?: RemoteReviewTarget, seedComments?: SeedReviewComment[]): Promise<ReviewRunStatus> {
     if (activeReview) {
       const message = "A review session is already open.";
       ctx.ui.notify(message, "warning");
@@ -214,6 +215,13 @@ export default function codeDiffExtension(pi: ExtensionAPI) {
         ctx.ui.notify(formatPullRequestContext(remoteTarget.pullRequest), "info");
       }
 
+      const seed = resolveSeedComments(files, visibleScopes, seedComments ?? []);
+      if (seed.unresolved.length > 0 && ctx.hasUI) {
+        const label = seed.unresolved.length === 1 ? "comment" : "comments";
+        const paths = seed.unresolved.map((comment) => comment.path).join(", ");
+        ctx.ui.notify(`code-diff: could not place ${seed.unresolved.length} prepopulated ${label} (${paths}).`, "warning");
+      }
+
       const result = await runReviewApp(ctx, {
         files,
         repoRoot,
@@ -221,6 +229,7 @@ export default function codeDiffExtension(pi: ExtensionAPI) {
         commentShortcuts: shortcutConfig.shortcuts,
         allowEmptySubmit: remoteTarget?.pullRequest != null,
         visibleScopes,
+        seedComments: seed.resolved,
       });
 
       if (result.type === "cancel") {
@@ -278,11 +287,11 @@ export default function codeDiffExtension(pi: ExtensionAPI) {
     return { started: true, prompt, context: formatPullRequestContext(pr) };
   }
 
-  async function openReview(ctx: ExtensionContext, cwd = ctx.cwd): Promise<ReviewRunStatus> {
-    return openReviewData(ctx, await getReviewWindowData(pi, cwd));
+  async function openReview(ctx: ExtensionContext, cwd = ctx.cwd, comments?: SeedReviewComment[]): Promise<ReviewRunStatus> {
+    return openReviewData(ctx, await getReviewWindowData(pi, cwd), undefined, comments);
   }
 
-  async function runInteractiveReview(params: InteractiveReviewParams, ctx: ExtensionContext, fallbackCwd = ctx.cwd): Promise<ReviewRunStatus> {
+  async function runInteractiveReview(params: InteractiveReviewParams, ctx: ExtensionContext, fallbackCwd = ctx.cwd, comments?: SeedReviewComment[]): Promise<ReviewRunStatus> {
     if (!ctx.hasUI) return { started: false, message: "Interactive review requires a TUI session." };
     if (params.resume != null) return unsupported("Resume support is being ported into pi-code-diff next.", ctx);
     if (params.tree != null || params.branch != null || params.project != null) return unsupported("Tree, branch, and project resolution are being ported into pi-code-diff next.", ctx);
@@ -295,7 +304,7 @@ export default function codeDiffExtension(pi: ExtensionAPI) {
         reportProgress(`Preparing diff for ${target.repo ?? target.branch}…`);
         const data = await getReviewWindowDataForRevisionRange(pi, target.gitRoot, target.baseRef, target.headRef);
         setRemoteProgress(ctx, undefined);
-        return openReviewData(ctx, data, target);
+        return openReviewData(ctx, data, target, comments);
       } catch (error) {
         setRemoteProgress(ctx, undefined);
         const message = error instanceof Error ? error.message : String(error);
@@ -309,17 +318,17 @@ export default function codeDiffExtension(pi: ExtensionAPI) {
       if (range == null || !range.includes("..")) return unsupported("Custom review requires a ref range like base..head.", ctx);
       const [baseRef, headRef] = range.split(/\.\.\.?/, 2);
       if (baseRef == null || headRef == null || baseRef.length === 0 || headRef.length === 0) return unsupported("Custom review requires a ref range like base..head.", ctx);
-      return openReviewData(ctx, await getReviewWindowDataForRevisionRange(pi, params.cwd ?? fallbackCwd, baseRef, headRef));
+      return openReviewData(ctx, await getReviewWindowDataForRevisionRange(pi, params.cwd ?? fallbackCwd, baseRef, headRef), undefined, comments);
     }
 
-    return openReview(ctx, params.cwd ?? fallbackCwd);
+    return openReview(ctx, params.cwd ?? fallbackCwd, comments);
   }
 
-  async function runDiff(args: string, ctx: ExtensionContext, cwd = ctx.cwd): Promise<ReviewRunStatus> {
+  async function runDiff(args: string, ctx: ExtensionContext, cwd = ctx.cwd, comments?: SeedReviewComment[]): Promise<ReviewRunStatus> {
     if (!ctx.hasUI) return { started: false, message: "Interactive review requires a TUI session." };
 
     const trimmed = args.trim();
-    if (trimmed.length === 0) return openReview(ctx, cwd);
+    if (trimmed.length === 0) return openReview(ctx, cwd, comments);
 
     const tokens = trimmed.split(/\s+/);
     const firstToken = tokens[0]!;
@@ -327,16 +336,16 @@ export default function codeDiffExtension(pi: ExtensionAPI) {
     if (firstToken.toLowerCase() === "remote") {
       const target = trimmed.slice(firstToken.length).trim();
       if (target.length === 0) return unsupported("Usage: /diff remote <url | branch>", ctx);
-      return runInteractiveReview({ remote: target }, ctx, cwd);
+      return runInteractiveReview({ remote: target }, ctx, cwd, comments);
     }
 
     if (trimmed.startsWith("-") || MODE_VALUES.has(firstToken)) {
-      return runInteractiveReview(parseInteractiveReviewArgs(trimmed), ctx, cwd);
+      return runInteractiveReview(parseInteractiveReviewArgs(trimmed), ctx, cwd, comments);
     }
     if (trimmed.includes("..")) {
-      return runInteractiveReview({ mode: "custom", ref: trimmed }, ctx, cwd);
+      return runInteractiveReview({ mode: "custom", ref: trimmed }, ctx, cwd, comments);
     }
-    return runInteractiveReview({ remote: trimmed }, ctx, cwd);
+    return runInteractiveReview({ remote: trimmed }, ctx, cwd, comments);
   }
 
   function formatOpenCodeDiffToolText(status: ReviewRunStatus, args: string, cwd: string): string {
@@ -391,15 +400,26 @@ export default function codeDiffExtension(pi: ExtensionAPI) {
       "Pass args exactly as you would after /diff: empty for local working-tree/uncommitted changes, remote <url | branch> for remote reviews, or base..head/base...head for custom ranges.",
       "Do not ask the user to commit before review; empty args reviews uncommitted working-tree changes, including untracked files.",
       "Pass cwd when you know the checkout/repository directory. Otherwise the current Pi cwd is used.",
+      "Pass comments to prepopulate concrete review notes into the UI. Each needs a path matching a reviewed file and a body; set side (added/deleted/file), line or startLine/endLine, and intent (discuss/comment/modify) to place it precisely. Seeded comments are editable and deletable by the user and flow through the same review prompt as hand-written ones.",
+      "Use seeded comments only when you have specific, actionable feedback to attach; the user opens the UI and decides what to keep. Comments whose path does not match a reviewed file are reported back, not silently applied.",
       "Wait for the tool result. It returns message, prompt, and context details after the interactive UI finishes.",
       "For agent-only remote DISCUSS follow-ups, answer in prose and then call open_code_diff again with the original remote args and cwd when the prompt asks you to restore the diff.",
     ],
     parameters: Type.Object({
       args: Type.Optional(Type.String({ description: "Same target syntax as /diff, for example empty string, 'remote <url | branch>', or 'base..head'." })),
       cwd: Type.Optional(Type.String({ description: "Directory to run the review from. Defaults to Pi's current cwd." })),
+      comments: Type.Optional(Type.Array(Type.Object({
+        path: Type.String({ description: "File path as shown in the diff (repo-relative displayPath). Required to attach the comment." }),
+        body: Type.String({ description: "Comment text the reviewer sees. Becomes an editable draft comment." }),
+        side: Type.Optional(Type.Union([Type.Literal("added"), Type.Literal("deleted"), Type.Literal("file")], { description: "added = new/right-side line (default), deleted = old/left-side line, file = whole-file comment." })),
+        line: Type.Optional(Type.Number({ description: "Target line number on the chosen side. New-version line for added, old-version line for deleted." })),
+        startLine: Type.Optional(Type.Number({ description: "Start line of a range. Overrides line when set." })),
+        endLine: Type.Optional(Type.Number({ description: "End line of a range. Defaults to the start line." })),
+        intent: Type.Optional(Type.Union([Type.Literal("discuss"), Type.Literal("comment"), Type.Literal("modify")], { description: "discuss = prose only, comment = actionable feedback (default), modify = apply the proposed change." })),
+      }), { description: "Optional review comments to prepopulate into the diff UI. Each becomes an editable, deletable draft comment attached to the matching file/line and flows through the same review prompt as hand-written comments. Comments whose path does not match a reviewed file are surfaced as a warning, never silently dropped." })),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      const input = params as { args?: string; cwd?: string };
+      const input = params as { args?: string; cwd?: string; comments?: SeedReviewComment[] };
       const args = input.args ?? "";
       const cwd = input.cwd ?? ctx.cwd;
 
@@ -415,7 +435,7 @@ export default function codeDiffExtension(pi: ExtensionAPI) {
 
       reviewRunInFlight = true;
       try {
-        const status = await runDiff(args, ctx, cwd);
+        const status = await runDiff(args, ctx, cwd, input.comments);
         return {
           content: [{ type: "text" as const, text: formatOpenCodeDiffToolText(status, args, cwd) }],
           details: { ...status, args, cwd },

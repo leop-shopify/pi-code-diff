@@ -76,6 +76,8 @@ You can also use the explicit package commands:
 
 Agents can open the same UI with the `open_code_diff` tool. It accepts an `args` string using the same syntax as `/diff`, plus optional `cwd`. Empty `args` reviews local working-tree/uncommitted changes, including untracked files, so you do not need to commit before review.
 
+Agents can also pass an optional `comments` array to prepopulate concrete review notes into the UI. Each entry needs a `path` matching a reviewed file and a `body`, plus optional `side` (`added` default, `deleted`, or `file`), `line` or `startLine`/`endLine`, and `intent` (`discuss`, `comment` default, or `modify`). Seeded comments are attached to the matching file and line, stay editable and deletable, and flow through the same review prompt as hand-written ones. Comments whose `path` does not match a reviewed file are surfaced as a warning instead of being dropped.
+
 Or use the global shortcut, which defaults to:
 
 ```text
