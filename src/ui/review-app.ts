@@ -553,6 +553,7 @@ export function buildDiffActionHintLine(theme: Theme, width: number): string {
     part("d", "discuss", "warning"),
     part("l", "file", "muted"),
     part("a", "all", "muted"),
+    part("w", "wrap", "muted"),
   ].join(sep);
   return truncateToWidth(hint, Math.max(1, width - 2), "…", false);
 }

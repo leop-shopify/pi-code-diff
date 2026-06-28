@@ -83,7 +83,7 @@ export function createInitialReviewState(files: ReviewFile[]): ReviewState {
     activeFileId: scoped[0]?.id ?? null,
     searchQuery: "",
     focus: "navigator",
-    wrapLines: false,
+    wrapLines: true,
     hideUnchanged: false,
     selectedCommentIndex: 0,
     selectedLineTargetByScopeFile: {},

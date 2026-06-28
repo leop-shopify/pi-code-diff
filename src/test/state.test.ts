@@ -49,6 +49,12 @@ describe("review state", () => {
     ])).toBe("all-files");
   });
 
+  it("starts with diff line wrapping enabled", () => {
+    const state = createInitialReviewState([makeFile("src/a.ts")]);
+
+    expect(state.wrapLines).toBe(true);
+  });
+
   it("orders all-files changes by review priority", () => {
     const makeAllFile = (path: string, status: "modified" | "added" | "deleted", references = 0) => makeFile(path, {
       inGitDiff: false,
