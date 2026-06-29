@@ -84,6 +84,38 @@ describe("composeReviewPrompt", () => {
     expect(prompt).not.toContain("MODIFY items");
   });
 
+  it("renders all-lines file discussion with the current file path", () => {
+    const prompt = composeReviewPrompt(files, {
+      type: "submit",
+      allComment: "",
+      allIntent: "discuss",
+      comments: [
+        {
+          id: "file:git-diff:bar",
+          fileId: "bar",
+          scope: "git-diff",
+          side: "file",
+          intent: "discuss",
+          startLine: null,
+          endLine: null,
+          body: "Explain every line in this file change.",
+        },
+      ],
+    });
+
+    expect(prompt).toBe([
+      "Respond to the following review discussion items in prose only.",
+      "Do not edit files, write code, run write/editing tools, or make repo changes.",
+      "",
+      "DISCUSS",
+      "",
+      "Files:",
+      "- src/bar.ts",
+      "  Explain every line in this file change.",
+    ].join("\n"));
+    expect(prompt).not.toContain("Review-wide:");
+  });
+
   it("uses comment-only instructions", () => {
     const prompt = composeReviewPrompt(files, {
       type: "submit",
