@@ -59,7 +59,7 @@ type LoadedEntry = LoadedEntryReady | LoadedEntryError | LoadedEntryLoading;
 
 type EditTarget =
   | { kind: "line"; fileId: string; scope: ReviewScope; side: ReviewLineTarget["side"]; startLine: number; endLine: number; initialBody: string; intent: CommentIntent; originalText?: string }
-  | { kind: "file"; fileId: string; scope: ReviewScope; initialBody: string; intent: CommentIntent }
+  | { kind: "file"; fileId: string; scope: ReviewScope; initialBody: string; intent: CommentIntent; label?: string }
   | { kind: "all"; initialBody: string; intent: CommentIntent };
 
 type CommentPanelItem =
@@ -495,7 +495,7 @@ const HELP_KEY_SECTIONS = [
       "n/N next/prev search, or n/p hunk without search",
       "t templates • o edit file in $EDITOR (same shell)",
       "Enter/m modify • c comment • d discuss line",
-      "e edit • x delete • l file (comment) • a all (discuss)",
+      "e edit • x delete • l file (comment) • a all lines (discuss)",
     ],
   },
   {
@@ -539,7 +539,7 @@ export function buildCommentPanelTextLines(theme: Theme, width: number, text: st
 export function buildCommentPanelEmptyStateLines(theme: Theme, width: number): string[] {
   return [
     ...buildCommentPanelTextLines(theme, width, "No comments yet.", "dim"),
-    ...buildCommentPanelTextLines(theme, width, "Use Enter/m modify, c comment, d discuss for a line or range, l for file, or a for all.", "dim"),
+    ...buildCommentPanelTextLines(theme, width, "Use Enter/m modify, c comment, d discuss for a line or range, l for file, or a for all lines in the current file.", "dim"),
   ];
 }
 
@@ -552,7 +552,7 @@ export function buildDiffActionHintLine(theme: Theme, width: number): string {
     part("c", "comment", "success"),
     part("d", "discuss", "warning"),
     part("l", "file", "muted"),
-    part("a", "all", "muted"),
+    part("a", "all lines", "muted"),
     part("w", "wrap", "muted"),
   ].join(sep);
   return truncateToWidth(hint, Math.max(1, width - 2), "…", false);
@@ -1456,8 +1456,22 @@ class ReviewApp {
     });
   }
 
-  private editAllNote(): void {
+  private editReviewWideNote(): void {
     this.openEditor({ kind: "all", initialBody: this.state.draft.allComment, intent: this.state.draft.allIntent });
+  }
+
+  private editAllLinesComment(): void {
+    const file = this.activeFile();
+    if (file == null) return;
+    const existing = getFileComment(this.state, file.id, this.state.activeScope);
+    this.openEditor({
+      kind: "file",
+      fileId: file.id,
+      scope: this.state.activeScope,
+      initialBody: existing?.body ?? "",
+      intent: existing?.intent ?? "discuss",
+      label: "All lines in current file",
+    });
   }
 
   private editCurrentLineComment(): void {
@@ -1504,7 +1518,7 @@ class ReviewApp {
     const item = items[this.state.selectedCommentIndex];
     if (item == null) return;
     if (item.kind === "all") {
-      this.editAllNote();
+      this.editReviewWideNote();
       return;
     }
     if (item.comment.side === "file") {
@@ -1581,7 +1595,7 @@ class ReviewApp {
 
   private submit(): void {
     if (!hasDraftContent(this.state) && this.options.allowEmptySubmit !== true) {
-      this.setMessage("Add at least one line comment, file comment, or all note before submitting.");
+      this.setMessage("Add at least one line comment, file/all-lines comment, or review-wide note before submitting.");
       this.requestRender();
       return;
     }
@@ -2085,7 +2099,7 @@ class ReviewApp {
     if (data === "u") { this.state = toggleHideUnchanged(this.state); this.ensureLineSelection(); this.requestRender(); return; }
     if (data === "s") { this.submit(); return; }
     if (data === "l") { this.editFileComment(); return; }
-    if (data === "a") { this.editAllNote(); return; }
+    if (data === "a") { this.editAllLinesComment(); return; }
     if (data === "n" && this.jumpSearch(1)) { return; }
     if (data === "N" && this.jumpSearch(-1)) { return; }
     if (data === "n") { this.moveHunk(1); return; }
@@ -2361,7 +2375,7 @@ class ReviewApp {
     const label = target.kind === "all"
       ? "All note"
       : target.kind === "file"
-        ? "File comment"
+        ? target.label ?? "File comment"
         : `${formatLineSideLabel(target.side)} line ${formatLineRangeLabel(target.startLine, target.endLine)}`;
     const bar = this.theme.fg("accent", "\u258c");
     const header = `${bar} ${getIntentBadge(this.theme, target.intent)} ${this.theme.fg("muted", label)}`;
@@ -2558,7 +2572,7 @@ class ReviewApp {
       lines.push(this.theme.fg("muted", this.editTarget.kind === "all"
         ? "All note"
         : this.editTarget.kind === "file"
-          ? "File comment"
+          ? this.editTarget.label ?? "File comment"
           : `${formatLineSideLabel(this.editTarget.side)} line ${formatLineRangeLabel(this.editTarget.startLine, this.editTarget.endLine)}`));
       lines.push(`${getIntentBadge(this.theme, this.editTarget.intent)} ${this.theme.fg("dim", "Tab toggle")}`);
       lines.push(this.theme.fg("dim", "Enter save • Shift+Enter newline"));
@@ -2575,7 +2589,9 @@ class ReviewApp {
         ? ` • search ${this.commentSearchQuery}`
         : "";
     lines.push(this.theme.fg("muted", `${this.state.draft.comments.length} scoped comment${this.state.draft.comments.length === 1 ? "" : "s"}${commentSearchLabel}`));
-    lines.push(this.theme.fg("dim", this.state.draft.allComment ? `all note set • ${formatIntentLabel(this.state.draft.allIntent).toLowerCase()}` : "all note: none"));
+    if (this.state.draft.allComment) {
+      lines.push(this.theme.fg("dim", `review-wide note set • ${formatIntentLabel(this.state.draft.allIntent).toLowerCase()}`));
+    }
     lines.push("");
 
     if (file != null) {
@@ -2584,7 +2600,7 @@ class ReviewApp {
       const lineComment = selectedTarget == null
         ? undefined
         : getLineComment(this.state, file.id, this.state.activeScope, selectedTarget.side, selectedTarget.line);
-      lines.push(this.theme.fg("muted", `file: ${fileComment ? "commented" : "none"}`));
+      lines.push(this.theme.fg("muted", `file/all lines: ${fileComment ? "commented" : "none"}`));
       lines.push(this.theme.fg("muted", selectedTarget == null
         ? "line —: none"
         : `${formatLineSideLabel(selectedTarget.side).toLowerCase()} ${formatLineRangeLabel(getLineTargetRange(selectedTarget).startLine, getLineTargetRange(selectedTarget).endLine)}: ${lineComment ? "commented" : "none"}`));

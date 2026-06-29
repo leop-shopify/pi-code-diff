@@ -393,7 +393,7 @@ describe("action and shortcut help rendering", () => {
   it("shows line action keys in the diff pane hint", () => {
     const hint = buildDiffActionHintLine(plainTheme as any, 120);
 
-    for (const token of ["Enter/m", "modify", "c", "comment", "d", "discuss", "l", "file", "a", "all", "w", "wrap"]) {
+    for (const token of ["Enter/m", "modify", "c", "comment", "d", "discuss", "l", "file", "a", "all lines", "w", "wrap"]) {
       expect(hint).toContain(token);
     }
   });

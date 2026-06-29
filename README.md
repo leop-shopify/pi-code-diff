@@ -4,7 +4,7 @@
 
 It is inspired by Mario Zechner's [pi-diff-review](https://github.com/badlogic/pi-diff-review).
 
-It lets you stop after an agent turn, walk a local diff or remote PR inside Pi, add fast line/file/whole-change annotations, and route the result either back to the agent or into a GitHub PR review.
+It lets you stop after an agent turn, walk a local diff or remote PR inside Pi, add fast line/file/all-lines annotations, and route the result either back to the agent or into a GitHub PR review.
 
 The goal is simple: keep terminal-based code review inside Pi, keep annotations precise, and make it easy to separate edits you want applied from comments you want posted and things you want explained.
 
@@ -27,7 +27,7 @@ Inside the review UI you can:
 - review changes in unified or side-by-side diff view
 - annotate **added** and **deleted** lines, including multiline ranges on one diff side
 - leave **file-level** annotations
-- leave a **whole-change** note
+- leave an **all-lines note** for the current file
 - mark feedback as either:
   - `DISCUSS` — the agent explains, justifies, or proposes; it never edits code or touches GitHub to satisfy the note
   - `COMMENT` — a real GitHub PR comment when the review is remote; for a local review it becomes a local comment to the agent about the change
@@ -117,7 +117,7 @@ Local changes open the in-UI scope switcher described below.
    - `c` for a line `COMMENT`
    - `d` for a line `DISCUSS`
    - `l` for a file annotation (a `COMMENT`)
-   - `a` for a whole-change note (a `DISCUSS`)
+   - `a` for an all-lines note on the current file (a `DISCUSS`)
 5. Press `s` to insert the review prompt into the editor
 6. Read it, tweak it if you want, then send it normally
 
@@ -156,7 +156,7 @@ The three GitHub verdicts use an agent-mediated submission flow:
 2. pi-code-diff sends the agent a structured submission handoff with the exact repo, PR number, commit, file paths, lines, sides, verdict, body, and inline comments.
 3. The agent must not inspect code or change review locations. It only fixes grammar, spelling, capitalization, and punctuation in the supplied review text.
 4. The agent asks you to approve/edit/skip each changed text item, batching separate item questions when the current ask tool supports it. Approving an item is the confirmation to submit that item; after the last item is resolved, the agent calls `submit_pr_review` without a second confirmation.
-5. `COMMENT` line items are posted as GitHub inline comments. `MODIFY` line edits are posted as inline comments containing a suggested diff. `COMMENT` file items and review-wide `COMMENT` notes become the review body. `DISCUSS` items are never sent to GitHub.
+5. `COMMENT` line items are posted as GitHub inline comments. `MODIFY` line edits are posted as inline comments containing a suggested diff. `COMMENT` file/all-lines items become the review body. `DISCUSS` items are never sent to GitHub.
 6. Approval refuses self-approval with a clear message, and `request changes` requires a body or at least one inline comment.
 
 `Send feedback to the agent` skips GitHub entirely and inserts the normal local review prompt instead, so the agent can answer or ask follow-up questions.
@@ -195,14 +195,14 @@ Examples:
 - `Explain this file-level refactor.`
 - `This file now does too much.`
 
-#### Whole-change note
+#### All-lines file notes
 
-Use this when the feedback is about the change as a whole.
+Use this when the feedback is about all lines in the current file, rather than one selected line.
 
 Examples:
 
-- `Explain this entire diff to me.`
-- `What is the overall intention behind this change?`
+- `Explain this entire file change to me.`
+- `What is the overall intention behind this file refactor?`
 
 ### DISCUSS vs COMMENT vs MODIFY
 
@@ -210,7 +210,7 @@ This distinction is central to how `/diff` works.
 
 #### DISCUSS
 
-Use `DISCUSS` (`d` on a line, `a` for the whole change) when you want explanation, rationale, tradeoffs, or a proposal. It is agent-only and never touches GitHub. A fix can still come out of a discussion, but the agent answers in prose first rather than editing to satisfy the note.
+Use `DISCUSS` (`d` on a line, `a` for all lines in the current file) when you want explanation, rationale, tradeoffs, or a proposal. It is agent-only and never touches GitHub. A fix can still come out of a discussion, but the agent answers in prose first rather than editing to satisfy the note.
 
 Examples:
 
@@ -290,7 +290,7 @@ When the review UI generates the local prompt, it uses different wording dependi
 - `e` — edit the existing line comment on the selected line
 - `x` — delete the existing line comment on the selected line
 - `l` — file comment (a `COMMENT`)
-- `a` — whole-change note (a `DISCUSS`)
+- `a` — all-lines note for the current file (a `DISCUSS`)
 - `t` — open template shortcut mode for the selected line
 
 Opening a source location in `$EDITOR` returns you to the review UI when the editor exits and keeps your draft feedback available for submission. The editor command comes from your local `$EDITOR` or `$VISUAL` and is run through your shell, so configure those variables only to commands you trust.
@@ -314,7 +314,7 @@ Line comment markers in the diff gutter:
 
 #### Editor
 
-The note editor opens inline in the diff, directly under the line you are annotating, so you type your note in place instead of in the comments panel. File and whole-change notes open the editor at the top of the diff pane.
+The note editor opens inline in the diff, directly under the line you are annotating, so you type your note in place instead of in the comments panel. File and all-lines notes open the editor at the top of the diff pane.
 
 - `Tab` — cycle `DISCUSS` / `COMMENT` / `MODIFY`
 - `Enter` — save
@@ -392,8 +392,7 @@ When you submit, `/diff` builds a prompt that matches the kind of review you cre
 
 It groups feedback naturally into sections like:
 
-- review-wide note
-- file comments
+- file/all-lines comments
 - line comments
 
 and uses stricter instructions when `DISCUSS` or `COMMENT` items are present, so the model is less likely to turn explanatory notes into accidental edits. `MODIFY` items are presented as exact `LINE CHANGED` edits to apply.
