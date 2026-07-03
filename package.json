@@ -1,6 +1,6 @@
 {
   "name": "pi-code-diff",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "private": true,
   "packageManager": "pnpm@10.28.0",
   "type": "module",
@@ -13,6 +13,7 @@
     "src/index.ts",
     "src/pi-render.ts",
     "src/prompt.ts",
+    "src/pr-summary.ts",
     "src/remote.ts",
     "src/review-submit.ts",
     "src/sanitize.ts",
