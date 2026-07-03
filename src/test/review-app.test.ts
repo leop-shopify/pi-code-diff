@@ -2,7 +2,7 @@ import { visibleWidth } from "@earendil-works/pi-tui";
 import { describe, expect, it } from "vitest";
 import { buildStructuredDiff } from "../diff.js";
 import type { DiffReviewComment, ReviewFile, ReviewState } from "../types.js";
-import { buildCommentPanelEmptyStateLines, buildCommentPanelTextLines, buildContextPanelLines, buildDiffActionHintLine, buildDisplayRows, buildEditorLaunchCommand, buildFooterLines, buildHelpPanelLines, buildSideBySideDisplayRows, diffTextMatchesSearch, formatFocusStatus, formatPaneTitle, formatSelectedLineTargetLabel, getCancelAction, getDraftCommentCount, getEditorLineForTarget, getHalfPageStep, getMatchingDiffLineTargets, getNavigatorMoveIndex, getNextSearchIndex, getPaneLayout, getPaneLayoutWithContext, getRelatedFileMarker, getRelatedFilePanelSections, getRelatedFilePaths, getSideBySideColumnTarget, getSideBySideLineTargets, getSideBySidePairedLineTarget, getStackedPaneLayout, getStackedPaneLayoutWithContext, parseMouseWheelInput, renderCenteredOverlay, shouldStackPanes } from "../ui/review-app.js";
+import { buildCommentPanelEmptyStateLines, buildCommentPanelTextLines, buildContextPanelLines, buildDiffActionHintLine, buildDisplayRows, buildEditorLaunchCommand, buildFooterLines, buildHelpPanelLines, buildSideBySideDisplayRows, diffTextMatchesSearch, formatFocusStatus, formatPaneTitle, formatSelectedLineTargetLabel, getCancelAction, getDraftCommentCount, getEditorLineForTarget, getHalfPageStep, getMatchingDiffLineTargets, getNavigatorMoveIndex, getNextSearchIndex, getPaneLayout, getPaneLayoutWithContext, getRelatedFileMarker, getRelatedFilePanelSections, getRelatedFilePaths, getSideBySideColumnTarget, getSideBySideLineTargets, getSideBySidePairedLineTarget, getStackedPaneLayout, getStackedPaneLayoutWithContext, parseMouseWheelInput, renderCenteredOverlay, shouldStackPanes, shouldStackPanesWithContext } from "../ui/review-app.js";
 
 function makeFile(path: string, flags?: Partial<ReviewFile>): ReviewFile {
   return {
@@ -206,14 +206,15 @@ describe("pane layout", () => {
     expect(shown.navigatorWidth).toBe(shown.commentsWidth);
   });
 
-  it("adds a remote context column by taking width from the diff pane", () => {
-    const local = getPaneLayoutWithContext(120, false, false);
-    const remote = getPaneLayoutWithContext(120, false, true);
+  it("adds a wider remote context column by taking width from the diff pane", () => {
+    const local = getPaneLayoutWithContext(200, false, false);
+    const remote = getPaneLayoutWithContext(200, false, true);
 
-    expect(remote.navigatorWidth).toBe(local.navigatorWidth);
+    expect(remote.navigatorWidth).toBeLessThanOrEqual(local.navigatorWidth);
     expect(remote.contextWidth).toBe(remote.commentsWidth);
+    expect(remote.contextWidth).toBeGreaterThan(local.commentsWidth);
     expect(remote.diffWidth).toBeLessThan(local.diffWidth);
-    expect(remote.navigatorWidth + remote.diffWidth + remote.commentsWidth + remote.contextWidth + 3).toBe(120);
+    expect(remote.navigatorWidth + remote.diffWidth + remote.commentsWidth + remote.contextWidth + 3).toBe(200);
   });
 
   it("hides the remote context column with the comments pane", () => {
@@ -226,6 +227,12 @@ describe("pane layout", () => {
   it("stacks panes below the desktop width breakpoint", () => {
     expect(shouldStackPanes(99)).toBe(true);
     expect(shouldStackPanes(100)).toBe(false);
+  });
+
+  it("stacks remote context reviews until the terminal is wide enough for four panes", () => {
+    expect(shouldStackPanesWithContext(155, true)).toBe(true);
+    expect(shouldStackPanesWithContext(156, true)).toBe(false);
+    expect(shouldStackPanesWithContext(120, false)).toBe(false);
   });
 
   it("allocates stacked pane heights with more room for the diff", () => {
@@ -408,12 +415,14 @@ describe("action and shortcut help rendering", () => {
     expect(lines.every((line) => visibleWidth(line) <= 22)).toBe(true);
   });
 
-  it("wraps parsed PR context to the fourth column width", () => {
-    const lines = buildContextPanelLines(plainTheme as any, 24, "Title:\nKeep the original title\n\nProblem:\nThis PR fixes a checkout path that confused buyers during free trials.");
+  it("wraps parsed PR context to the fourth column width with padding", () => {
+    const lines = buildContextPanelLines(plainTheme as any, 24, "Title:\\x0aKeep the original title\\x0a\\x0aProblem:\\x0aThis PR fixes a checkout path that confused buyers during free trials.");
 
-    expect(lines).toContain("Title:");
-    expect(lines).toContain("Problem:");
+    expect(lines).toContain("  Title:");
+    expect(lines).toContain("  Problem:");
+    expect(lines.some((line) => line.includes("\\x0a"))).toBe(false);
     expect(lines.length).toBeGreaterThan(4);
+    expect(lines.every((line) => line.startsWith("  "))).toBe(true);
     expect(lines.every((line) => visibleWidth(line) <= 22)).toBe(true);
   });
 

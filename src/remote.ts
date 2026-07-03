@@ -272,6 +272,10 @@ async function fetchStackParentCandidateRef(pi: ExtensionAPI, gitRoot: string, c
   }
 }
 
+function shouldScanStackParentCandidates(): boolean {
+  return process.env.PI_CODE_DIFF_SCAN_STACK_PARENTS === "1";
+}
+
 async function findClosestStackParent(pi: ExtensionAPI, gitRoot: string, metadata: PullRequestMetadata, currentBaseRef: string, headRef: string, remote = "origin", repo?: string, onProgress?: RemoteProgress): Promise<{ baseRef: string; stackParent: StackParentMetadata } | undefined> {
   const candidates = await listStackParentCandidates(pi, gitRoot, metadata, repo, onProgress);
   if (candidates.length === 0) return undefined;
@@ -397,10 +401,12 @@ export async function resolveRemoteReviewTarget(pi: ExtensionAPI, fallbackCwd: s
   if (parsed.prNumber != null) {
     const pullRequest = await getPullRequestMetadata(pi, gitRoot, parsed.prNumber, parsed.repo, onProgress);
     const refs = await fetchPullRequestRefs(pi, gitRoot, pullRequest, fetchRemote, onProgress);
-    const closestStackParent = await findClosestStackParent(pi, gitRoot, pullRequest, refs.baseRef, refs.headRef, fetchRemote, parsed.repo, onProgress);
-    if (closestStackParent != null) {
-      refs.baseRef = closestStackParent.baseRef;
-      pullRequest.stackParent = closestStackParent.stackParent;
+    if (shouldScanStackParentCandidates()) {
+      const closestStackParent = await findClosestStackParent(pi, gitRoot, pullRequest, refs.baseRef, refs.headRef, fetchRemote, parsed.repo, onProgress);
+      if (closestStackParent != null) {
+        refs.baseRef = closestStackParent.baseRef;
+        pullRequest.stackParent = closestStackParent.stackParent;
+      }
     }
     return {
       gitRoot,
