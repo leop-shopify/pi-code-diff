@@ -101,6 +101,8 @@ const SEARCHABLE_SCOPES: ReviewScope[] = ["git-diff", "last-commit", "all-files"
 const DEFAULT_VISIBLE_SCOPES: ReviewScope[] = ["git-diff", "last-commit"];
 const DEFAULT_CONTEXT_LINES = 3;
 const STACKED_LAYOUT_MAX_WIDTH = 99;
+const STACKED_CONTEXT_LAYOUT_MAX_WIDTH = 155;
+const CONTEXT_PANEL_PADDING_X = 2;
 
 function shellQuote(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`;
@@ -155,6 +157,10 @@ export function shouldStackPanes(frameInnerWidth: number): boolean {
   return frameInnerWidth <= STACKED_LAYOUT_MAX_WIDTH;
 }
 
+export function shouldStackPanesWithContext(frameInnerWidth: number, contextVisible: boolean): boolean {
+  return shouldStackPanes(frameInnerWidth) || (contextVisible && frameInnerWidth <= STACKED_CONTEXT_LAYOUT_MAX_WIDTH);
+}
+
 export function getPaneLayout(frameInnerWidth: number, commentsHidden: boolean): { navigatorWidth: number; diffWidth: number; commentsWidth: number } {
   const sideWidth = Math.max(24, Math.min(36, Math.floor(frameInnerWidth * 0.26)));
   if (commentsHidden) {
@@ -176,13 +182,16 @@ export function getPaneLayoutWithContext(frameInnerWidth: number, commentsHidden
   const base = getPaneLayout(frameInnerWidth, commentsHidden);
   if (!contextVisible || commentsHidden) return { ...base, contextWidth: 0 };
 
-  const maximumContextWidth = Math.floor((frameInnerWidth - base.navigatorWidth - 3 - 24) / 2);
-  const sideWidth = Math.max(1, Math.min(base.commentsWidth, maximumContextWidth));
+  const navigatorWidth = Math.max(20, Math.min(32, base.navigatorWidth));
+  const minimumDiffWidth = 48;
+  const maximumSideWidth = 72;
+  const maximumReadableSideWidth = Math.floor((frameInnerWidth - navigatorWidth - minimumDiffWidth - 3) / 2);
+  const sideWidth = Math.max(24, Math.min(maximumSideWidth, maximumReadableSideWidth));
   return {
-    navigatorWidth: base.navigatorWidth,
+    navigatorWidth,
     commentsWidth: sideWidth,
     contextWidth: sideWidth,
-    diffWidth: Math.max(24, frameInnerWidth - base.navigatorWidth - sideWidth * 2 - 3),
+    diffWidth: Math.max(24, frameInnerWidth - navigatorWidth - sideWidth * 2 - 3),
   };
 }
 
@@ -544,7 +553,7 @@ const HELP_KEY_SECTIONS = [
       "n/N next/prev search, or n/p hunk without search",
       "t templates • o edit file in $EDITOR (same shell)",
       "Enter/m modify • c comment • d discuss line",
-      "e edit • x delete • l file (comment) • a all lines (discuss)",
+      "e edit • x delete • l file (comment) • a all lines (comment)",
     ],
   },
   {
@@ -592,20 +601,29 @@ export function buildCommentPanelEmptyStateLines(theme: Theme, width: number): s
   ];
 }
 
+function normalizeContextPanelText(text: string): string {
+  return text
+    .replace(/\\+x0a/gi, "\n")
+    .replace(/\\+u000a/gi, "\n")
+    .replace(/&#10;/g, "\n")
+    .replace(/\\+n/g, "\n");
+}
+
 export function buildContextPanelLines(theme: Theme, width: number, text: string): string[] {
-  const contentWidth = Math.max(1, width - 2);
+  const prefix = " ".repeat(CONTEXT_PANEL_PADDING_X);
+  const contentWidth = Math.max(1, width - 2 - CONTEXT_PANEL_PADDING_X * 2);
   const lines: string[] = [];
-  for (const rawLine of text.split(/\r?\n/)) {
+  for (const rawLine of normalizeContextPanelText(text).split(/\r?\n/)) {
     const line = sanitizeTerminalText(rawLine).trim();
     if (line.length === 0) {
-      lines.push("");
+      lines.push(prefix);
       continue;
     }
     if (/^[A-Za-z][A-Za-z ]{1,32}:$/.test(line)) {
-      pushWrappedAnsiText(lines, theme.fg("warning", line), contentWidth);
+      pushWrappedAnsiText(lines, theme.fg("warning", line), contentWidth, prefix);
       continue;
     }
-    pushWrappedText(lines, theme, line, contentWidth, "muted");
+    pushWrappedText(lines, theme, line, contentWidth, "muted", prefix);
   }
   return lines;
 }
@@ -1122,7 +1140,7 @@ class ReviewApp {
     this.contextPanelState = { status: "loading" };
     this.requestRender();
     void source.load().then((text) => {
-      this.contextPanelState = { status: "ready", text: sanitizeTerminalText(text) };
+      this.contextPanelState = { status: "ready", text };
       this.requestRender();
     }).catch((error: unknown) => {
       const message = error instanceof Error ? error.message : String(error);
@@ -1558,7 +1576,7 @@ class ReviewApp {
       fileId: file.id,
       scope: this.state.activeScope,
       initialBody: existing?.body ?? "",
-      intent: existing?.intent ?? "discuss",
+      intent: existing?.intent ?? "comment",
       label: "All lines in current file",
     });
   }
@@ -2766,8 +2784,8 @@ class ReviewApp {
     const frameInnerWidth = Math.max(20, this.lastWidth - 2 - MODAL_INNER_PADDING_X * 2);
     const frameInnerHeight = Math.max(10, totalHeight - 2 - MODAL_INNER_PADDING_Y * 2);
 
-    const stackPanes = shouldStackPanes(frameInnerWidth);
     const contextVisible = this.hasContextPanel();
+    const stackPanes = shouldStackPanesWithContext(frameInnerWidth, contextVisible);
     const bodyHeight = Math.max(stackPanes && !this.commentsHidden ? (contextVisible ? 12 : 9) : 6, frameInnerHeight - 5);
     const terminalCols = this.tui?.terminal?.columns ?? this.lastWidth;
     const overlayOriginCol = Math.max(0, Math.floor((terminalCols - this.lastWidth) / 2));
@@ -2862,7 +2880,7 @@ export async function runReviewApp(
         width: "100%",
         maxHeight: "100%",
         minWidth: 40,
-        margin: 1,
+        margin: { top: 1, right: 0, bottom: 1, left: 0 },
       },
     },
   );

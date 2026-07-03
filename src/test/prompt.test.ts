@@ -84,7 +84,7 @@ describe("composeReviewPrompt", () => {
     expect(prompt).not.toContain("MODIFY items");
   });
 
-  it("renders all-lines file discussion with the current file path", () => {
+  it("renders all-lines file comments with the current file path", () => {
     const prompt = composeReviewPrompt(files, {
       type: "submit",
       allComment: "",
@@ -95,7 +95,7 @@ describe("composeReviewPrompt", () => {
           fileId: "bar",
           scope: "git-diff",
           side: "file",
-          intent: "discuss",
+          intent: "comment",
           startLine: null,
           endLine: null,
           body: "Explain every line in this file change.",
@@ -104,16 +104,17 @@ describe("composeReviewPrompt", () => {
     });
 
     expect(prompt).toBe([
-      "Respond to the following review discussion items in prose only.",
-      "Do not edit files, write code, run write/editing tools, or make repo changes.",
+      "Treat the following review comments as actionable feedback about the change.",
+      "Answer questions in prose, and make local edits when a comment asks for a change or states a preferred implementation.",
       "",
-      "DISCUSS",
+      "COMMENT",
       "",
       "Files:",
       "- src/bar.ts",
       "  Explain every line in this file change.",
     ].join("\n"));
     expect(prompt).not.toContain("Review-wide:");
+    expect(prompt).not.toContain("DISCUSS");
   });
 
   it("uses comment-only instructions", () => {

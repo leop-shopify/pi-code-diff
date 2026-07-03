@@ -76,8 +76,59 @@ describe("remote review helpers", () => {
     expect(withParent).toContain("Stack parent: PR #6 Parent change (parent/review, merged)");
   });
 
-  it("resolves stacked GitHub PRs to the closest ancestor PR even when GitHub base is main", async () => {
+  it("skips broad stack parent candidate scans by default", async () => {
     const fetchCalls: string[][] = [];
+    const previousScan = process.env.PI_CODE_DIFF_SCAN_STACK_PARENTS;
+    delete process.env.PI_CODE_DIFF_SCAN_STACK_PARENTS;
+    const exec = vi.fn(async (command: string, args: string[]) => {
+      if (command === "provider-cli" && args[0] === "pr" && args[1] === "view") {
+        return {
+          code: 0,
+          stdout: JSON.stringify({
+            title: "Child change",
+            body: "Body",
+            additions: 10,
+            deletions: 4,
+            changedFiles: 3,
+            author: { login: "leo" },
+            state: "OPEN",
+            reviews: [],
+            headRefName: "child/review",
+            headRefOid: "abc123",
+            baseRefName: "main",
+          }),
+          stderr: "",
+          killed: false,
+        };
+      }
+      if (command === "provider-cli" && args[0] === "pr" && args[1] === "list") {
+        return { code: 1, stdout: "", stderr: "should not scan candidates", killed: false };
+      }
+      if (command === "git" && args.join(" ") === "merge-base origin/main origin/child/review") return { code: 0, stdout: "main-base\n", stderr: "", killed: false };
+      if (command === "git" && args[1] === "fetch") {
+        fetchCalls.push(args);
+        return { code: 0, stdout: "", stderr: "", killed: false };
+      }
+      return { code: 1, stdout: "", stderr: `unexpected ${command} ${args.join(" ")}`, killed: false };
+    });
+
+    const target = await resolveRemoteReviewTarget({ exec } as never, "/repo", "https://github.com/example/widgets/pull/123", "/repo");
+
+    expect(target).toMatchObject({
+      baseRef: "main-base",
+      headRef: "origin/child/review",
+      pullRequest: { number: "123", stackParent: undefined },
+    });
+    expect(exec).not.toHaveBeenCalledWith("provider-cli", expect.arrayContaining(["list"]), expect.anything());
+    expect(fetchCalls).toHaveLength(1);
+    if (previousScan == null) delete process.env.PI_CODE_DIFF_SCAN_STACK_PARENTS;
+    else process.env.PI_CODE_DIFF_SCAN_STACK_PARENTS = previousScan;
+  });
+
+  it("resolves stacked GitHub PRs to the closest ancestor PR when candidate scanning is enabled", async () => {
+    const fetchCalls: string[][] = [];
+    const previousScan = process.env.PI_CODE_DIFF_SCAN_STACK_PARENTS;
+    process.env.PI_CODE_DIFF_SCAN_STACK_PARENTS = "1";
     const exec = vi.fn(async (command: string, args: string[]) => {
       if (command === "provider-cli" && args[0] === "pr" && args[1] === "view") {
         return {
@@ -141,6 +192,8 @@ describe("remote review helpers", () => {
     expect(fetchCalls[0]).toContain("+refs/heads/child/review:refs/remotes/origin/child/review");
     expect(fetchCalls[1]).toContain("+refs/heads/parent/review:refs/remotes/origin/parent/review");
     expect(formatPullRequestContext(target.pullRequest!)).toContain("Stack parent: PR #6 Parent change (parent/review, merged)");
+    if (previousScan == null) delete process.env.PI_CODE_DIFF_SCAN_STACK_PARENTS;
+    else process.env.PI_CODE_DIFF_SCAN_STACK_PARENTS = previousScan;
   });
 
   it("resolves same-repo GitHub PRs to fetched base and head refs", async () => {
