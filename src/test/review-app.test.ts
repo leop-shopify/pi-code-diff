@@ -2,7 +2,7 @@ import { visibleWidth } from "@earendil-works/pi-tui";
 import { describe, expect, it } from "vitest";
 import { buildStructuredDiff } from "../diff.js";
 import type { DiffReviewComment, ReviewFile, ReviewState } from "../types.js";
-import { buildCommentPanelEmptyStateLines, buildCommentPanelTextLines, buildDiffActionHintLine, buildDisplayRows, buildEditorLaunchCommand, buildFooterLines, buildHelpPanelLines, buildSideBySideDisplayRows, diffTextMatchesSearch, formatFocusStatus, formatPaneTitle, formatSelectedLineTargetLabel, getCancelAction, getDraftCommentCount, getEditorLineForTarget, getHalfPageStep, getMatchingDiffLineTargets, getNavigatorMoveIndex, getNextSearchIndex, getPaneLayout, getRelatedFileMarker, getRelatedFilePanelSections, getRelatedFilePaths, getSideBySideColumnTarget, getSideBySideLineTargets, getSideBySidePairedLineTarget, getStackedPaneLayout, parseMouseWheelInput, renderCenteredOverlay, shouldStackPanes } from "../ui/review-app.js";
+import { buildCommentPanelEmptyStateLines, buildCommentPanelTextLines, buildContextPanelLines, buildDiffActionHintLine, buildDisplayRows, buildEditorLaunchCommand, buildFooterLines, buildHelpPanelLines, buildSideBySideDisplayRows, diffTextMatchesSearch, formatFocusStatus, formatPaneTitle, formatSelectedLineTargetLabel, getCancelAction, getDraftCommentCount, getEditorLineForTarget, getHalfPageStep, getMatchingDiffLineTargets, getNavigatorMoveIndex, getNextSearchIndex, getPaneLayout, getPaneLayoutWithContext, getRelatedFileMarker, getRelatedFilePanelSections, getRelatedFilePaths, getSideBySideColumnTarget, getSideBySideLineTargets, getSideBySidePairedLineTarget, getStackedPaneLayout, getStackedPaneLayoutWithContext, parseMouseWheelInput, renderCenteredOverlay, shouldStackPanes } from "../ui/review-app.js";
 
 function makeFile(path: string, flags?: Partial<ReviewFile>): ReviewFile {
   return {
@@ -206,6 +206,23 @@ describe("pane layout", () => {
     expect(shown.navigatorWidth).toBe(shown.commentsWidth);
   });
 
+  it("adds a remote context column by taking width from the diff pane", () => {
+    const local = getPaneLayoutWithContext(120, false, false);
+    const remote = getPaneLayoutWithContext(120, false, true);
+
+    expect(remote.navigatorWidth).toBe(local.navigatorWidth);
+    expect(remote.contextWidth).toBe(remote.commentsWidth);
+    expect(remote.diffWidth).toBeLessThan(local.diffWidth);
+    expect(remote.navigatorWidth + remote.diffWidth + remote.commentsWidth + remote.contextWidth + 3).toBe(120);
+  });
+
+  it("hides the remote context column with the comments pane", () => {
+    const hidden = getPaneLayoutWithContext(120, true, true);
+
+    expect(hidden.commentsWidth).toBe(0);
+    expect(hidden.contextWidth).toBe(0);
+  });
+
   it("stacks panes below the desktop width breakpoint", () => {
     expect(shouldStackPanes(99)).toBe(true);
     expect(shouldStackPanes(100)).toBe(false);
@@ -222,6 +239,15 @@ describe("pane layout", () => {
       navigatorHeight: 3,
       diffHeight: 6,
       commentsHeight: 0,
+    });
+  });
+
+  it("allocates a stacked PR context panel after comments", () => {
+    expect(getStackedPaneLayoutWithContext(14, false, true)).toEqual({
+      navigatorHeight: 3,
+      diffHeight: 5,
+      commentsHeight: 3,
+      contextHeight: 3,
     });
   });
 });
@@ -379,6 +405,15 @@ describe("action and shortcut help rendering", () => {
 
     expect(lines.join(" ")).toContain("m modify");
     expect(lines.length).toBeGreaterThan(2);
+    expect(lines.every((line) => visibleWidth(line) <= 22)).toBe(true);
+  });
+
+  it("wraps parsed PR context to the fourth column width", () => {
+    const lines = buildContextPanelLines(plainTheme as any, 24, "Title:\nKeep the original title\n\nProblem:\nThis PR fixes a checkout path that confused buyers during free trials.");
+
+    expect(lines).toContain("Title:");
+    expect(lines).toContain("Problem:");
+    expect(lines.length).toBeGreaterThan(4);
     expect(lines.every((line) => visibleWidth(line) <= 22)).toBe(true);
   });
 

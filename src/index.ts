@@ -3,6 +3,7 @@ import { truncateToWidth, type Component, type TUI } from "@earendil-works/pi-tu
 import { Type } from "typebox";
 import { getReviewWindowData, getReviewWindowDataForRevisionRange, loadReviewFileContents, type ReviewWindowData } from "./git.js";
 import { composeReviewPrompt } from "./prompt.js";
+import { createRemotePullRequestSummarySource } from "./pr-summary.js";
 import { formatPullRequestContext, resolveRemoteReviewTarget, type RemoteReviewTarget } from "./remote.js";
 import { buildInlineComments, buildReviewBody, submitPullRequestReview, type ReviewInlineComment, type ReviewVerdict } from "./review-submit.js";
 import { resolveSeedComments, type SeedReviewComment } from "./seed-comments.js";
@@ -222,6 +223,7 @@ export default function codeDiffExtension(pi: ExtensionAPI) {
         allowEmptySubmit: remoteTarget?.pullRequest != null,
         visibleScopes,
         seedComments: seed.resolved,
+        contextPanelSource: createRemotePullRequestSummarySource(pi, ctx, remoteTarget),
       });
 
       if (result.type === "cancel") {

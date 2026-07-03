@@ -37,7 +37,7 @@ import { getShortcutConfigPath, getShortcutsForSide, type CommentShortcut } from
 import { filterFilesBySearch } from "../search.js";
 import { sanitizeTerminalText } from "../sanitize.js";
 import { highlightJsonLine, highlightMarkdownLine } from "../theme-highlight.js";
-import type { CommentIntent, DiffReviewComment, ReviewFile, ReviewFileContents, ReviewFocus, ReviewLineTarget, ReviewResult, ReviewScope, ReviewState } from "../types.js";
+import type { CommentIntent, DiffReviewComment, ReviewContextPanelSource, ReviewFile, ReviewFileContents, ReviewFocus, ReviewLineTarget, ReviewResult, ReviewScope, ReviewState } from "../types.js";
 import { formatIntentLabel, formatScopeLabel } from "../types.js";
 
 interface LoadedEntryReady {
@@ -57,6 +57,12 @@ interface LoadedEntryLoading {
 
 type LoadedEntry = LoadedEntryReady | LoadedEntryError | LoadedEntryLoading;
 
+type ContextPanelState =
+  | { status: "idle" }
+  | { status: "loading" }
+  | { status: "ready"; text: string }
+  | { status: "error"; error: string };
+
 type EditTarget =
   | { kind: "line"; fileId: string; scope: ReviewScope; side: ReviewLineTarget["side"]; startLine: number; endLine: number; initialBody: string; intent: CommentIntent; originalText?: string }
   | { kind: "file"; fileId: string; scope: ReviewScope; initialBody: string; intent: CommentIntent; label?: string }
@@ -74,6 +80,7 @@ interface ReviewAppOptions {
   allowEmptySubmit?: boolean;
   visibleScopes?: ReviewScope[];
   seedComments?: ResolvedSeedComment[];
+  contextPanelSource?: ReviewContextPanelSource;
   notify: ExtensionContext["ui"]["notify"];
 }
 
@@ -165,6 +172,20 @@ export function getPaneLayout(frameInnerWidth: number, commentsHidden: boolean):
   };
 }
 
+export function getPaneLayoutWithContext(frameInnerWidth: number, commentsHidden: boolean, contextVisible: boolean): { navigatorWidth: number; diffWidth: number; commentsWidth: number; contextWidth: number } {
+  const base = getPaneLayout(frameInnerWidth, commentsHidden);
+  if (!contextVisible || commentsHidden) return { ...base, contextWidth: 0 };
+
+  const maximumContextWidth = Math.floor((frameInnerWidth - base.navigatorWidth - 3 - 24) / 2);
+  const sideWidth = Math.max(1, Math.min(base.commentsWidth, maximumContextWidth));
+  return {
+    navigatorWidth: base.navigatorWidth,
+    commentsWidth: sideWidth,
+    contextWidth: sideWidth,
+    diffWidth: Math.max(24, frameInnerWidth - base.navigatorWidth - sideWidth * 2 - 3),
+  };
+}
+
 export function getStackedPaneLayout(bodyHeight: number, commentsHidden: boolean): { navigatorHeight: number; diffHeight: number; commentsHeight: number } {
   const safeBodyHeight = Math.max(commentsHidden ? 6 : 9, Math.floor(bodyHeight));
   const minimums = commentsHidden ? [3, 3] : [3, 3, 3];
@@ -187,6 +208,34 @@ export function getStackedPaneLayout(bodyHeight: number, commentsHidden: boolean
     navigatorHeight: heights[0]!,
     diffHeight: heights[1]!,
     commentsHeight: commentsHidden ? 0 : heights[2]!,
+  };
+}
+
+export function getStackedPaneLayoutWithContext(bodyHeight: number, commentsHidden: boolean, contextVisible: boolean): { navigatorHeight: number; diffHeight: number; commentsHeight: number; contextHeight: number } {
+  if (!contextVisible || commentsHidden) return { ...getStackedPaneLayout(bodyHeight, commentsHidden), contextHeight: 0 };
+
+  const safeBodyHeight = Math.max(12, Math.floor(bodyHeight));
+  const minimums = [3, 3, 3, 3];
+  const weights = [1, 2, 1, 1];
+  const heights = [...minimums];
+  let remaining = safeBodyHeight - heights.reduce((sum, height) => sum + height, 0);
+
+  while (remaining > 0) {
+    let selectedIndex = 0;
+    for (let index = 1; index < weights.length; index += 1) {
+      if (heights[index]! / weights[index]! < heights[selectedIndex]! / weights[selectedIndex]!) {
+        selectedIndex = index;
+      }
+    }
+    heights[selectedIndex]! += 1;
+    remaining -= 1;
+  }
+
+  return {
+    navigatorHeight: heights[0]!,
+    diffHeight: heights[1]!,
+    commentsHeight: heights[2]!,
+    contextHeight: heights[3]!,
   };
 }
 
@@ -541,6 +590,24 @@ export function buildCommentPanelEmptyStateLines(theme: Theme, width: number): s
     ...buildCommentPanelTextLines(theme, width, "No comments yet.", "dim"),
     ...buildCommentPanelTextLines(theme, width, "Use Enter/m modify, c comment, d discuss for a line or range, l for file, or a for all lines in the current file.", "dim"),
   ];
+}
+
+export function buildContextPanelLines(theme: Theme, width: number, text: string): string[] {
+  const contentWidth = Math.max(1, width - 2);
+  const lines: string[] = [];
+  for (const rawLine of text.split(/\r?\n/)) {
+    const line = sanitizeTerminalText(rawLine).trim();
+    if (line.length === 0) {
+      lines.push("");
+      continue;
+    }
+    if (/^[A-Za-z][A-Za-z ]{1,32}:$/.test(line)) {
+      pushWrappedAnsiText(lines, theme.fg("warning", line), contentWidth);
+      continue;
+    }
+    pushWrappedText(lines, theme, line, contentWidth, "muted");
+  }
+  return lines;
 }
 
 export function buildDiffActionHintLine(theme: Theme, width: number): string {
@@ -968,6 +1035,7 @@ class ReviewApp {
   private navigatorScroll = 0;
   private diffScroll = 0;
   private commentsScroll = 0;
+  private contextPanelState: ContextPanelState = { status: "idle" };
   private navigatorPageSize = 1;
   private diffPageSize = 1;
   private commentsPageSize = 1;
@@ -1016,6 +1084,7 @@ class ReviewApp {
 
     queueMicrotask(() => {
       this.ensureActiveEntry();
+      this.ensureContextPanel();
       this.requestRender();
     });
   }
@@ -1044,6 +1113,26 @@ class ReviewApp {
     if (typeof this.tui.requestRender === "function") {
       this.tui.requestRender();
     }
+  }
+
+  private ensureContextPanel(): void {
+    const source = this.options.contextPanelSource;
+    if (source == null || this.contextPanelState.status !== "idle") return;
+
+    this.contextPanelState = { status: "loading" };
+    this.requestRender();
+    void source.load().then((text) => {
+      this.contextPanelState = { status: "ready", text: sanitizeTerminalText(text) };
+      this.requestRender();
+    }).catch((error: unknown) => {
+      const message = error instanceof Error ? error.message : String(error);
+      this.contextPanelState = { status: "error", error: sanitizeTerminalText(message) };
+      this.requestRender();
+    });
+  }
+
+  private hasContextPanel(): boolean {
+    return this.options.contextPanelSource != null && !this.commentsHidden;
   }
 
   private writeTerminal(data: string): void {
@@ -2520,6 +2609,26 @@ class ReviewApp {
       .map((line) => this.theme.bg("toolPendingBg", line));
   }
 
+  private renderContextPanel(width: number, height: number): string[] {
+    const source = this.options.contextPanelSource;
+    const lines: string[] = [];
+    if (source == null) return renderBox("PR context", width, height, this.theme, lines, false);
+
+    if (this.contextPanelState.status === "idle" || this.contextPanelState.status === "loading") {
+      lines.push(this.theme.fg("muted", source.loadingText));
+      return renderBox(source.title, width, height, this.theme, lines, false);
+    }
+
+    if (this.contextPanelState.status === "error") {
+      lines.push(this.theme.fg("error", "Could not load PR context."));
+      pushWrappedText(lines, this.theme, this.contextPanelState.error, Math.max(1, width - 2), "muted");
+      return renderBox(source.title, width, height, this.theme, lines, false);
+    }
+
+    lines.push(...buildContextPanelLines(this.theme, width, this.contextPanelState.text));
+    return renderBox(source.title, width, height, this.theme, lines, false);
+  }
+
   private renderComments(width: number, height: number): string[] {
     const file = this.activeFile();
     const lines: string[] = [];
@@ -2658,7 +2767,8 @@ class ReviewApp {
     const frameInnerHeight = Math.max(10, totalHeight - 2 - MODAL_INNER_PADDING_Y * 2);
 
     const stackPanes = shouldStackPanes(frameInnerWidth);
-    const bodyHeight = Math.max(stackPanes && !this.commentsHidden ? 9 : 6, frameInnerHeight - 5);
+    const contextVisible = this.hasContextPanel();
+    const bodyHeight = Math.max(stackPanes && !this.commentsHidden ? (contextVisible ? 12 : 9) : 6, frameInnerHeight - 5);
     const terminalCols = this.tui?.terminal?.columns ?? this.lastWidth;
     const overlayOriginCol = Math.max(0, Math.floor((terminalCols - this.lastWidth) / 2));
     const overlayOriginRow = Math.max(0, Math.floor((terminalRows - totalHeight) / 2));
@@ -2691,7 +2801,7 @@ class ReviewApp {
     const body: string[] = [];
 
     if (stackPanes) {
-      const { navigatorHeight, diffHeight, commentsHeight } = getStackedPaneLayout(bodyHeight, this.commentsHidden);
+      const { navigatorHeight, diffHeight, commentsHeight, contextHeight } = getStackedPaneLayoutWithContext(bodyHeight, this.commentsHidden, contextVisible);
       const paneLeft = contentLeft;
       const paneRight = contentLeft + frameInnerWidth - 1;
       const navigatorTop = bodyTop;
@@ -2706,8 +2816,9 @@ class ReviewApp {
       body.push(...this.renderNavigator(frameInnerWidth, navigatorHeight));
       body.push(...this.renderDiff(frameInnerWidth, diffHeight));
       if (!this.commentsHidden) body.push(...this.renderComments(frameInnerWidth, commentsHeight));
+      if (contextVisible) body.push(...this.renderContextPanel(frameInnerWidth, contextHeight));
     } else {
-      const { navigatorWidth, diffWidth, commentsWidth } = getPaneLayout(frameInnerWidth, this.commentsHidden);
+      const { navigatorWidth, diffWidth, commentsWidth, contextWidth } = getPaneLayoutWithContext(frameInnerWidth, this.commentsHidden, contextVisible);
       const diffLeft = contentLeft + navigatorWidth + 1;
       const commentsLeft = this.commentsHidden ? null : diffLeft + diffWidth + 1;
       this.mousePaneLayout = {
@@ -2719,11 +2830,14 @@ class ReviewApp {
       const navigator = this.renderNavigator(navigatorWidth, bodyHeight);
       const diff = this.renderDiff(diffWidth, bodyHeight);
       const comments = this.commentsHidden ? [] : this.renderComments(commentsWidth, bodyHeight);
+      const context = contextVisible ? this.renderContextPanel(contextWidth, bodyHeight) : [];
 
       for (let i = 0; i < bodyHeight; i += 1) {
         body.push(this.commentsHidden
           ? `${navigator[i] ?? ""} ${diff[i] ?? ""}`
-          : `${navigator[i] ?? ""} ${diff[i] ?? ""} ${comments[i] ?? ""}`);
+          : contextVisible
+            ? `${navigator[i] ?? ""} ${diff[i] ?? ""} ${comments[i] ?? ""} ${context[i] ?? ""}`
+            : `${navigator[i] ?? ""} ${diff[i] ?? ""} ${comments[i] ?? ""}`);
       }
     }
 

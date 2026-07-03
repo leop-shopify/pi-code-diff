@@ -34,6 +34,12 @@ export interface ReviewFileContents {
   modifiedContent: string;
 }
 
+export interface ReviewContextPanelSource {
+  title: string;
+  loadingText: string;
+  load: () => Promise<string>;
+}
+
 export type CommentSide = "added" | "deleted" | "file";
 
 export type CommentIntent = "discuss" | "comment" | "modify";
