@@ -1,3 +1,6 @@
+import { statSync } from "node:fs";
+import { homedir } from "node:os";
+import { isAbsolute, resolve as resolvePath } from "node:path";
 import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth, type Component, type TUI } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
@@ -34,6 +37,30 @@ interface ReviewRunStatus {
 
 const MODE_VALUES = new Set(["working", "staged", "branch", "custom"]);
 
+function expandHomePath(path: string): string {
+  if (path === "~") return homedir();
+  if (path.startsWith("~/")) return resolvePath(homedir(), path.slice(2));
+  return path;
+}
+
+function normalizeReviewCwd(cwd: string, fallbackCwd: string): string {
+  const expandedCwd = expandHomePath(cwd);
+  if (isAbsolute(expandedCwd)) return resolvePath(expandedCwd);
+
+  const expandedFallback = expandHomePath(fallbackCwd);
+  const baseCwd = isAbsolute(expandedFallback) ? expandedFallback : resolvePath(expandedFallback);
+  return resolvePath(baseCwd, expandedCwd);
+}
+
+function resolveLocalReviewCwdArg(arg: string, fallbackCwd: string): string | null {
+  const reviewCwd = normalizeReviewCwd(arg, fallbackCwd);
+  try {
+    return statSync(reviewCwd).isDirectory() ? reviewCwd : null;
+  } catch {
+    return null;
+  }
+}
+
 function parseInteractiveReviewArgs(args: string): InteractiveReviewParams {
   const tokens = args.trim().split(/\s+/).filter(Boolean);
   const params: InteractiveReviewParams = {};
@@ -54,6 +81,7 @@ function parseInteractiveReviewArgs(args: string): InteractiveReviewParams {
     else if (token === "--project") params.project = next();
     else if (token === "--remote") params.remote = next();
     else if (token === "--cwd") params.cwd = next();
+    else if (token.startsWith("--cwd=")) params.cwd = token.slice("--cwd=".length);
     else if (token === "--include-generated") params.includeGenerated = true;
   }
 
@@ -282,11 +310,13 @@ export default function codeDiffExtension(pi: ExtensionAPI) {
   }
 
   async function openReview(ctx: ExtensionContext, cwd = ctx.cwd, comments?: SeedReviewComment[]): Promise<ReviewRunStatus> {
-    return openReviewData(ctx, await getReviewWindowData(pi, cwd), undefined, comments);
+    const reviewCwd = normalizeReviewCwd(cwd, ctx.cwd);
+    return openReviewData(ctx, await getReviewWindowData(pi, reviewCwd), undefined, comments);
   }
 
   async function runInteractiveReview(params: InteractiveReviewParams, ctx: ExtensionContext, fallbackCwd = ctx.cwd, comments?: SeedReviewComment[]): Promise<ReviewRunStatus> {
     if (!ctx.hasUI) return { started: false, message: "Interactive review requires a TUI session." };
+    const reviewCwd = params.cwd == null ? undefined : normalizeReviewCwd(params.cwd, fallbackCwd);
     if (params.resume != null) return unsupported("Resume support is being ported into pi-code-diff next.", ctx);
     if (params.tree != null || params.branch != null || params.project != null) return unsupported("Tree, branch, and project resolution are being ported into pi-code-diff next.", ctx);
     if (params.mode === "staged") return unsupported("Staged diff mode is being ported into pi-code-diff next.", ctx);
@@ -294,7 +324,7 @@ export default function codeDiffExtension(pi: ExtensionAPI) {
     if (params.remote != null) {
       try {
         const reportProgress = (message: string) => setRemoteProgress(ctx, message);
-        const target = await resolveRemoteReviewTarget(pi, fallbackCwd, params.remote, params.cwd, reportProgress);
+        const target = await resolveRemoteReviewTarget(pi, fallbackCwd, params.remote, reviewCwd, reportProgress);
         reportProgress(`Preparing diff for ${target.repo ?? target.branch}…`);
         const data = await getReviewWindowDataForRevisionRange(pi, target.gitRoot, target.baseRef, target.headRef);
         setRemoteProgress(ctx, undefined);
@@ -312,17 +342,18 @@ export default function codeDiffExtension(pi: ExtensionAPI) {
       if (range == null || !range.includes("..")) return unsupported("Custom review requires a ref range like base..head.", ctx);
       const [baseRef, headRef] = range.split(/\.\.\.?/, 2);
       if (baseRef == null || headRef == null || baseRef.length === 0 || headRef.length === 0) return unsupported("Custom review requires a ref range like base..head.", ctx);
-      return openReviewData(ctx, await getReviewWindowDataForRevisionRange(pi, params.cwd ?? fallbackCwd, baseRef, headRef), undefined, comments);
+      return openReviewData(ctx, await getReviewWindowDataForRevisionRange(pi, reviewCwd ?? fallbackCwd, baseRef, headRef), undefined, comments);
     }
 
-    return openReview(ctx, params.cwd ?? fallbackCwd, comments);
+    return openReview(ctx, reviewCwd ?? fallbackCwd, comments);
   }
 
   async function runDiff(args: string, ctx: ExtensionContext, cwd = ctx.cwd, comments?: SeedReviewComment[]): Promise<ReviewRunStatus> {
     if (!ctx.hasUI) return { started: false, message: "Interactive review requires a TUI session." };
 
+    const fallbackCwd = normalizeReviewCwd(cwd, ctx.cwd);
     const trimmed = args.trim();
-    if (trimmed.length === 0) return openReview(ctx, cwd, comments);
+    if (trimmed.length === 0) return openReview(ctx, fallbackCwd, comments);
 
     const tokens = trimmed.split(/\s+/);
     const firstToken = tokens[0]!;
@@ -330,16 +361,20 @@ export default function codeDiffExtension(pi: ExtensionAPI) {
     if (firstToken.toLowerCase() === "remote") {
       const target = trimmed.slice(firstToken.length).trim();
       if (target.length === 0) return unsupported("Usage: /diff remote <url | branch>", ctx);
-      return runInteractiveReview({ remote: target }, ctx, cwd, comments);
+      return runInteractiveReview({ remote: target }, ctx, fallbackCwd, comments);
     }
 
     if (trimmed.startsWith("-") || MODE_VALUES.has(firstToken)) {
-      return runInteractiveReview(parseInteractiveReviewArgs(trimmed), ctx, cwd, comments);
+      return runInteractiveReview(parseInteractiveReviewArgs(trimmed), ctx, fallbackCwd, comments);
     }
+
+    const localCwd = resolveLocalReviewCwdArg(trimmed, fallbackCwd);
+    if (localCwd != null) return openReview(ctx, localCwd, comments);
+
     if (trimmed.includes("..")) {
-      return runInteractiveReview({ mode: "custom", ref: trimmed }, ctx, cwd, comments);
+      return runInteractiveReview({ mode: "custom", ref: trimmed }, ctx, fallbackCwd, comments);
     }
-    return runInteractiveReview({ remote: trimmed }, ctx, cwd, comments);
+    return runInteractiveReview({ remote: trimmed }, ctx, fallbackCwd, comments);
   }
 
   function formatOpenCodeDiffToolText(status: ReviewRunStatus, args: string, cwd: string): string {
@@ -416,7 +451,7 @@ export default function codeDiffExtension(pi: ExtensionAPI) {
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const input = params as { args?: string; cwd?: string; comments?: SeedReviewComment[] };
       const args = input.args ?? "";
-      const cwd = input.cwd ?? ctx.cwd;
+      const cwd = normalizeReviewCwd(input.cwd ?? ctx.cwd, ctx.cwd);
 
       if (reviewRunInFlight || activeReview) {
         const message = "A review session is already open.";

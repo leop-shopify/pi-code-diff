@@ -119,6 +119,53 @@ export function parseUntrackedPaths(output: string): ChangedPath[] {
     .map((path) => ({ status: "added" as const, oldPath: null, newPath: path }));
 }
 
+export function parseStatusPorcelain(output: string): ChangedPath[] {
+  const entries = output.split("\0");
+  const changes: ChangedPath[] = [];
+
+  for (let index = 0; index < entries.length; index += 1) {
+    const entry = entries[index];
+    if (entry == null || entry.length < 4) continue;
+
+    const indexStatus = entry[0] ?? " ";
+    const worktreeStatus = entry[1] ?? " ";
+    const path = entry.slice(3);
+    if (path.length === 0 || (indexStatus === "!" && worktreeStatus === "!")) continue;
+
+    if (indexStatus === "?" && worktreeStatus === "?") {
+      changes.push({ status: "added", oldPath: null, newPath: path });
+      continue;
+    }
+
+    if (indexStatus === "R" || worktreeStatus === "R") {
+      const oldPath = entries[index + 1] ?? null;
+      if (oldPath != null && oldPath.length > 0) {
+        changes.push({ status: "renamed", oldPath, newPath: path });
+        index += 1;
+      } else {
+        changes.push({ status: "modified", oldPath: path, newPath: path });
+      }
+      continue;
+    }
+
+    if (indexStatus === "C" || worktreeStatus === "C" || indexStatus === "A" || worktreeStatus === "A") {
+      changes.push({ status: "added", oldPath: null, newPath: path });
+      continue;
+    }
+
+    if (indexStatus === "D" || worktreeStatus === "D") {
+      changes.push({ status: "deleted", oldPath: path, newPath: null });
+      continue;
+    }
+
+    if (indexStatus !== " " || worktreeStatus !== " ") {
+      changes.push({ status: "modified", oldPath: path, newPath: path });
+    }
+  }
+
+  return changes;
+}
+
 function parseTrackedPaths(output: string): string[] {
   return output
     .split(/\r?\n/)
@@ -134,6 +181,31 @@ export function mergeChangedPaths(tracked: ChangedPath[], untracked: ChangedPath
     const key = `${change.status}:${change.oldPath ?? ""}:${change.newPath ?? ""}`;
     if (seen.has(key)) continue;
     seen.add(key);
+    merged.push(change);
+  }
+
+  return merged;
+}
+
+function getChangedPathCoverage(changes: ChangedPath[]): Set<string> {
+  const paths = new Set<string>();
+  for (const change of changes) {
+    if (change.oldPath != null) paths.add(normalizeGitPath(change.oldPath));
+    if (change.newPath != null) paths.add(normalizeGitPath(change.newPath));
+  }
+  return paths;
+}
+
+function mergeMissingChangedPaths(primary: ChangedPath[], supplemental: ChangedPath[]): ChangedPath[] {
+  const coveredPaths = getChangedPathCoverage(primary);
+  const merged = [...primary];
+
+  for (const change of supplemental) {
+    const paths = [change.oldPath, change.newPath]
+      .filter((path): path is string => path != null)
+      .map(normalizeGitPath);
+    if (paths.length === 0 || paths.every((path) => coveredPaths.has(path))) continue;
+    for (const path of paths) coveredPaths.add(path);
     merged.push(change);
   }
 
@@ -434,6 +506,19 @@ function compareReviewFiles(a: ReviewFile, b: ReviewFile): number {
   return a.path.localeCompare(b.path);
 }
 
+function getLocalReviewLimitRank(file: ReviewFile): number {
+  if (file.inGitDiff) return 0;
+  if (file.inLastCommit) return 1;
+  if (file.inAllFiles) return 2;
+  return 3;
+}
+
+function compareLocalReviewFilesForLimit(a: ReviewFile, b: ReviewFile): number {
+  const scopeDelta = getLocalReviewLimitRank(a) - getLocalReviewLimitRank(b);
+  if (scopeDelta !== 0) return scopeDelta;
+  return compareReviewFiles(a, b);
+}
+
 function upsertSeed(seeds: Map<string, ReviewFileSeed>, key: string, create: () => ReviewFileSeed): ReviewFileSeed {
   const existing = seeds.get(key);
   if (existing != null) return existing;
@@ -560,6 +645,7 @@ export async function getReviewWindowData(pi: ExtensionAPI, cwd: string): Promis
     ? await runGitAllowFailure(pi, repoRoot, ["diff", "--find-renames", "-M", "--numstat", "HEAD", "--"])
     : "";
   const untrackedOutput = await runGitAllowFailure(pi, repoRoot, ["ls-files", "--others", "--exclude-standard"]);
+  const statusOutput = await runGitAllowFailure(pi, repoRoot, ["status", "--porcelain=v1", "-z", "--untracked-files=all"]);
   const trackedFilesOutput = await runGitAllowFailure(pi, repoRoot, ["ls-files", "--cached"]);
   const deletedFilesOutput = await runGitAllowFailure(pi, repoRoot, ["ls-files", "--deleted"]);
   const lastCommitOutput = repositoryHasHead
@@ -576,19 +662,23 @@ export async function getReviewWindowData(pi: ExtensionAPI, cwd: string): Promis
     ? ""
     : await runGitAllowFailure(pi, repoRoot, ["diff", "--find-renames", "-M", "--numstat", branchBaseRevision, "HEAD", "--"]);
 
-  const untrackedChanges = limitReviewItems(parseUntrackedPaths(untrackedOutput));
+  const untrackedChanges = parseUntrackedPaths(untrackedOutput);
+  const statusChanges = parseStatusPorcelain(statusOutput);
+  const diffChanges = mergeChangedPaths(parseNameStatus(trackedDiffOutput), untrackedChanges);
+  const localChanges = statusChanges.length > 0 ? mergeMissingChangedPaths(statusChanges, diffChanges) : diffChanges;
+  const lastCommitStats = parseNumStat(lastCommitNumStatOutput);
+  const branchStats = parseNumStat(branchNumStatOutput);
+  const worktreeChanges = limitReviewItems(localChanges
+    .filter((change) => isReviewableFilePath(change.newPath ?? change.oldPath ?? "")));
   const worktreeStats = parseNumStat(worktreeNumStatOutput);
-  await Promise.all(untrackedChanges.map(async (change) => {
-    if (change.newPath == null) return;
+  await Promise.all(worktreeChanges.map(async (change) => {
+    if (change.oldPath != null || change.newPath == null || worktreeStats.has(normalizeGitPath(change.newPath))) return;
     const content = await getWorkingTreeContent(repoRoot, change.newPath);
     worktreeStats.set(normalizeGitPath(change.newPath), { additions: countContentLines(content), deletions: 0 });
   }));
-  const lastCommitStats = parseNumStat(lastCommitNumStatOutput);
-  const branchStats = parseNumStat(branchNumStatOutput);
-  const worktreeChanges = limitReviewItems(mergeChangedPaths(parseNameStatus(trackedDiffOutput), untrackedChanges)
-    .filter((change) => isReviewableFilePath(change.newPath ?? change.oldPath ?? "")));
   const deletedPaths = new Set(parseTrackedPaths(deletedFilesOutput));
-  const currentPaths = limitReviewItems(uniquePaths([...parseTrackedPaths(trackedFilesOutput), ...parseTrackedPaths(untrackedOutput)])
+  const statusCurrentPaths = statusChanges.flatMap((change) => (change.newPath == null ? [] : [change.newPath]));
+  const currentPaths = limitReviewItems(uniquePaths([...parseTrackedPaths(trackedFilesOutput), ...parseTrackedPaths(untrackedOutput), ...statusCurrentPaths])
     .filter((path) => !deletedPaths.has(path))
     .filter(isReviewableFilePath));
   const currentPathSet = new Set(currentPaths);
@@ -639,7 +729,7 @@ export async function getReviewWindowData(pi: ExtensionAPI, cwd: string): Promis
     }
   }
 
-  const files = limitReviewItems([...seeds.values()].map(createReviewFile).sort(compareReviewFiles));
+  const files = limitReviewItems([...seeds.values()].map(createReviewFile).sort(compareLocalReviewFilesForLimit));
   return { repoRoot, files, branchBaseRevision, visibleScopes: ["git-diff", "last-commit"] };
 }
 
