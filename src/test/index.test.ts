@@ -1,3 +1,6 @@
+import { mkdtemp } from "node:fs/promises";
+import { homedir, tmpdir } from "node:os";
+import { join } from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const mocks = vi.hoisted(() => ({
@@ -169,7 +172,8 @@ describe("code diff extension", () => {
       lastCommit: null,
       allFiles: null,
     }];
-    mocks.getReviewWindowData.mockResolvedValue({ repoRoot: "/custom-repo", files, branchBaseRevision: null, modifiedRevision: undefined, visibleScopes: ["git-diff"] });
+    const expandedCwd = join(homedir(), "custom-repo");
+    mocks.getReviewWindowData.mockResolvedValue({ repoRoot: expandedCwd, files, branchBaseRevision: null, modifiedRevision: undefined, visibleScopes: ["git-diff"] });
     mocks.runReviewApp.mockResolvedValue({ type: "submit", allComment: "", allIntent: "discuss", comments: [] });
     mocks.composeReviewPrompt.mockReturnValue("generated review prompt");
     const pi = {
@@ -189,12 +193,12 @@ describe("code diff extension", () => {
     };
 
     codeDiffExtension(pi as never);
-    const result = await tools.get("open_code_diff").execute("tool-call", { args: "", cwd: "/custom-repo" }, new AbortController().signal, vi.fn(), ctx);
+    const result = await tools.get("open_code_diff").execute("tool-call", { args: "", cwd: "~/custom-repo" }, new AbortController().signal, vi.fn(), ctx);
 
-    expect(mocks.getReviewWindowData).toHaveBeenCalledWith(pi, "/custom-repo");
+    expect(mocks.getReviewWindowData).toHaveBeenCalledWith(pi, expandedCwd);
     expect(mocks.runReviewApp).toHaveBeenCalled();
     expect(ctx.ui.setEditorText).toHaveBeenCalledWith("generated review prompt");
-    expect(result.details).toMatchObject({ started: true, args: "", cwd: "/custom-repo", prompt: "generated review prompt" });
+    expect(result.details).toMatchObject({ started: true, args: "", cwd: expandedCwd, prompt: "generated review prompt" });
     expect(result.content[0].text).toContain("local working-tree/uncommitted changes");
     expect(result.content[0].text).toContain("generated review prompt");
   });
@@ -334,6 +338,85 @@ describe("code diff extension", () => {
     await vi.waitFor(() => expect(mocks.runReviewApp).toHaveBeenCalled());
 
     expect(mocks.runReviewApp).toHaveBeenCalledWith(ctx, expect.objectContaining({ seedComments: [] }));
+  });
+
+  it("expands --cwd for the diff command", async () => {
+    const commands = new Map<string, { handler: (args: string, ctx: any) => Promise<void> }>();
+    const expandedCwd = join(homedir(), "Poetry/rpgmenace");
+    const files = [{
+      id: "app/admin/dashboard.rb::working::::",
+      path: "app/admin/dashboard.rb",
+      worktreeStatus: "modified",
+      hasWorkingTreeFile: true,
+      inGitDiff: true,
+      inLastCommit: false,
+      inAllFiles: false,
+      gitDiff: { status: "modified", oldPath: "app/admin/dashboard.rb", newPath: "app/admin/dashboard.rb", displayPath: "app/admin/dashboard.rb", hasOriginal: true, hasModified: true },
+      lastCommit: null,
+      allFiles: null,
+    }];
+    mocks.getReviewWindowData.mockResolvedValue({ repoRoot: expandedCwd, files, branchBaseRevision: null, modifiedRevision: undefined, visibleScopes: ["git-diff"] });
+    mocks.runReviewApp.mockResolvedValue({ type: "submit", allComment: "", allIntent: "discuss", comments: [] });
+    mocks.composeReviewPrompt.mockReturnValue("generated review prompt");
+    const pi = {
+      registerCommand: vi.fn((name: string, command) => commands.set(name, command)),
+      registerTool: vi.fn(),
+      registerShortcut: vi.fn(),
+      on: vi.fn(),
+    };
+    const ctx = {
+      hasUI: true,
+      cwd: "/repo",
+      ui: {
+        notify: vi.fn(),
+        setWidget: vi.fn(),
+        setEditorText: vi.fn(),
+      },
+    };
+
+    codeDiffExtension(pi as never);
+    await commands.get("diff")!.handler("--cwd ~/Poetry/rpgmenace", ctx);
+    await vi.waitFor(() => expect(mocks.getReviewWindowData).toHaveBeenCalledWith(pi, expandedCwd));
+  });
+
+  it("treats a bare existing local directory as the diff cwd", async () => {
+    const commands = new Map<string, { handler: (args: string, ctx: any) => Promise<void> }>();
+    const localRepo = await mkdtemp(join(tmpdir(), "pi-code-diff-local-"));
+    const files = [{
+      id: "src/app.ts::working::::",
+      path: "src/app.ts",
+      worktreeStatus: "modified",
+      hasWorkingTreeFile: true,
+      inGitDiff: true,
+      inLastCommit: false,
+      inAllFiles: false,
+      gitDiff: { status: "modified", oldPath: "src/app.ts", newPath: "src/app.ts", displayPath: "src/app.ts", hasOriginal: true, hasModified: true },
+      lastCommit: null,
+      allFiles: null,
+    }];
+    mocks.getReviewWindowData.mockResolvedValue({ repoRoot: localRepo, files, branchBaseRevision: null, modifiedRevision: undefined, visibleScopes: ["git-diff"] });
+    mocks.runReviewApp.mockResolvedValue({ type: "submit", allComment: "", allIntent: "discuss", comments: [] });
+    mocks.composeReviewPrompt.mockReturnValue("generated review prompt");
+    const pi = {
+      registerCommand: vi.fn((name: string, command) => commands.set(name, command)),
+      registerTool: vi.fn(),
+      registerShortcut: vi.fn(),
+      on: vi.fn(),
+    };
+    const ctx = {
+      hasUI: true,
+      cwd: "/repo",
+      ui: {
+        notify: vi.fn(),
+        setWidget: vi.fn(),
+        setEditorText: vi.fn(),
+      },
+    };
+
+    codeDiffExtension(pi as never);
+    await commands.get("diff")!.handler(localRepo, ctx);
+    await vi.waitFor(() => expect(mocks.getReviewWindowData).toHaveBeenCalledWith(pi, localRepo));
+    expect(mocks.getReviewWindowDataForRevisionRange).not.toHaveBeenCalled();
   });
 
   it("does not block the diff command while review data loads", async () => {

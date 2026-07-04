@@ -2,7 +2,7 @@ import { mkdir, mkdtemp, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
-import { getBranchBaseRef, getChangedFileReferenceCounts, getChangedFileReferenceGraph, getWorkingTreeContent, isPathInside, isReviewFileSizeAllowed, isReviewableFilePath, limitReviewItems, MAX_REVIEW_FILE_BYTES, MAX_REVIEW_FILE_COUNT, mergeChangedPaths, parseLocalBranchRefs, parseNameStatus, parseNumStat, parseUntrackedPaths, selectClosestAncestorBranch } from "../git.js";
+import { getBranchBaseRef, getChangedFileReferenceCounts, getChangedFileReferenceGraph, getReviewWindowData, getWorkingTreeContent, isPathInside, isReviewFileSizeAllowed, isReviewableFilePath, limitReviewItems, MAX_REVIEW_FILE_BYTES, MAX_REVIEW_FILE_COUNT, mergeChangedPaths, parseLocalBranchRefs, parseNameStatus, parseNumStat, parseStatusPorcelain, parseUntrackedPaths, selectClosestAncestorBranch } from "../git.js";
 
 describe("git helpers", () => {
   it("parses modified, added, deleted, and renamed files", () => {
@@ -39,6 +39,139 @@ describe("git helpers", () => {
       { status: "added", oldPath: null, newPath: "src/new.ts" },
       { status: "added", oldPath: null, newPath: "notes.md" },
     ]);
+  });
+
+  it("parses porcelain status entries for local worktree changes", () => {
+    const output = [
+      " M app/admin/dashboard.rb",
+      "M  app/models/game_play_session.rb",
+      "R  app/renamed.rb",
+      "app/old.rb",
+      " D app/views/games/play.html.erb",
+      "?? app/channels/game_play_channel.rb",
+      "?? test/javascript/controllers/game_play_heartbeat_controller_test.js",
+      "",
+    ].join("\0");
+
+    expect(parseStatusPorcelain(output)).toEqual([
+      { status: "modified", oldPath: "app/admin/dashboard.rb", newPath: "app/admin/dashboard.rb" },
+      { status: "modified", oldPath: "app/models/game_play_session.rb", newPath: "app/models/game_play_session.rb" },
+      { status: "renamed", oldPath: "app/old.rb", newPath: "app/renamed.rb" },
+      { status: "deleted", oldPath: "app/views/games/play.html.erb", newPath: null },
+      { status: "added", oldPath: null, newPath: "app/channels/game_play_channel.rb" },
+      { status: "added", oldPath: null, newPath: "test/javascript/controllers/game_play_heartbeat_controller_test.js" },
+    ]);
+  });
+
+  it("keeps every git status file in the git diff scope when branch comparison is huge", async () => {
+    const modifiedFiles = [
+      "app/admin/dashboard.rb",
+      "app/assets/stylesheets/base.scss",
+      "app/assets/stylesheets/mobile.scss",
+      "app/javascript/controllers/application.js",
+      "app/models/game_play_session.rb",
+      "app/views/games/play.html.erb",
+      "config/locales/backend.en.yml",
+      "config/locales/backend.pt-BR.yml",
+      "test/controllers/admin/irc_admin_test.rb",
+    ];
+    const untrackedFiles = [
+      "app/channels/game_play_channel.rb",
+      "app/javascript/controllers/game_play_heartbeat_controller.js",
+      "test/channels/game_play_channel_test.rb",
+      "test/javascript/controllers/game_play_heartbeat_controller_test.js",
+    ];
+    const statusOutput = [
+      ...modifiedFiles.map((path) => ` M ${path}`),
+      ...untrackedFiles.map((path) => `?? ${path}`),
+      "",
+    ].join("\0");
+    const trackedFiles = modifiedFiles.join("\n");
+    const untrackedOutput = untrackedFiles.join("\n");
+    const partialDiffOutput = [
+      "M\tapp/admin/dashboard.rb",
+      "M\tapp/assets/stylesheets/base.scss",
+      "M\tapp/assets/stylesheets/mobile.scss",
+      "A\tapp/channels/game_play_channel.rb",
+    ].join("\n");
+    const numStatOutput = [
+      "275\t206\tapp/admin/dashboard.rb",
+      "7\t3\tapp/assets/stylesheets/base.scss",
+      "2\t0\tapp/assets/stylesheets/mobile.scss",
+    ].join("\n");
+    const branchOnlyFiles = Array.from({ length: MAX_REVIEW_FILE_COUNT }, (_, index) => `app/games/generated_${String(index).padStart(3, "0")}.rb`);
+    const branchDiffOutput = branchOnlyFiles.map((path) => `A\t${path}`).join("\n");
+    const branchNumStatOutput = branchOnlyFiles.map((path) => `1\t0\t${path}`).join("\n");
+    const exec = vi.fn(async (_command: string, args: string[]) => {
+      const key = args.join(" ");
+      if (key === "rev-parse --show-toplevel") return { code: 0, stdout: "/repo\n", stderr: "" };
+      if (key === "rev-parse --verify HEAD") return { code: 0, stdout: "abc123\n", stderr: "" };
+      if (key === "diff --find-renames -M --name-status HEAD --") return { code: 0, stdout: partialDiffOutput, stderr: "" };
+      if (key === "diff --find-renames -M --numstat HEAD --") return { code: 0, stdout: numStatOutput, stderr: "" };
+      if (key === "ls-files --others --exclude-standard") return { code: 0, stdout: untrackedOutput, stderr: "" };
+      if (key === "status --porcelain=v1 -z --untracked-files=all") return { code: 0, stdout: statusOutput, stderr: "" };
+      if (key === "ls-files --cached") return { code: 0, stdout: trackedFiles, stderr: "" };
+      if (key === "ls-files --deleted") return { code: 0, stdout: "", stderr: "" };
+      if (key.startsWith("diff-tree ")) return { code: 0, stdout: "", stderr: "" };
+      if (key === "branch --show-current") return { code: 0, stdout: "feature\n", stderr: "" };
+      if (key === "for-each-ref --format=%(refname:short)%09%(objectname) refs/heads") return { code: 0, stdout: "main\tabc123\nfeature\tdef456\n", stderr: "" };
+      if (key === "merge-base --is-ancestor main HEAD") return { code: 0, stdout: "", stderr: "" };
+      if (key === "rev-list --count main..HEAD") return { code: 0, stdout: "1\n", stderr: "" };
+      if (key === "merge-base main HEAD") return { code: 0, stdout: "base123\n", stderr: "" };
+      if (key === "diff --find-renames -M --name-status base123 HEAD --") return { code: 0, stdout: branchDiffOutput, stderr: "" };
+      if (key === "diff --find-renames -M --numstat base123 HEAD --") return { code: 0, stdout: branchNumStatOutput, stderr: "" };
+      if (key.startsWith("symbolic-ref ")) return { code: 1, stdout: "", stderr: "" };
+      if (key.startsWith("rev-parse --verify --quiet ")) return { code: 1, stdout: "", stderr: "" };
+      return { code: 1, stdout: "", stderr: `unexpected command: ${key}` };
+    });
+
+    const data = await getReviewWindowData({ exec } as never, "/repo");
+
+    expect(data.files.filter((file) => file.inGitDiff).map((file) => file.path)).toEqual([
+      "app/admin/dashboard.rb",
+      "app/assets/stylesheets/base.scss",
+      "app/assets/stylesheets/mobile.scss",
+      "app/channels/game_play_channel.rb",
+      "app/javascript/controllers/application.js",
+      "app/javascript/controllers/game_play_heartbeat_controller.js",
+      "app/models/game_play_session.rb",
+      "app/views/games/play.html.erb",
+      "config/locales/backend.en.yml",
+      "config/locales/backend.pt-BR.yml",
+      "test/channels/game_play_channel_test.rb",
+      "test/controllers/admin/irc_admin_test.rb",
+      "test/javascript/controllers/game_play_heartbeat_controller_test.js",
+    ]);
+  });
+
+  it("keeps git diff files ahead of last commit files when limiting the local review list", async () => {
+    const currentPath = "zz/current_status_file.rb";
+    const lastCommitFiles = Array.from({ length: MAX_REVIEW_FILE_COUNT }, (_, index) => `aa/last_commit_${String(index).padStart(3, "0")}.rb`);
+    const lastCommitOutput = lastCommitFiles.map((path) => `A\t${path}`).join("\n");
+    const lastCommitNumStatOutput = lastCommitFiles.map((path) => `1\t0\t${path}`).join("\n");
+    const exec = vi.fn(async (_command: string, args: string[]) => {
+      const key = args.join(" ");
+      if (key === "rev-parse --show-toplevel") return { code: 0, stdout: "/repo\n", stderr: "" };
+      if (key === "rev-parse --verify HEAD") return { code: 0, stdout: "abc123\n", stderr: "" };
+      if (key === "diff --find-renames -M --name-status HEAD --") return { code: 0, stdout: `M\t${currentPath}\n`, stderr: "" };
+      if (key === "diff --find-renames -M --numstat HEAD --") return { code: 0, stdout: `3\t1\t${currentPath}\n`, stderr: "" };
+      if (key === "status --porcelain=v1 -z --untracked-files=all") return { code: 0, stdout: ` M ${currentPath}\0`, stderr: "" };
+      if (key === "ls-files --others --exclude-standard") return { code: 0, stdout: "", stderr: "" };
+      if (key === "ls-files --cached") return { code: 0, stdout: `${currentPath}\n`, stderr: "" };
+      if (key === "ls-files --deleted") return { code: 0, stdout: "", stderr: "" };
+      if (key === "diff-tree --root --find-renames -M --name-status --no-commit-id -r HEAD") return { code: 0, stdout: lastCommitOutput, stderr: "" };
+      if (key === "diff-tree --root --find-renames -M --numstat --no-commit-id -r HEAD") return { code: 0, stdout: lastCommitNumStatOutput, stderr: "" };
+      if (key === "branch --show-current") return { code: 1, stdout: "", stderr: "" };
+      if (key.startsWith("symbolic-ref ")) return { code: 1, stdout: "", stderr: "" };
+      if (key.startsWith("rev-parse --verify --quiet ")) return { code: 1, stdout: "", stderr: "" };
+      return { code: 1, stdout: "", stderr: `unexpected command: ${key}` };
+    });
+
+    const data = await getReviewWindowData({ exec } as never, "/repo");
+
+    expect(data.files).toHaveLength(MAX_REVIEW_FILE_COUNT);
+    expect(data.files.some((file) => file.path === currentPath && file.inGitDiff)).toBe(true);
+    expect(data.files.filter((file) => file.inGitDiff).map((file) => file.path)).toEqual([currentPath]);
   });
 
   it("parses numstat additions and deletions", () => {
