@@ -206,14 +206,15 @@ describe("pane layout", () => {
     expect(shown.navigatorWidth).toBe(shown.commentsWidth);
   });
 
-  it("adds a wider remote context column by taking width from the diff pane", () => {
+  it("keeps remote comments narrow while PR context stays wider", () => {
     const local = getPaneLayoutWithContext(200, false, false);
     const remote = getPaneLayoutWithContext(200, false, true);
 
     expect(remote.navigatorWidth).toBeLessThanOrEqual(local.navigatorWidth);
-    expect(remote.contextWidth).toBe(remote.commentsWidth);
-    expect(remote.contextWidth).toBeGreaterThan(local.commentsWidth);
+    expect(remote.commentsWidth).toBe(remote.navigatorWidth);
+    expect(remote.contextWidth).toBeGreaterThan(remote.commentsWidth);
     expect(remote.diffWidth).toBeLessThan(local.diffWidth);
+    expect(remote).toMatchObject({ navigatorWidth: 32, commentsWidth: 32, contextWidth: 58, diffWidth: 75 });
     expect(remote.navigatorWidth + remote.diffWidth + remote.commentsWidth + remote.contextWidth + 3).toBe(200);
   });
 

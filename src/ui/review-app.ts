@@ -183,15 +183,16 @@ export function getPaneLayoutWithContext(frameInnerWidth: number, commentsHidden
   if (!contextVisible || commentsHidden) return { ...base, contextWidth: 0 };
 
   const navigatorWidth = Math.max(20, Math.min(32, base.navigatorWidth));
+  const commentsWidth = navigatorWidth;
   const minimumDiffWidth = 48;
-  const maximumSideWidth = 72;
-  const maximumReadableSideWidth = Math.floor((frameInnerWidth - navigatorWidth - minimumDiffWidth - 3) / 2);
-  const sideWidth = Math.max(24, Math.min(maximumSideWidth, maximumReadableSideWidth));
+  const maximumContextWidth = 72;
+  const maximumReadableContextWidth = Math.floor((frameInnerWidth - navigatorWidth - minimumDiffWidth - 3) / 2);
+  const contextWidth = Math.max(24, Math.min(maximumContextWidth, maximumReadableContextWidth));
   return {
     navigatorWidth,
-    commentsWidth: sideWidth,
-    contextWidth: sideWidth,
-    diffWidth: Math.max(24, frameInnerWidth - navigatorWidth - sideWidth * 2 - 3),
+    commentsWidth,
+    contextWidth,
+    diffWidth: Math.max(24, frameInnerWidth - navigatorWidth - commentsWidth - contextWidth - 3),
   };
 }
 
