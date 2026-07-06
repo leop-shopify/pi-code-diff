@@ -1,0 +1,41 @@
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { DEFAULT_REVIEW_PREFERENCES, loadReviewPreferences, saveReviewPreference } from "../preferences.js";
+
+const originalEnvPath = process.env.PI_CODE_DIFF_PREFERENCES_PATH;
+let tempDir: string;
+
+beforeEach(async () => {
+  tempDir = await mkdtemp(join(tmpdir(), "pi-code-diff-prefs-"));
+  process.env.PI_CODE_DIFF_PREFERENCES_PATH = join(tempDir, "code-diff-preferences.json");
+});
+
+afterEach(async () => {
+  if (originalEnvPath == null) delete process.env.PI_CODE_DIFF_PREFERENCES_PATH;
+  else process.env.PI_CODE_DIFF_PREFERENCES_PATH = originalEnvPath;
+  await rm(tempDir, { recursive: true, force: true });
+});
+
+describe("review preferences", () => {
+  it("returns defaults when no preferences file exists", () => {
+    expect(loadReviewPreferences()).toEqual(DEFAULT_REVIEW_PREFERENCES);
+  });
+
+  it("persists diff view mode across calls", () => {
+    saveReviewPreference({ diffViewMode: "side-by-side" });
+
+    expect(loadReviewPreferences().diffViewMode).toBe("side-by-side");
+
+    saveReviewPreference({ diffViewMode: "unified" });
+
+    expect(loadReviewPreferences().diffViewMode).toBe("unified");
+  });
+
+  it("ignores corrupted preference files and keeps defaults", async () => {
+    await writeFile(process.env.PI_CODE_DIFF_PREFERENCES_PATH!, "{ not valid json", "utf8");
+
+    expect(loadReviewPreferences()).toEqual(DEFAULT_REVIEW_PREFERENCES);
+  });
+});
