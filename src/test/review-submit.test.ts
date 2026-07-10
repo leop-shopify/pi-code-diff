@@ -48,6 +48,25 @@ describe("buildInlineComments", () => {
     ]);
   });
 
+  it("preserves exact modify whitespace in the generated suggestion", () => {
+    const files = [makeFile("src/a.ts", "src/a.ts")];
+    const [inline] = buildInlineComments(files, [
+      comment({
+        id: "1",
+        fileId: "src/a.ts",
+        side: "added",
+        intent: "modify",
+        startLine: 8,
+        endLine: 9,
+        originalText: "\told()  \r\n  child()",
+        body: "\tnew()  \r\n  child()  ",
+      }),
+    ]);
+
+    expect(inline?.body).toContain("- \told()  \n-   child()");
+    expect(inline?.body).toContain("+ \tnew()  \n+   child()  ");
+  });
+
   it("encodes a multi-line range with start_line and start_side", () => {
     const files = [makeFile("src/a.ts", "src/a.ts")];
     const inline = buildInlineComments(files, [

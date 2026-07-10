@@ -4,15 +4,18 @@ import { isAbsolute, resolve as resolvePath } from "node:path";
 import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth, type Component, type TUI } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import { getReviewWindowData, getReviewWindowDataForRevisionRange, loadReviewFileContents, type ReviewWindowData } from "./git.js";
+import { getReviewWindowData, getReviewWindowDataForRevisionRange, loadReviewFileContents, type ReviewWindowData, type ReviewWindowOptions } from "./git.js";
 import { composeReviewPrompt } from "./prompt.js";
 import { createRemotePullRequestSummarySource } from "./pr-summary.js";
+import { reviewGrammar, type GrammarReviewResult, type GrammarTextChange, type ReviewTextSet } from "./review-grammar.js";
+import { createReviewSessionId, deleteReviewSession, loadReviewSession, saveReviewSession } from "./review-session.js";
 import { formatPullRequestContext, resolveRemoteReviewTarget, type RemoteReviewTarget } from "./remote.js";
 import { buildInlineComments, buildReviewBody, submitPullRequestReview, type ReviewInlineComment, type ReviewVerdict } from "./review-submit.js";
 import { resolveSeedComments, type SeedReviewComment } from "./seed-comments.js";
+import { sanitizeTerminalText } from "./sanitize.js";
 import { loadCommentShortcuts } from "./shortcuts.js";
 import { runReviewApp } from "./ui/review-app.js";
-import type { ReviewSubmitPayload } from "./types.js";
+import { hasExactSubmoduleRange, type ReviewSubmitPayload } from "./types.js";
 
 type InteractiveReviewMode = "working" | "staged" | "branch" | "custom";
 
@@ -26,6 +29,8 @@ interface InteractiveReviewParams {
   remote?: string;
   cwd?: string;
   includeGenerated?: boolean;
+  wholeRepo?: boolean;
+  discardResume?: boolean;
 }
 
 interface ReviewRunStatus {
@@ -75,7 +80,11 @@ function parseInteractiveReviewArgs(args: string): InteractiveReviewParams {
     }
 
     if (token === "--ref" || token === "--custom") params.ref = next();
-    else if (token === "--resume") params.resume = next();
+    else if (token === "--resume") {
+      const candidate = tokens[index + 1];
+      params.resume = candidate != null && !candidate.startsWith("-") ? next() : "latest";
+    }
+    else if (token === "--discard-resume") params.discardResume = true;
     else if (token === "--tree") params.tree = next();
     else if (token === "--branch") params.branch = next();
     else if (token === "--project") params.project = next();
@@ -83,6 +92,7 @@ function parseInteractiveReviewArgs(args: string): InteractiveReviewParams {
     else if (token === "--cwd") params.cwd = next();
     else if (token.startsWith("--cwd=")) params.cwd = token.slice("--cwd=".length);
     else if (token === "--include-generated") params.includeGenerated = true;
+    else if (token === "--whole-repo") params.wholeRepo = true;
   }
 
   if (params.ref != null) params.mode = "custom";
@@ -153,27 +163,190 @@ export function composeReviewSubmissionPrompt(target: RemoteReviewTarget, verdic
     "- This is not a request to review, inspect, or understand the code. The user already selected the exact review locations.",
     "- Do not read files, search the repository, run commands, run tests, inspect diffs, open plans, create todos, or enter plan mode.",
     "- Do not change path, line, side, verdict, PR number, commit id, repo, cwd, author fields, or remove existing inline comments.",
-    "- Only use submit_pr_review after the user confirms the cleaned text.",
+    "- The review UI already captured the user's explicit confirmation of the exact verdict and original text.",
+    "- Grammar, spelling, capitalization, punctuation, and meaning-preserving syntax corrections are already authorized by the review UI and do not require another confirmation.",
+    "- Only a correction that may change meaning, intent, tone, technical substance, or requested scope requires exact per-item approval before submission.",
     "- Call submit_pr_review once with the full arguments below. The tool handles approval plus inline comments safely.",
     "",
     "Your job:",
     "1. Fix only grammar, spelling, capitalization, and punctuation in the review body and inline comment bodies. Do not change meaning.",
-    "2. Present each changed text item using this exact style, with one separate decision per item:",
+    "2. Compare every cleaned body/comment with its original and classify whether the correction preserves meaning, intent, tone, technical substance, and requested scope.",
+    "3. If every correction is limited to grammar, spelling, capitalization, punctuation, or meaning-preserving syntax and clarity, call submit_pr_review immediately with the cleaned arguments and do not ask for confirmation.",
+    "4. Ask only about text items whose correction may change meaning, intent, tone, technical substance, or requested scope. Present each such item using this exact style, with one separate decision per item:",
     "   Comment 1: <path>:<line-or-range> (<side>)",
     "   Original: <original text>",
     "   Fixed   : <fixed text>",
     "   Choices: Approve, Edit, Skip",
-    "3. Ask for decisions using the available local confirmation/asking tooling. If the current ask tool can queue multiple questions, batch the changed text items in one ask call with one separate question per item. If batching is unavailable, ask one item at a time. Do not collapse all decisions into one combined prompt.",
-    "4. For approved items, use the fixed text. For edited items, use the user's replacement text. For skipped items, remove that body/comment from the submission.",
-    "5. The user's Approve choice is the confirmation to submit that item. After the last item is approved, edited, or skipped, call submit_pr_review immediately with the arguments below, replacing only body/comment text with the approved or edited text and omitting skipped items. Do not ask for a second/final submission confirmation.",
-    `6. Do not approve this PR if the current GitHub user (${pr.authorLogin}) authored it; the tool refuses self-approval.`,
-    `7. After submit_pr_review succeeds, reply with the PR link and the short action summary returned by the tool. PR link: ${prUrl}`,
+    "5. Ask for decisions using the available local confirmation/asking tooling. If the current ask tool can queue multiple questions, batch the uncertain text items in one ask call with one separate question per item. If batching is unavailable, ask one item at a time. Do not collapse all decisions into one combined prompt.",
+    "6. Apply grammar-only corrections automatically. For approved uncertain items, use the fixed text. For edited items, use the user's replacement text. For skipped items, remove that body/comment from the submission.",
+    "7. The user's Approve choice is the confirmation to submit an uncertain item. After the last uncertain item is approved, edited, or skipped, call submit_pr_review immediately with the arguments below, applying automatic grammar-only corrections and replacing only uncertain body/comment text with the approved or edited text. Do not ask for a second/final submission confirmation.",
+    `8. Do not approve this PR if the current GitHub user (${pr.authorLogin}) authored it; the tool refuses self-approval.`,
+    `9. After submit_pr_review succeeds, reply with the PR link and the short action summary returned by the tool. PR link: ${prUrl}`,
     "",
     "submit_pr_review arguments:",
     "```json",
     JSON.stringify(args, null, 2),
     "```",
   ].join("\n");
+}
+
+const USE_CORRECTED_TEXT = "Use corrected text";
+const EDIT_CORRECTED_TEXT = "Edit corrected text";
+const KEEP_ORIGINAL_TEXT = "Keep original text";
+const REMOVE_REVIEW_ITEM = "Remove this review item";
+const CANCEL_REVIEW_SUBMISSION = "Cancel submission";
+
+function sendReviewFollowUp(pi: ExtensionAPI, ctx: ExtensionContext, message: string): void {
+  if (ctx.isIdle()) pi.sendUserMessage(message);
+  else pi.sendUserMessage(message, { deliverAs: "followUp" });
+}
+
+function getGrammarChangeLocation(change: GrammarTextChange, comments: ReviewInlineComment[]): string {
+  if (change.key === "body") return "Review body";
+  const index = Number.parseInt(change.key.slice("comment:".length), 10);
+  const comment = comments[index];
+  if (comment == null) return `Comment ${index + 1}`;
+  const range = comment.start_line == null || comment.start_line === comment.line
+    ? String(comment.line)
+    : `${comment.start_line}-${comment.line}`;
+  return `Comment ${index + 1}: ${comment.path}:${range} (${comment.side})`;
+}
+
+function setResolvedGrammarText(
+  change: GrammarTextChange,
+  value: string | undefined,
+  resolved: { body?: string; commentBodies: Array<string | undefined> },
+): void {
+  if (change.key === "body") {
+    resolved.body = value;
+    return;
+  }
+  const index = Number.parseInt(change.key.slice("comment:".length), 10);
+  resolved.commentBodies[index] = value;
+}
+
+async function resolveUncertainGrammarChanges(
+  ctx: ExtensionContext,
+  result: Extract<GrammarReviewResult, { status: "review" }>,
+  comments: ReviewInlineComment[],
+): Promise<{ body?: string; comments: ReviewInlineComment[] } | null> {
+  const resolved: { body?: string; commentBodies: Array<string | undefined> } = {
+    body: result.corrected.body,
+    commentBodies: [...result.corrected.comments],
+  };
+
+  for (const change of result.changes.filter((candidate) => !candidate.grammarOnly)) {
+    const location = getGrammarChangeLocation(change, comments);
+    const title = [
+      location,
+      `Original: ${sanitizeTerminalText(change.original)}`,
+      `Fixed: ${sanitizeTerminalText(change.corrected)}`,
+      `Why this needs approval: ${sanitizeTerminalText(change.reason)}`,
+    ].join("\n\n");
+    const choice = await ctx.ui.select(title, [
+      USE_CORRECTED_TEXT,
+      EDIT_CORRECTED_TEXT,
+      KEEP_ORIGINAL_TEXT,
+      REMOVE_REVIEW_ITEM,
+      CANCEL_REVIEW_SUBMISSION,
+    ]);
+    if (choice == null || choice === CANCEL_REVIEW_SUBMISSION) return null;
+    if (choice === USE_CORRECTED_TEXT) continue;
+    if (choice === KEEP_ORIGINAL_TEXT) {
+      setResolvedGrammarText(change, change.original, resolved);
+      continue;
+    }
+    if (choice === REMOVE_REVIEW_ITEM) {
+      setResolvedGrammarText(change, undefined, resolved);
+      continue;
+    }
+    const edited = await ctx.ui.editor(`Edit ${location}`, change.corrected);
+    if (edited == null) return null;
+    setResolvedGrammarText(change, edited, resolved);
+  }
+
+  return {
+    body: resolved.body,
+    comments: comments
+      .map((comment, index) => {
+        const body = resolved.commentBodies[index];
+        return body == null ? null : { ...comment, body };
+      })
+      .filter((comment): comment is ReviewInlineComment => comment != null),
+  };
+}
+
+export async function submitUiConfirmedReview(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  target: RemoteReviewTarget,
+  verdict: ReviewVerdict,
+  body: string | undefined,
+  comments: ReviewInlineComment[],
+): Promise<ReviewRunStatus> {
+  const pr = target.pullRequest!;
+  const original: ReviewTextSet = {
+    body,
+    comments: comments.map((comment) => comment.body),
+  };
+  let grammarResult: GrammarReviewResult = { status: "safe", corrected: original, changes: [] };
+
+  if (body != null || comments.length > 0) {
+    ctx.ui.setStatus("pi-code-diff-grammar", `Checking review grammar with ${ctx.model?.id ?? "the active model"}...`);
+    try {
+      grammarResult = await reviewGrammar(ctx, original);
+    } finally {
+      ctx.ui.setStatus("pi-code-diff-grammar", undefined);
+    }
+  }
+
+  if (grammarResult.status === "error") {
+    const prompt = composeReviewSubmissionPrompt(target, verdict, body, comments);
+    sendReviewFollowUp(pi, ctx, prompt);
+    ctx.ui.notify(`Could not verify grammar automatically: ${grammarResult.error} Sent the review to the agent instead.`, "warning");
+    return { started: true, prompt, context: formatPullRequestContext(pr) };
+  }
+
+  const resolved = grammarResult.status === "review"
+    ? await resolveUncertainGrammarChanges(ctx, grammarResult, comments)
+    : {
+        body: grammarResult.corrected.body,
+        comments: comments.map((comment, index) => ({ ...comment, body: grammarResult.corrected.comments[index]! })),
+      };
+  if (resolved == null) {
+    const message = "Review submission cancelled; nothing was posted.";
+    ctx.ui.notify(message, "info");
+    return { started: true, message, context: formatPullRequestContext(pr) };
+  }
+
+  const repo = target.repo ?? pr.repo;
+  if (repo == null) {
+    const message = "Could not submit the review because the GitHub repository is unknown.";
+    ctx.ui.notify(message, "warning");
+    return { started: true, message, context: formatPullRequestContext(pr) };
+  }
+  const submission = await submitPullRequestReview(pi, {
+    repo,
+    prNumber: pr.number,
+    commitId: pr.headRefOid,
+    verdict,
+    body: resolved.body,
+    comments: resolved.comments,
+    prAuthorLogin: pr.authorLogin,
+    gitRoot: target.gitRoot,
+  });
+  ctx.ui.notify(submission.message, submission.ok ? "info" : "warning");
+  if (!submission.ok) return { started: true, message: submission.message, context: formatPullRequestContext(pr) };
+
+  const prUrl = `https://github.com/${repo}/pull/${pr.number}`;
+  sendReviewFollowUp(pi, ctx, [
+    "pi-code-diff already submitted this GitHub review after its grammar safety pass.",
+    "Do not ask for confirmation and do not submit the review again.",
+    "Run any configured post-review completion callback, then report the result briefly.",
+    `PR: ${prUrl}`,
+    submission.message,
+  ].join("\n"));
+  return { started: true, message: submission.message, context: formatPullRequestContext(pr) };
 }
 
 export function composeRemoteReviewPrompt(target: RemoteReviewTarget, reviewPrompt: string): string {
@@ -213,7 +386,13 @@ export default function codeDiffExtension(pi: ExtensionAPI) {
     ctx.ui.notify(`code-diff config: ${warnings.join(" ")}`, "warning");
   }
 
-  async function openReviewData(ctx: ExtensionContext, data: ReviewWindowData, remoteTarget?: RemoteReviewTarget, seedComments?: SeedReviewComment[]): Promise<ReviewRunStatus> {
+  async function openReviewData(
+    ctx: ExtensionContext,
+    data: ReviewWindowData,
+    remoteTarget?: RemoteReviewTarget,
+    seedComments?: SeedReviewComment[],
+    sessionOptions?: { resumeId?: string; discard?: boolean },
+  ): Promise<ReviewRunStatus> {
     if (activeReview) {
       const message = "A review session is already open.";
       ctx.ui.notify(message, "warning");
@@ -231,6 +410,13 @@ export default function codeDiffExtension(pi: ExtensionAPI) {
       }
 
       notifyShortcutWarnings(ctx, shortcutConfig.warnings);
+      const sessionIdentity = [repoRoot, branchBaseRevision ?? "working", modifiedRevision ?? "worktree", remoteTarget?.remote ?? "local"].join("|");
+      const sessionId = sessionOptions?.resumeId != null && sessionOptions.resumeId !== "latest"
+        ? sessionOptions.resumeId
+        : createReviewSessionId(sessionIdentity);
+      if (sessionOptions?.discard) deleteReviewSession(sessionIdentity, sessionId);
+      const initialSession = sessionOptions?.discard ? null : loadReviewSession(sessionIdentity, sessionId);
+      if (initialSession != null) ctx.ui.notify(`Resumed review session ${sessionId}.`, "info");
 
       if (remoteTarget?.pullRequest != null) {
         ctx.ui.notify(formatPullRequestContext(remoteTarget.pullRequest), "info");
@@ -243,16 +429,28 @@ export default function codeDiffExtension(pi: ExtensionAPI) {
         ctx.ui.notify(`code-diff: could not place ${seed.unresolved.length} prepopulated ${label} (${paths}).`, "warning");
       }
 
+      let sessionActive = true;
       const result = await runReviewApp(ctx, {
         files,
         repoRoot,
-        loadFileContents: (file, scope) => loadReviewFileContents(pi, repoRoot, file, scope, branchBaseRevision, modifiedRevision),
+        loadFileContents: (activeRepoRoot, file, scope) => activeRepoRoot === repoRoot
+          ? loadReviewFileContents(pi, activeRepoRoot, file, scope, branchBaseRevision, modifiedRevision)
+          : loadReviewFileContents(pi, activeRepoRoot, file, scope),
+        loadSubmoduleReviewData: (submodule) => hasExactSubmoduleRange(submodule)
+          ? getReviewWindowDataForRevisionRange(pi, submodule.repoRoot, submodule.oldSha, submodule.newSha, { wholeRepo: true })
+          : getReviewWindowData(pi, submodule.repoRoot, { wholeRepo: true }),
         commentShortcuts: shortcutConfig.shortcuts,
         allowEmptySubmit: remoteTarget?.pullRequest != null,
         visibleScopes,
         seedComments: seed.resolved,
         contextPanelSource: createRemotePullRequestSummarySource(pi, ctx, remoteTarget),
+        initialSession: initialSession ?? undefined,
+        onSessionChange: (session) => {
+          if (sessionActive) saveReviewSession(sessionIdentity, session, sessionId);
+        },
       });
+      sessionActive = false;
+      deleteReviewSession(sessionIdentity, sessionId);
 
       if (result.type === "cancel") {
         const message = "Review cancelled.";
@@ -303,21 +501,31 @@ export default function codeDiffExtension(pi: ExtensionAPI) {
     const reviewBody = buildReviewBody(files, result);
     const optionalBody = verdict === "comment" ? undefined : await ctx.ui.editor(`${choice}: optional review body comment`, "");
     const body = mergeReviewBodies(optionalBody, reviewBody);
-    const prompt = composeReviewSubmissionPrompt(target, verdict, body, inlineComments);
-    pi.sendUserMessage(prompt);
-    ctx.ui.notify("Sent review submission instructions to the agent.", "info");
-    return { started: true, prompt, context: formatPullRequestContext(pr) };
+    return submitUiConfirmedReview(pi, ctx, target, verdict, body, inlineComments);
   }
 
-  async function openReview(ctx: ExtensionContext, cwd = ctx.cwd, comments?: SeedReviewComment[]): Promise<ReviewRunStatus> {
+  async function openReview(
+    ctx: ExtensionContext,
+    cwd = ctx.cwd,
+    comments?: SeedReviewComment[],
+    options?: ReviewWindowOptions,
+    sessionOptions?: { resumeId?: string; discard?: boolean },
+  ): Promise<ReviewRunStatus> {
     const reviewCwd = normalizeReviewCwd(cwd, ctx.cwd);
-    return openReviewData(ctx, await getReviewWindowData(pi, reviewCwd), undefined, comments);
+    const data = options == null
+      ? await getReviewWindowData(pi, reviewCwd)
+      : await getReviewWindowData(pi, reviewCwd, options);
+    return openReviewData(ctx, data, undefined, comments, sessionOptions);
   }
 
   async function runInteractiveReview(params: InteractiveReviewParams, ctx: ExtensionContext, fallbackCwd = ctx.cwd, comments?: SeedReviewComment[]): Promise<ReviewRunStatus> {
     if (!ctx.hasUI) return { started: false, message: "Interactive review requires a TUI session." };
     const reviewCwd = params.cwd == null ? undefined : normalizeReviewCwd(params.cwd, fallbackCwd);
-    if (params.resume != null) return unsupported("Resume support is being ported into pi-code-diff next.", ctx);
+    const reviewOptions = {
+      ...(params.includeGenerated ? { includeGenerated: true } : {}),
+      ...(params.wholeRepo ? { wholeRepo: true } : {}),
+    };
+    const hasReviewOptions = Object.keys(reviewOptions).length > 0;
     if (params.tree != null || params.branch != null || params.project != null) return unsupported("Tree, branch, and project resolution are being ported into pi-code-diff next.", ctx);
     if (params.mode === "staged") return unsupported("Staged diff mode is being ported into pi-code-diff next.", ctx);
 
@@ -326,9 +534,17 @@ export default function codeDiffExtension(pi: ExtensionAPI) {
         const reportProgress = (message: string) => setRemoteProgress(ctx, message);
         const target = await resolveRemoteReviewTarget(pi, fallbackCwd, params.remote, reviewCwd, reportProgress);
         reportProgress(`Preparing diff for ${target.repo ?? target.branch}…`);
-        const data = await getReviewWindowDataForRevisionRange(pi, target.gitRoot, target.baseRef, target.headRef);
+        const rangeOptions = {
+          ...reviewOptions,
+          ...(params.wholeRepo || target.pathspecs == null ? {} : { pathspecs: target.pathspecs }),
+          ...(params.wholeRepo || target.workspacePath == null ? {} : { workspacePath: target.workspacePath }),
+          ...(target.importAliases == null ? {} : { importAliases: target.importAliases }),
+        };
+        const data = Object.keys(rangeOptions).length === 0
+          ? await getReviewWindowDataForRevisionRange(pi, target.gitRoot, target.baseRef, target.headRef)
+          : await getReviewWindowDataForRevisionRange(pi, target.gitRoot, target.baseRef, target.headRef, rangeOptions);
         setRemoteProgress(ctx, undefined);
-        return openReviewData(ctx, data, target, comments);
+        return openReviewData(ctx, data, target, comments, { resumeId: params.resume, discard: params.discardResume });
       } catch (error) {
         setRemoteProgress(ctx, undefined);
         const message = error instanceof Error ? error.message : String(error);
@@ -342,10 +558,23 @@ export default function codeDiffExtension(pi: ExtensionAPI) {
       if (range == null || !range.includes("..")) return unsupported("Custom review requires a ref range like base..head.", ctx);
       const [baseRef, headRef] = range.split(/\.\.\.?/, 2);
       if (baseRef == null || headRef == null || baseRef.length === 0 || headRef.length === 0) return unsupported("Custom review requires a ref range like base..head.", ctx);
-      return openReviewData(ctx, await getReviewWindowDataForRevisionRange(pi, reviewCwd ?? fallbackCwd, baseRef, headRef), undefined, comments);
+      const rangeOptions = {
+        ...reviewOptions,
+        ...(range.includes("...") ? { mergeBase: true } : {}),
+      };
+      const data = Object.keys(rangeOptions).length === 0
+        ? await getReviewWindowDataForRevisionRange(pi, reviewCwd ?? fallbackCwd, baseRef, headRef)
+        : await getReviewWindowDataForRevisionRange(pi, reviewCwd ?? fallbackCwd, baseRef, headRef, rangeOptions);
+      return openReviewData(ctx, data, undefined, comments, { resumeId: params.resume, discard: params.discardResume });
     }
 
-    return openReview(ctx, reviewCwd ?? fallbackCwd, comments);
+    return openReview(
+      ctx,
+      reviewCwd ?? fallbackCwd,
+      comments,
+      hasReviewOptions ? reviewOptions : undefined,
+      { resumeId: params.resume, discard: params.discardResume },
+    );
   }
 
   async function runDiff(args: string, ctx: ExtensionContext, cwd = ctx.cwd, comments?: SeedReviewComment[]): Promise<ReviewRunStatus> {
@@ -490,8 +719,8 @@ export default function codeDiffExtension(pi: ExtensionAPI) {
     description: "Submit a GitHub pull request review (approve, request changes, or comment) via provider-cli api. Refuses to approve a PR authored by the current user. Approvals with inline comments post the comments first, then approve.",
     promptSnippet: "Submit a GitHub PR review verdict via provider-cli api after the user confirms.",
     promptGuidelines: [
-      "Only call submit_pr_review after the user explicitly confirms the exact verdict and text.",
-      "Fix only grammar and English in the body and comment text; never change their meaning.",
+      "Only call submit_pr_review after the user explicitly confirms the verdict and review text. The review UI confirmation also authorizes grammar, spelling, capitalization, punctuation, and meaning-preserving syntax corrections without another confirmation.",
+      "Fix only grammar and English in the body and comment text; never change meaning, intent, tone, technical substance, or requested scope. Only changes that may cross those boundaries require exact approval before submission.",
       "Never approve a pull request the user authored; the tool blocks self-approval and you should not retry as approve.",
       "Keep existing inline comments in the comments array for approve, request_changes, and comment verdicts.",
       "After a successful submission, report the PR link and short summary returned by the tool.",

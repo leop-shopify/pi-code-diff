@@ -212,6 +212,42 @@ describe("composeReviewPrompt", () => {
     ].join("\n"));
   });
 
+  it("preserves exact MODIFY whitespace and line deletion", () => {
+    const prompt = composeReviewPrompt(files, {
+      type: "submit",
+      allComment: "",
+      allIntent: "discuss",
+      comments: [
+        {
+          id: "1",
+          fileId: "bar",
+          scope: "git-diff",
+          side: "added",
+          intent: "modify",
+          startLine: 27,
+          endLine: 27,
+          originalText: "\tremove()  ",
+          body: "",
+        },
+        {
+          id: "2",
+          fileId: "bar",
+          scope: "git-diff",
+          side: "added",
+          intent: "modify",
+          startLine: 28,
+          endLine: 28,
+          originalText: "\told()  ",
+          body: "\tnew()  ",
+        },
+      ],
+    });
+
+    expect(prompt).toContain("   - \tremove()  ");
+    expect(prompt).toContain("   - \told()  ");
+    expect(prompt).toContain("   + \tnew()  ");
+  });
+
   it("renders a multi-line MODIFY edit with every old and new line", () => {
     const prompt = composeReviewPrompt(files, {
       type: "submit",

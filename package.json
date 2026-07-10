@@ -1,6 +1,6 @@
 {
   "name": "pi-code-diff",
-  "version": "0.2.7",
+  "version": "0.3.0",
   "private": true,
   "packageManager": "pnpm@10.28.0",
   "type": "module",
@@ -11,10 +11,14 @@
     "src/diff.ts",
     "src/git.ts",
     "src/index.ts",
+    "src/locale-files.ts",
     "src/pi-render.ts",
+    "src/path-policy.ts",
     "src/prompt.ts",
     "src/pr-summary.ts",
     "src/remote.ts",
+    "src/review-grammar.ts",
+    "src/review-session.ts",
     "src/review-submit.ts",
     "src/sanitize.ts",
     "src/search.ts",
@@ -48,9 +52,11 @@
   },
   "scripts": {
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "vitest run"
+    "test": "vitest run",
+    "benchmark": "vitest bench --run"
   },
   "dependencies": {
+    "@earendil-works/pi-ai": "0.78.0",
     "@earendil-works/pi-tui": "0.78.0",
     "@pierre/diffs": "1.2.7",
     "typebox": "1.1.38"

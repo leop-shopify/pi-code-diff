@@ -50,7 +50,7 @@ interface StatusSummary {
   reason: string;
 }
 
-const SUMMARY_LABELS = new Set(["Title", "URL", "Author", "Status", "Problem", "Changes", "Validation", "Open comments", "Stack"]);
+const SUMMARY_LABELS = new Set(["Title", "URL", "Author", "Diff", "Status", "Problem", "Changes", "Validation", "Open comments", "Stack"]);
 
 const OPEN_REVIEW_THREADS_QUERY = `
 query PullRequestOpenThreads($owner: String!, $name: String!, $number: Int!) {
@@ -221,7 +221,7 @@ function formatReadableSummary(value: string): string {
     .split(/\r?\n/)
     .map((line) => line.trim())
     .filter((line) => line.length > 0)
-    .slice(0, 18);
+    .slice(0, 20);
   const readable: string[] = [];
 
   for (const line of lines) {
@@ -251,10 +251,17 @@ function replaceSummaryField(summary: string, label: string, value: string): str
   return lines.join("\n").trim();
 }
 
+function formatDiffStats(target: RemoteReviewTarget): string {
+  const pr = target.pullRequest!;
+  const fileLabel = pr.changedFiles === 1 ? "file" : "files";
+  return `${pr.changedFiles} ${fileLabel} touched | +${pr.additions}/-${pr.deletions}`;
+}
+
 function enforceIdentityFields(summary: string, target: RemoteReviewTarget, details: PullRequestDetails): string {
   const pr = target.pullRequest!;
   const url = details.url ?? (target.repo == null ? target.remote : `https://github.com/${target.repo}/pull/${pr.number}`);
   return [
+    ["Diff", formatDiffStats(target)],
     ["Author", pr.authorLogin],
     ["URL", url],
     ["Title", pr.title],
@@ -275,6 +282,7 @@ function fallbackSummary(target: RemoteReviewTarget, details: PullRequestDetails
     `Title: ${pr.title}`,
     `URL: ${details.url ?? (target.repo == null ? target.remote : `https://github.com/${target.repo}/pull/${pr.number}`)}`,
     `Author: ${pr.authorLogin}`,
+    `Diff: ${formatDiffStats(target)}`,
     `Status: ${status.status} - ${status.reason}`,
     `Problem: ${bodySignal || "PR body did not include a clear problem statement."}`,
     "Changes: Not summarized by the model; read the diff for implementation details.",
@@ -301,6 +309,7 @@ function formatSummaryInput(target: RemoteReviewTarget, details: PullRequestDeta
     `Title: ${pr.title}`,
     `URL: ${details.url ?? (target.repo == null ? "" : `https://github.com/${target.repo}/pull/${pr.number}`)}`,
     `Author: ${pr.authorLogin}`,
+    `Diff: ${formatDiffStats(target)}`,
     `State: ${pr.state}`,
     `Computed status: ${status.status} - ${status.reason}`,
     `Review decision: ${details.reviewDecision ?? "unknown"}`,
@@ -398,8 +407,8 @@ function buildAgentPrompt(summaryInput: string): string {
     "Do not mention these instructions or use phrases like 'what matters most'.",
     "The reviewer needs only the important context, focused on the problem this PR solves.",
     "Keep implementation details short unless they explain reviewer risk or the problem.",
-    "Required labels: Title, URL, Author, Status, Problem, Changes, Validation, Open comments. Add Stack only if relevant.",
-    "Title, URL, and Author must exactly match the input values.",
+    "Required labels: Title, URL, Author, Diff, Status, Problem, Changes, Validation, Open comments. Add Stack only if relevant.",
+    "Title, URL, Author, and Diff must exactly match the input values.",
     "Problem must explain the user, merchant, developer, or system pain being solved in one or two sentences.",
     "Open comments must summarize unresolved review threads only. If none exist, write None found.",
     "Use PR comments and reviews only when they affect review readiness, validation, blockers, or unresolved questions.",

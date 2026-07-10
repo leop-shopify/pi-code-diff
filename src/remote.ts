@@ -1,7 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { mkdir } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join, posix } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { getDefaultBranchRef } from "./git.js";
 import { getShortcutConfigPath } from "./shortcuts.js";
@@ -45,6 +45,9 @@ export interface RemoteReviewTarget {
   branch: string;
   repo?: string;
   pullRequest?: PullRequestMetadata;
+  workspacePath?: string;
+  pathspecs?: string[];
+  importAliases?: Record<string, string>;
 }
 
 export type RemoteProgress = (message: string) => void;
@@ -83,6 +86,16 @@ export function extractBranchFromRemote(input: string): RemoteParseResult | null
 interface RemoteRepositoryConfig {
   cwd?: unknown;
   path?: unknown;
+  subdir?: unknown;
+  pathspecs?: unknown;
+  importAliases?: unknown;
+}
+
+interface ConfiguredRepositoryProfile {
+  gitRoot: string;
+  workspacePath?: string;
+  pathspecs?: string[];
+  importAliases?: Record<string, string>;
 }
 
 interface CodeDiffConfigFile {
@@ -97,19 +110,47 @@ function getCodeDiffConfigPath(): string {
   return process.env.PI_CODE_DIFF_CONFIG_PATH ?? getShortcutConfigPath();
 }
 
-function getConfiguredRepoRoot(repo: string): string | undefined {
+function normalizeConfiguredPathspec(value: unknown): string | undefined {
+  if (typeof value !== "string" || value.trim().length === 0 || isAbsolute(value)) return undefined;
+  const normalized = posix.normalize(value.trim().replace(/\\/g, "/")).replace(/^\.\//, "");
+  return normalized === "." || normalized === ".." || normalized.startsWith("../") ? undefined : normalized;
+}
+
+function getConfiguredRepositoryProfile(repo: string): ConfiguredRepositoryProfile | undefined {
   const configPath = getCodeDiffConfigPath();
   if (!existsSync(configPath)) return undefined;
 
+  let config: CodeDiffConfigFile;
   try {
-    const config = JSON.parse(readFileSync(configPath, "utf8")) as CodeDiffConfigFile;
-    const repositories = config.repositories ?? {};
-    const entry = repositories[repo] ?? repositories[normalizeRepoName(repo)];
-    const candidate = typeof entry === "string" ? entry : typeof entry?.cwd === "string" ? entry.cwd : typeof entry?.path === "string" ? entry.path : undefined;
-    return candidate != null && existsSync(candidate) ? candidate : undefined;
+    config = JSON.parse(readFileSync(configPath, "utf8")) as CodeDiffConfigFile;
   } catch {
     return undefined;
   }
+
+  const repositories = config.repositories ?? {};
+  const entry = repositories[repo] ?? repositories[normalizeRepoName(repo)];
+  const candidate = typeof entry === "string" ? entry : typeof entry?.cwd === "string" ? entry.cwd : typeof entry?.path === "string" ? entry.path : undefined;
+  if (candidate == null || !existsSync(candidate)) return undefined;
+  if (typeof entry === "string") return { gitRoot: candidate };
+
+  const workspacePath = normalizeConfiguredPathspec(entry.subdir);
+  if (entry.subdir != null && workspacePath == null) throw new Error(`Invalid subdir configured for ${repo}.`);
+  const configuredPathspecs = Array.isArray(entry.pathspecs)
+    ? entry.pathspecs.map(normalizeConfiguredPathspec).filter((path): path is string => path != null)
+    : [];
+  if (Array.isArray(entry.pathspecs) && configuredPathspecs.length !== entry.pathspecs.length) {
+    throw new Error(`Invalid pathspec configured for ${repo}.`);
+  }
+  const pathspecs = configuredPathspecs.length > 0 ? [...new Set(configuredPathspecs)] : workspacePath == null ? undefined : [workspacePath];
+  const importAliases = entry.importAliases != null && typeof entry.importAliases === "object" && !Array.isArray(entry.importAliases)
+    ? Object.fromEntries(Object.entries(entry.importAliases)
+        .map(([prefix, target]) => [prefix.trim(), normalizeConfiguredPathspec(target)] as const)
+        .filter((item): item is readonly [string, string] => item[0].length > 0 && item[1] != null))
+    : undefined;
+  if (entry.importAliases != null && (importAliases == null || Object.keys(importAliases).length !== Object.keys(entry.importAliases as object).length)) {
+    throw new Error(`Invalid import alias configured for ${repo}.`);
+  }
+  return { gitRoot: candidate, workspacePath, pathspecs, importAliases };
 }
 
 function repoMatchesRemoteUrl(repo: string, remoteUrl: string): boolean {
@@ -150,7 +191,13 @@ async function ensureRemoteCacheRepo(pi: ExtensionAPI, repo: string, onProgress?
   return ok.stdout.trim() || gitRoot;
 }
 
-async function resolveRepoRoot(pi: ExtensionAPI, fallbackCwd: string, repo: string | undefined, explicitCwd: string | undefined, onProgress?: RemoteProgress): Promise<{ gitRoot: string; fetchRemote?: string }> {
+async function validateConfiguredRepoRoot(pi: ExtensionAPI, repo: string, gitRoot: string): Promise<void> {
+  const remoteResult = await pi.exec("git", ["remote", "get-url", "--all", "origin"], { cwd: gitRoot, timeout: 10000 });
+  const matches = remoteResult.code === 0 && remoteResult.stdout.split(/\r?\n/).some((url) => repoMatchesRemoteUrl(repo, url));
+  if (!matches) throw new Error(`Configured checkout ${gitRoot} does not match ${repo}.`);
+}
+
+async function resolveRepoRoot(pi: ExtensionAPI, fallbackCwd: string, repo: string | undefined, explicitCwd: string | undefined, onProgress?: RemoteProgress): Promise<{ gitRoot: string; fetchRemote?: string; workspacePath?: string; pathspecs?: string[]; importAliases?: Record<string, string> }> {
   if (explicitCwd != null) {
     onProgress?.(`Using local checkout ${explicitCwd}…`);
     return { gitRoot: explicitCwd };
@@ -160,10 +207,11 @@ async function resolveRepoRoot(pi: ExtensionAPI, fallbackCwd: string, repo: stri
     return { gitRoot: fallbackCwd };
   }
 
-  const configuredRoot = getConfiguredRepoRoot(repo);
-  if (configuredRoot != null) {
-    onProgress?.(`Using configured checkout for ${repo}…`);
-    return { gitRoot: configuredRoot };
+  const configuredProfile = getConfiguredRepositoryProfile(repo);
+  if (configuredProfile != null) {
+    await validateConfiguredRepoRoot(pi, repo, configuredProfile.gitRoot);
+    onProgress?.(`Using configured checkout for ${repo}${configuredProfile.workspacePath == null ? "" : ` at ${configuredProfile.workspacePath}`}…`);
+    return configuredProfile;
   }
 
   const localRoot = await getMatchingLocalRepoRoot(pi, fallbackCwd, repo);
@@ -396,7 +444,7 @@ export async function resolveRemoteReviewTarget(pi: ExtensionAPI, fallbackCwd: s
   if (parsed == null) throw new Error(`Could not extract branch name from: ${remote}`);
 
   onProgress?.(`Preparing remote review for ${remote}…`);
-  const { gitRoot, fetchRemote } = await resolveRepoRoot(pi, fallbackCwd, parsed.repo, explicitCwd, onProgress);
+  const { gitRoot, fetchRemote, workspacePath, pathspecs, importAliases } = await resolveRepoRoot(pi, fallbackCwd, parsed.repo, explicitCwd, onProgress);
 
   if (parsed.prNumber != null) {
     const pullRequest = await getPullRequestMetadata(pi, gitRoot, parsed.prNumber, parsed.repo, onProgress);
@@ -416,6 +464,9 @@ export async function resolveRemoteReviewTarget(pi: ExtensionAPI, fallbackCwd: s
       branch: pullRequest.headRefName,
       repo: parsed.repo,
       pullRequest,
+      workspacePath,
+      pathspecs,
+      importAliases,
     };
   }
 
@@ -427,6 +478,9 @@ export async function resolveRemoteReviewTarget(pi: ExtensionAPI, fallbackCwd: s
     remote,
     branch: parsed.branch,
     repo: parsed.repo,
+    workspacePath,
+    pathspecs,
+    importAliases,
   };
 }
 

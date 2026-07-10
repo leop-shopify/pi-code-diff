@@ -2,7 +2,7 @@ import { visibleWidth } from "@earendil-works/pi-tui";
 import { describe, expect, it } from "vitest";
 import { buildStructuredDiff } from "../diff.js";
 import type { DiffReviewComment, ReviewFile, ReviewState } from "../types.js";
-import { buildCommentPanelEmptyStateLines, buildCommentPanelTextLines, buildContextPanelLines, buildDiffActionHintLine, buildDisplayRows, buildEditorLaunchCommand, buildFooterLines, buildHelpPanelLines, buildSideBySideDisplayRows, diffTextMatchesSearch, formatFocusStatus, formatPaneTitle, formatSelectedLineTargetLabel, getCancelAction, getDraftCommentCount, getEditorLineForTarget, getHalfPageStep, getMatchingDiffLineTargets, getNavigatorMoveIndex, getNextSearchIndex, getPaneLayout, getPaneLayoutWithContext, getRelatedFileMarker, getRelatedFilePanelSections, getRelatedFilePaths, getSideBySideColumnTarget, getSideBySideLineTargets, getSideBySidePairedLineTarget, getStackedPaneLayout, getStackedPaneLayoutWithContext, parseMouseWheelInput, renderCenteredOverlay, shouldStackPanes, shouldStackPanesWithContext } from "../ui/review-app.js";
+import { buildCommentPanelEmptyStateLines, buildCommentPanelTextLines, buildContextPanelLines, buildDiffActionHintLine, buildDisplayRows, buildEditorLaunchCommand, buildFooterLines, buildHelpPanelLines, buildModifyPreviewLines, buildSelectionClipboardText, buildSideBySideDisplayRows, diffTextMatchesSearch, formatFocusStatus, formatPaneTitle, formatSelectedLineTargetLabel, getCancelAction, getChangedLineTargets, getDraftCommentCount, getEditorLineForTarget, getHalfPageStep, getMatchingDiffLineTargets, getMeasuredPageRange, getNavigatorGroup, getNavigatorMoveIndex, getNextSearchIndex, getPaneLayout, getPaneLayoutWithContext, getRelatedFileMarker, getRelatedFilePanelSections, getRelatedFilePaths, getSideBySideColumnTarget, getSideBySideLineTargets, getSideBySidePairedLineTarget, getSourceLineRangeText, getStableDiffScroll, getStackedPaneLayout, getStackedPaneLayoutWithContext, getVirtualRowRange, groupNavigatorFiles, isUnchangedModify, parseMouseWheelInput, renderCenteredOverlay, setBoundedMapEntry, shouldStackPanes, shouldStackPanesWithContext } from "../ui/review-app.js";
 
 function makeFile(path: string, flags?: Partial<ReviewFile>): ReviewFile {
   return {
@@ -64,6 +64,17 @@ describe("buildDisplayRows", () => {
     expect(rowsAtLineTwo.map((row) => ({ kind: row.kind, commentLineNumber: row.commentLineNumber, commentSide: row.commentSide }))).toEqual([
       { kind: "removed", commentLineNumber: 2, commentSide: "deleted" },
       { kind: "context", commentLineNumber: 2, commentSide: "added" },
+    ]);
+  });
+});
+
+describe("changed-line navigation", () => {
+  it("skips unchanged context while retaining both sides of replacements", () => {
+    const diff = buildStructuredDiff("alpha\nold\nomega\n", "alpha\nnew\nomega\n", 3);
+
+    expect(getChangedLineTargets(diff)).toEqual([
+      { side: "deleted", line: 2 },
+      { side: "added", line: 2 },
     ]);
   });
 });
@@ -187,6 +198,26 @@ describe("search and navigator movement helpers", () => {
     expect(getNavigatorMoveIndex(2, 3, 1)).toBe(0);
     expect(getNavigatorMoveIndex(0, 3, 99)).toBe(2);
     expect(getNavigatorMoveIndex(2, 3, -99)).toBe(0);
+  });
+});
+
+describe("navigator grouping", () => {
+  it("groups common monorepo roots and keeps a deterministic tree order", () => {
+    const files = [
+      makeFile("packages/shop/src/app.ts"),
+      makeFile("README.md"),
+      makeFile("packages/admin/src/app.ts"),
+      makeFile("apps/web/page.ts"),
+    ];
+
+    expect(getNavigatorGroup(files[0]!)).toBe("packages/shop");
+    expect(getNavigatorGroup(files[1]!)).toBe("root");
+    expect(groupNavigatorFiles(files).map((file) => file.path)).toEqual([
+      "apps/web/page.ts",
+      "packages/admin/src/app.ts",
+      "packages/shop/src/app.ts",
+      "README.md",
+    ]);
   });
 });
 
@@ -441,5 +472,97 @@ describe("action and shortcut help rendering", () => {
     for (const token of ["Enter/m", "modify", "c", "comment", "d", "discuss", "l", "file", "a", "all lines", "w", "wrap"]) {
       expect(hint).toContain(token);
     }
+  });
+});
+
+describe("review editing and clipboard helpers", () => {
+  const target = { side: "added" as const, line: 12, endLine: 14 };
+
+  it("formats source, location, patch, and suggestion clipboard content", () => {
+    const source = "  first()\n\tsecond()";
+
+    expect(buildSelectionClipboardText("source", "src/app.ts", target, source)).toBe(source);
+    expect(buildSelectionClipboardText("location", "src/app.ts", target, source)).toBe("src/app.ts:12-14");
+    expect(buildSelectionClipboardText("patch", "src/app.ts", target, source)).toBe([
+      "--- a/src/app.ts",
+      "+++ b/src/app.ts",
+      "@@ added lines 12-14 @@",
+      "+  first()",
+      "+\tsecond()",
+    ].join("\n"));
+    expect(buildSelectionClipboardText("suggestion", "src/app.ts", target, source)).toBe("```suggestion\n  first()\n\tsecond()\n```");
+  });
+
+  it("uses an existing modify comment for old/new patch content", () => {
+    const comment: DiffReviewComment = {
+      ...lineComment,
+      intent: "modify",
+      startLine: 12,
+      endLine: 14,
+      originalText: "old()",
+      body: "\tnew()  ",
+    };
+
+    expect(buildSelectionClipboardText("patch", "src/app.ts", target, "ignored", comment)).toContain("-old()\n+\tnew()  ");
+    expect(buildSelectionClipboardText("suggestion", "src/app.ts", target, "ignored", comment)).toBe("```suggestion\n\tnew()  \n```");
+  });
+
+  it("builds an exact old/new MODIFY preview", () => {
+    expect(buildModifyPreviewLines("\told()  ", "\tnew()  ")).toEqual(["- \told()  ", "+ \tnew()  "]);
+    expect(buildModifyPreviewLines("remove()", "")).toEqual(["- remove()"]);
+    expect(buildModifyPreviewLines("one\r\ntwo\nthree\rfour", "replacement", 3)).toEqual(["- one", "- two", "- three"]);
+  });
+
+  it("detects unchanged modify submissions without trimming", () => {
+    expect(isUnchangedModify("\tvalue  ", "\tvalue  ")).toBe(true);
+    expect(isUnchangedModify("\tvalue  ", "value")).toBe(false);
+    expect(isUnchangedModify(undefined, "value")).toBe(false);
+  });
+
+  it("extracts selected source lines without corrupting CRLF boundaries", () => {
+    const content = "first\r\n\tsecond\r\n  third  \r\nfourth\r\n";
+
+    expect(getSourceLineRangeText(content, 2, 3)).toBe("\tsecond\r\n  third  ");
+    expect(getSourceLineRangeText(content, 4, 4)).toBe("fourth");
+  });
+
+  it("recenters once at the viewport edge instead of shifting on every following row", () => {
+    const recentered = getStableDiffScroll(0, 12, 12, 13);
+
+    expect(recentered).toBeGreaterThan(1);
+    expect(getStableDiffScroll(recentered, 12, 13, 14)).toBe(recentered);
+    expect(getStableDiffScroll(recentered, 12, 14, 15)).toBe(recentered);
+  });
+
+  it("keeps a tall wrapped row fully visible", () => {
+    const scroll = getStableDiffScroll(0, 12, 10, 15);
+
+    expect(scroll).toBeGreaterThan(0);
+    expect(scroll).toBeLessThanOrEqual(10);
+    expect(scroll + 12).toBeGreaterThanOrEqual(15);
+  });
+
+  it("measures wrapped item heights when selecting a comment page", () => {
+    expect(getMeasuredPageRange([2, 6, 2], 2, 0, 7)).toEqual({ start: 2, end: 3 });
+    expect(getMeasuredPageRange([2, 2, 2], 1, 0, 5)).toEqual({ start: 0, end: 2 });
+  });
+
+  it("selects only viewport rows plus overscan from cached row heights", () => {
+    expect(getVirtualRowRange([1, 3, 1, 2], 3, 2, 1)).toEqual({
+      startRow: 1,
+      endRow: 4,
+      startOffset: 1,
+      offsets: [0, 1, 4, 5, 7],
+    });
+  });
+
+  it("evicts the least recently inserted bounded cache entry", () => {
+    const cache = new Map<string, number>();
+    setBoundedMapEntry(cache, "a", 1, 2);
+    setBoundedMapEntry(cache, "b", 2, 2);
+    setBoundedMapEntry(cache, "a", 3, 2);
+    setBoundedMapEntry(cache, "c", 4, 2);
+
+    expect([...cache.entries()]).toEqual([["a", 3], ["c", 4]]);
   });
 });

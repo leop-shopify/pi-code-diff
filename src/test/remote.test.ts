@@ -326,8 +326,17 @@ describe("remote review helpers", () => {
     const configRoot = await mkdtemp(join(tmpdir(), "pi-code-diff-config-"));
     const monorepoRoot = join(configRoot, "monorepo");
     const configPath = join(configRoot, "code-diff.json");
-    await mkdir(monorepoRoot, { recursive: true });
-    await writeFile(configPath, JSON.stringify({ repositories: { "example/widgets": { cwd: monorepoRoot } } }));
+    await mkdir(join(monorepoRoot, "packages/widgets"), { recursive: true });
+    await writeFile(configPath, JSON.stringify({
+      repositories: {
+        "example/widgets": {
+          cwd: monorepoRoot,
+          subdir: "packages/widgets",
+          pathspecs: ["packages/widgets", "shared/ui"],
+          importAliases: { "@workspace/shared": "shared/ui" },
+        },
+      },
+    }));
     process.env.PI_CODE_DIFF_CONFIG_PATH = configPath;
 
     try {
@@ -352,6 +361,7 @@ describe("remote review helpers", () => {
             killed: false,
           };
         }
+        if (command === "git" && args[0] === "remote") return { code: 0, stdout: "https://github.com/example/widgets.git\n", stderr: "", killed: false };
         if (command === "git" && args[1] === "fetch") return { code: 0, stdout: "", stderr: "", killed: false };
         return { code: 1, stdout: "", stderr: `unexpected ${command} ${args.join(" ")}`, killed: false };
       });
@@ -362,8 +372,36 @@ describe("remote review helpers", () => {
         headRef: "origin/feature/review",
         branch: "feature/review",
         repo: "example/widgets",
+        workspacePath: "packages/widgets",
+        pathspecs: ["packages/widgets", "shared/ui"],
+        importAliases: { "@workspace/shared": "shared/ui" },
       });
       expect(exec).toHaveBeenCalledWith("git", expect.arrayContaining(["origin"]), expect.objectContaining({ cwd: monorepoRoot }));
+    } finally {
+      if (previousConfigPath == null) delete process.env.PI_CODE_DIFF_CONFIG_PATH;
+      else process.env.PI_CODE_DIFF_CONFIG_PATH = previousConfigPath;
+      await rm(configRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects a configured checkout whose remote does not match the requested repository", async () => {
+    const previousConfigPath = process.env.PI_CODE_DIFF_CONFIG_PATH;
+    const configRoot = await mkdtemp(join(tmpdir(), "pi-code-diff-config-mismatch-"));
+    const checkoutRoot = join(configRoot, "checkout");
+    const configPath = join(configRoot, "code-diff.json");
+    await mkdir(checkoutRoot, { recursive: true });
+    await writeFile(configPath, JSON.stringify({ repositories: { "example/widgets": { cwd: checkoutRoot } } }));
+    process.env.PI_CODE_DIFF_CONFIG_PATH = configPath;
+
+    try {
+      const exec = vi.fn(async (command: string, args: string[]) => {
+        if (command === "git" && args[0] === "remote") return { code: 0, stdout: "https://github.com/example/another-repo.git\n", stderr: "", killed: false };
+        return { code: 1, stdout: "", stderr: `unexpected ${command} ${args.join(" ")}`, killed: false };
+      });
+
+      await expect(resolveRemoteReviewTarget({ exec } as never, "/repo", "https://github.com/example/widgets/pull/123")).rejects.toThrow(
+        `Configured checkout ${checkoutRoot} does not match example/widgets.`,
+      );
     } finally {
       if (previousConfigPath == null) delete process.env.PI_CODE_DIFF_CONFIG_PATH;
       else process.env.PI_CODE_DIFF_CONFIG_PATH = previousConfigPath;

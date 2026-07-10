@@ -10,6 +10,12 @@ const mocks = vi.hoisted(() => ({
   loadReviewFileContents: vi.fn(),
   composeReviewPrompt: vi.fn(),
   runReviewApp: vi.fn(),
+  createReviewSessionId: vi.fn(() => "automatic-session"),
+  loadReviewSession: vi.fn(),
+  saveReviewSession: vi.fn(),
+  deleteReviewSession: vi.fn(),
+  reviewGrammar: vi.fn(),
+  submitPullRequestReview: vi.fn(),
 }));
 
 vi.mock("../shortcuts.js", () => ({
@@ -26,21 +32,67 @@ vi.mock("../prompt.js", () => ({
   composeReviewPrompt: mocks.composeReviewPrompt,
 }));
 
+vi.mock("../review-session.js", () => ({
+  createReviewSessionId: mocks.createReviewSessionId,
+  loadReviewSession: mocks.loadReviewSession,
+  saveReviewSession: mocks.saveReviewSession,
+  deleteReviewSession: mocks.deleteReviewSession,
+}));
+
 vi.mock("../ui/review-app.js", () => ({
   runReviewApp: mocks.runReviewApp,
 }));
 
-const { composeRemoteReviewPrompt, composeReviewSubmissionPrompt, mergeReviewBodies, default: codeDiffExtension } = await import("../index.js");
+vi.mock("../review-grammar.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../review-grammar.js")>()),
+  reviewGrammar: mocks.reviewGrammar,
+}));
+
+vi.mock("../review-submit.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../review-submit.js")>()),
+  submitPullRequestReview: mocks.submitPullRequestReview,
+}));
+
+const { composeRemoteReviewPrompt, composeReviewSubmissionPrompt, mergeReviewBodies, submitUiConfirmedReview, default: codeDiffExtension } = await import("../index.js");
+
+function remoteTarget() {
+  return {
+    gitRoot: "/repo",
+    baseRef: "origin/main",
+    headRef: "origin/pr/1/head",
+    remote: "example/widgets#1",
+    branch: "feature/review",
+    repo: "example/widgets",
+    pullRequest: {
+      number: "1",
+      repo: "example/widgets",
+      title: "Add review mode",
+      body: "",
+      additions: 1,
+      deletions: 0,
+      changedFiles: 1,
+      authorLogin: "alice",
+      state: "OPEN" as const,
+      reviews: [],
+      headRefName: "feature/review",
+      headRefOid: "abc123",
+      baseRefName: "main",
+    },
+  };
+}
 
 describe("code diff extension", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mocks.loadReviewSession.mockReturnValue(null);
     mocks.loadCommentShortcuts.mockReturnValue({
       shortcuts: [],
       globalShortcut: "alt+s",
       warnings: ["bad shortcut config"],
       path: "/tmp/code-diff.json",
     });
+    mocks.reviewGrammar.mockImplementation(async (_ctx, original) => ({ status: "safe", corrected: original, changes: [] }));
+    mocks.submitPullRequestReview.mockResolvedValue({ ok: true, message: "https://github.com/example/widgets/pull/1\nReview comment was posted at 12:00.\n1 inline comment was added." });
   });
 
   it("builds an agent-mediated review submission prompt", () => {
@@ -72,18 +124,96 @@ describe("code diff extension", () => {
 
     expect(prompt).toContain("Do not read files, search the repository, run commands, run tests, inspect diffs, open plans, create todos, or enter plan mode.");
     expect(prompt).toContain("Fix only grammar, spelling, capitalization, and punctuation");
+    expect(prompt).toContain("The review UI already captured the user's explicit confirmation of the exact verdict and original text.");
+    expect(prompt).toContain("If every correction is limited to grammar, spelling, capitalization, punctuation, or meaning-preserving syntax and clarity, call submit_pr_review immediately with the cleaned arguments and do not ask for confirmation.");
+    expect(prompt).toContain("Ask only about text items whose correction may change meaning, intent, tone, technical substance, or requested scope.");
     expect(prompt).toContain("Original: <original text>");
     expect(prompt).toContain("Fixed   : <fixed text>");
     expect(prompt).toContain("Choices: Approve, Edit, Skip");
-    expect(prompt).toContain("Present each changed text item using this exact style");
-    expect(prompt).toContain("If the current ask tool can queue multiple questions, batch the changed text items in one ask call");
+    expect(prompt).toContain("Present each such item using this exact style");
+    expect(prompt).toContain("If the current ask tool can queue multiple questions, batch the uncertain text items in one ask call");
     expect(prompt).toContain("one separate question per item");
-    expect(prompt).toContain("The user's Approve choice is the confirmation to submit that item.");
+    expect(prompt).toContain("Apply grammar-only corrections automatically.");
+    expect(prompt).toContain("The user's Approve choice is the confirmation to submit an uncertain item.");
     expect(prompt).toContain("Do not ask for a second/final submission confirmation.");
     expect(prompt).toContain("Call submit_pr_review once with the full arguments below");
     expect(prompt).toContain("reply with the PR link and the short action summary returned by the tool");
     expect(prompt).toContain('"body": "Shouwlwn be as MagicModules"');
     expect(prompt).toContain('"repo": "example/widgets"');
+  });
+
+  it("submits grammar-only corrections immediately after the review UI confirmation", async () => {
+    const original = "can we have these 2 components in variables and isolated, so we can simplify this rendering?";
+    const corrected = "Can we isolate these two components in variables so we can simplify this rendering?";
+    mocks.reviewGrammar.mockResolvedValue({
+      status: "safe",
+      corrected: { comments: [corrected] },
+      changes: [{ key: "comment:0", original, corrected, grammarOnly: true, reason: "Grammar and word order only." }],
+    });
+    const pi = { sendUserMessage: vi.fn() };
+    const ctx = {
+      model: { id: "test-model" },
+      modelRegistry: {},
+      isIdle: vi.fn(() => true),
+      ui: {
+        setStatus: vi.fn(),
+        select: vi.fn(),
+        editor: vi.fn(),
+        notify: vi.fn(),
+      },
+    };
+    const comments = [{ path: "src/app.ts", line: 12, side: "RIGHT" as const, body: original }];
+
+    await submitUiConfirmedReview(pi as never, ctx as never, remoteTarget(), "comment", undefined, comments);
+
+    expect(ctx.ui.select).not.toHaveBeenCalled();
+    expect(mocks.submitPullRequestReview).toHaveBeenCalledWith(pi, expect.objectContaining({
+      verdict: "comment",
+      comments: [{ path: "src/app.ts", line: 12, side: "RIGHT", body: corrected }],
+    }));
+    expect(pi.sendUserMessage).toHaveBeenCalledWith(expect.stringContaining("already submitted this GitHub review"));
+  });
+
+  it("asks only about corrections that may change technical meaning", async () => {
+    const firstOriginal = "This dont render correctly.";
+    const firstCorrected = "This doesn't render correctly.";
+    const secondOriginal = "Can this handle the empty state?";
+    const secondCorrected = "This must handle every empty state.";
+    mocks.reviewGrammar.mockResolvedValue({
+      status: "review",
+      corrected: { comments: [firstCorrected, secondCorrected] },
+      changes: [
+        { key: "comment:0", original: firstOriginal, corrected: firstCorrected, grammarOnly: true, reason: "Grammar only." },
+        { key: "comment:1", original: secondOriginal, corrected: secondCorrected, grammarOnly: false, reason: "Changes a question into a requirement." },
+      ],
+    });
+    const pi = { sendUserMessage: vi.fn() };
+    const ctx = {
+      model: { id: "test-model" },
+      modelRegistry: {},
+      isIdle: vi.fn(() => true),
+      ui: {
+        setStatus: vi.fn(),
+        select: vi.fn(async (_title: string, _options: string[]) => "Keep original text"),
+        editor: vi.fn(),
+        notify: vi.fn(),
+      },
+    };
+    const comments = [
+      { path: "src/app.ts", line: 12, side: "RIGHT" as const, body: firstOriginal },
+      { path: "src/app.ts", line: 20, side: "RIGHT" as const, body: secondOriginal },
+    ];
+
+    await submitUiConfirmedReview(pi as never, ctx as never, remoteTarget(), "comment", undefined, comments);
+
+    expect(ctx.ui.select).toHaveBeenCalledTimes(1);
+    expect(ctx.ui.select.mock.calls[0]?.[0]).toContain("Comment 2: src/app.ts:20 (RIGHT)");
+    expect(mocks.submitPullRequestReview).toHaveBeenCalledWith(pi, expect.objectContaining({
+      comments: [
+        { path: "src/app.ts", line: 12, side: "RIGHT", body: firstCorrected },
+        { path: "src/app.ts", line: 20, side: "RIGHT", body: secondOriginal },
+      ],
+    }));
   });
 
   it("merges optional review body comments with existing review body text", () => {
@@ -203,6 +333,52 @@ describe("code diff extension", () => {
     expect(result.content[0].text).toContain("generated review prompt");
   });
 
+  it("dispatches exact and fallback submodule reviews through the correct loaders", async () => {
+    const tools = new Map<string, any>();
+    const rootFiles = [{
+      id: "packages/app::working::::",
+      path: "packages/app",
+      worktreeStatus: "modified",
+      hasWorkingTreeFile: true,
+      inGitDiff: true,
+      inLastCommit: false,
+      inAllFiles: false,
+      gitDiff: null,
+      lastCommit: null,
+      allFiles: null,
+    }];
+    const rootData = { repoRoot: "/repo", files: rootFiles, branchBaseRevision: null, visibleScopes: ["git-diff"] };
+    const nestedData = { repoRoot: "/repo/packages/app", files: [], branchBaseRevision: "abc", modifiedRevision: "def", visibleScopes: ["all-files"] };
+    mocks.getReviewWindowData.mockResolvedValue(rootData);
+    mocks.getReviewWindowDataForRevisionRange.mockResolvedValue(nestedData);
+    const pi = {
+      registerCommand: vi.fn(),
+      registerTool: vi.fn((tool) => tools.set(tool.name, tool)),
+      registerShortcut: vi.fn(),
+      on: vi.fn(),
+    };
+    const ctx = {
+      hasUI: true,
+      cwd: "/repo",
+      ui: { notify: vi.fn(), setWidget: vi.fn(), setEditorText: vi.fn() },
+    };
+
+    codeDiffExtension(pi as never);
+    mocks.runReviewApp.mockImplementationOnce(async (_ctx, options) => {
+      await options.loadSubmoduleReviewData({ repoRoot: "/repo/packages/app", path: "packages/app", oldSha: "abc", newSha: "def", available: true });
+      return { type: "cancel" };
+    });
+    await tools.get("open_code_diff").execute("tool-call", { args: "" }, new AbortController().signal, vi.fn(), ctx);
+    expect(mocks.getReviewWindowDataForRevisionRange).toHaveBeenCalledWith(pi, "/repo/packages/app", "abc", "def", { wholeRepo: true });
+
+    mocks.runReviewApp.mockImplementationOnce(async (_ctx, options) => {
+      await options.loadSubmoduleReviewData({ repoRoot: "/repo/packages/app", path: "packages/app", oldSha: "abc", newSha: "abc", available: true });
+      return { type: "cancel" };
+    });
+    await tools.get("open_code_diff").execute("tool-call", { args: "" }, new AbortController().signal, vi.fn(), ctx);
+    expect(mocks.getReviewWindowData).toHaveBeenCalledWith(pi, "/repo/packages/app", { wholeRepo: true });
+  });
+
   it("open_code_diff seeds prepopulated comments and warns about unresolved ones", async () => {
     const tools = new Map<string, any>();
     const files = [{
@@ -298,6 +474,10 @@ describe("code diff extension", () => {
         { fileId: "src/app.ts::all::base::head", scope: "all-files", side: "added", intent: "comment", startLine: 5, endLine: 5, body: "Range note." },
       ],
     }));
+
+    mocks.getReviewWindowDataForRevisionRange.mockClear();
+    await tools.get("open_code_diff").execute("tool-call", { args: "base...head" }, new AbortController().signal, vi.fn(), ctx);
+    expect(mocks.getReviewWindowDataForRevisionRange).toHaveBeenCalledWith(pi, "/repo", "base", "head", { mergeBase: true });
   });
 
   it("does not seed comments when the diff command is invoked", async () => {
@@ -375,8 +555,22 @@ describe("code diff extension", () => {
     };
 
     codeDiffExtension(pi as never);
-    await commands.get("diff")!.handler("--cwd ~/Poetry/rpgmenace", ctx);
-    await vi.waitFor(() => expect(mocks.getReviewWindowData).toHaveBeenCalledWith(pi, expandedCwd));
+    await commands.get("diff")!.handler("--cwd ~/Poetry/rpgmenace --include-generated --whole-repo --resume saved-session", ctx);
+    await vi.waitFor(() => expect(mocks.getReviewWindowData).toHaveBeenCalledWith(pi, expandedCwd, { includeGenerated: true, wholeRepo: true }));
+    expect(mocks.loadReviewSession).toHaveBeenCalledWith(`${expandedCwd}|working|worktree|local`, "saved-session");
+    await vi.waitFor(() => expect(mocks.deleteReviewSession).toHaveBeenCalledWith(`${expandedCwd}|working|worktree|local`, "saved-session"));
+
+    mocks.deleteReviewSession.mockClear();
+    const discardCommands = new Map<string, { handler: (args: string, ctx: any) => Promise<void> }>();
+    const discardPi = {
+      registerCommand: vi.fn((name: string, command) => discardCommands.set(name, command)),
+      registerTool: vi.fn(),
+      registerShortcut: vi.fn(),
+      on: vi.fn(),
+    };
+    codeDiffExtension(discardPi as never);
+    await discardCommands.get("diff")!.handler("--cwd ~/Poetry/rpgmenace --discard-resume", ctx);
+    await vi.waitFor(() => expect(mocks.deleteReviewSession).toHaveBeenCalledWith(`${expandedCwd}|working|worktree|local`, "automatic-session"));
   });
 
   it("treats a bare existing local directory as the diff cwd", async () => {

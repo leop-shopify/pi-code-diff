@@ -1,7 +1,11 @@
 import { lstat, readFile, realpath, stat } from "node:fs/promises";
-import { extname, isAbsolute, posix, relative, resolve } from "node:path";
+import { isAbsolute, join, posix, relative, resolve } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import type { ChangeStatus, ReviewFile, ReviewFileComparison, ReviewFileContents, ReviewScope } from "./types.js";
+import { isReviewableFilePath, type ReviewPathPolicy } from "./path-policy.js";
+import type { ChangeStatus, ReviewFile, ReviewFileComparison, ReviewFileContents, ReviewScope, ReviewSubmoduleByScope, ReviewSubmoduleInfo } from "./types.js";
+
+export { isReviewableFilePath } from "./path-policy.js";
+export type { ReviewPathPolicy } from "./path-policy.js";
 
 export interface ChangedPath {
   status: ChangeStatus;
@@ -14,16 +18,42 @@ export interface ChangeStats {
   deletions: number;
 }
 
+export interface RawDiffChange extends ChangedPath {
+  oldMode: string;
+  newMode: string;
+  oldSha: string;
+  newSha: string;
+}
+
 export interface ReviewWindowData {
   repoRoot: string;
   files: ReviewFile[];
   branchBaseRevision: string | null;
   modifiedRevision?: string;
   visibleScopes: ReviewScope[];
+  workspacePath?: string;
+}
+
+export interface ReviewWindowOptions extends ReviewPathPolicy {
+  wholeRepo?: boolean;
+  pathspecs?: string[];
+  workspacePath?: string;
+  importAliases?: Record<string, string>;
+}
+
+export interface RevisionRangeOptions extends ReviewPathPolicy {
+  mergeBase?: boolean;
+  wholeRepo?: boolean;
+  pathspecs?: string[];
+  workspacePath?: string;
+  importAliases?: Record<string, string>;
 }
 
 export const MAX_REVIEW_FILE_BYTES = 1_000_000;
 export const MAX_REVIEW_FILE_COUNT = 500;
+const IMPORT_SOURCE_EXTENSIONS = new Set([".cjs", ".js", ".jsx", ".mjs", ".ts", ".tsx"]);
+const MONOREPO_WORKSPACE_ROOTS = new Set(["apps", "areas", "modules", "packages", "services"]);
+const LOCAL_GIT_TIMEOUT_MS = 30_000;
 
 interface ReviewFileSeed {
   path: string;
@@ -38,10 +68,11 @@ interface ReviewFileSeed {
   allFilesReferenceCount: number;
   allFilesOutgoingReferences: string[];
   allFilesIncomingReferences: string[];
+  submodule?: ReviewSubmoduleByScope;
 }
 
 async function runGit(pi: ExtensionAPI, repoRoot: string, args: string[]): Promise<string> {
-  const result = await pi.exec("git", args, { cwd: repoRoot });
+  const result = await pi.exec("git", args, { cwd: repoRoot, timeout: LOCAL_GIT_TIMEOUT_MS });
   if (result.code !== 0) {
     const message = result.stderr.trim() || result.stdout.trim() || `git ${args.join(" ")} failed`;
     throw new Error(message);
@@ -50,13 +81,13 @@ async function runGit(pi: ExtensionAPI, repoRoot: string, args: string[]): Promi
 }
 
 async function runGitAllowFailure(pi: ExtensionAPI, repoRoot: string, args: string[]): Promise<string> {
-  const result = await pi.exec("git", args, { cwd: repoRoot });
+  const result = await pi.exec("git", args, { cwd: repoRoot, timeout: LOCAL_GIT_TIMEOUT_MS });
   if (result.code !== 0) return "";
   return result.stdout;
 }
 
 export async function getRepoRoot(pi: ExtensionAPI, cwd: string): Promise<string> {
-  const result = await pi.exec("git", ["rev-parse", "--show-toplevel"], { cwd });
+  const result = await pi.exec("git", ["rev-parse", "--show-toplevel"], { cwd, timeout: LOCAL_GIT_TIMEOUT_MS });
   if (result.code !== 0) {
     throw new Error("Not inside a git repository.");
   }
@@ -64,7 +95,7 @@ export async function getRepoRoot(pi: ExtensionAPI, cwd: string): Promise<string
 }
 
 async function hasHead(pi: ExtensionAPI, repoRoot: string): Promise<boolean> {
-  const result = await pi.exec("git", ["rev-parse", "--verify", "HEAD"], { cwd: repoRoot });
+  const result = await pi.exec("git", ["rev-parse", "--verify", "HEAD"], { cwd: repoRoot, timeout: LOCAL_GIT_TIMEOUT_MS });
   return result.code === 0;
 }
 
@@ -106,6 +137,42 @@ export function parseNameStatus(output: string): ChangedPath[] {
       const path = parts[1] ?? null;
       if (path != null) changes.push({ status: "deleted", oldPath: path, newPath: null });
     }
+  }
+
+  return changes;
+}
+
+function parseRawStatus(rawStatus: string): ChangeStatus | null {
+  const code = rawStatus[0];
+  if (code === "M" || code === "T") return "modified";
+  if (code === "A") return "added";
+  if (code === "D") return "deleted";
+  if (code === "R") return "renamed";
+  return null;
+}
+
+export function parseRawDiff(output: string): RawDiffChange[] {
+  const fields = output.split("\0").filter((field) => field.length > 0);
+  const changes: RawDiffChange[] = [];
+
+  for (let index = 0; index < fields.length;) {
+    const header = fields[index++];
+    if (header == null || !header.startsWith(":")) continue;
+    const parts = header.slice(1).split(" ");
+    const status = parseRawStatus(parts[4] ?? "");
+    if (status == null) continue;
+    const oldPath = fields[index++] ?? null;
+    const newPath = status === "renamed" ? fields[index++] ?? null : oldPath;
+    if (oldPath == null) continue;
+    changes.push({
+      status,
+      oldPath: status === "added" ? null : oldPath,
+      newPath: status === "deleted" ? null : newPath,
+      oldMode: parts[0] ?? "",
+      newMode: parts[1] ?? "",
+      oldSha: parts[2] ?? "",
+      newSha: parts[3] ?? "",
+    });
   }
 
   return changes;
@@ -260,7 +327,7 @@ function toDisplayPath(change: ChangedPath): string {
   return change.newPath ?? change.oldPath ?? "(unknown)";
 }
 
-function toComparison(change: ChangedPath, stats?: ChangeStats): ReviewFileComparison {
+function toComparison(change: ChangedPath, stats?: ChangeStats, revisions?: { originalRevision?: string | null; modifiedRevision?: string | null }): ReviewFileComparison {
   return {
     status: change.status,
     oldPath: change.oldPath,
@@ -270,6 +337,8 @@ function toComparison(change: ChangedPath, stats?: ChangeStats): ReviewFileCompa
     hasModified: change.newPath != null,
     additions: stats?.additions,
     deletions: stats?.deletions,
+    originalRevision: revisions?.originalRevision,
+    modifiedRevision: revisions?.modifiedRevision,
   };
 }
 
@@ -298,6 +367,7 @@ function createReviewFile(seed: ReviewFileSeed): ReviewFile {
     allFilesReferenceCount: seed.allFilesReferenceCount,
     allFilesOutgoingReferences: seed.allFilesOutgoingReferences,
     allFilesIncomingReferences: seed.allFilesIncomingReferences,
+    submodule: seed.submodule,
   };
 }
 
@@ -312,6 +382,20 @@ export function isReviewFileSizeAllowed(size: number): boolean {
 
 export function limitReviewItems<T>(items: T[]): T[] {
   return items.length <= MAX_REVIEW_FILE_COUNT ? items : items.slice(0, MAX_REVIEW_FILE_COUNT);
+}
+
+export async function mapWithConcurrency<T, R>(items: T[], limit: number, mapper: (item: T, index: number) => Promise<R>): Promise<R[]> {
+  if (items.length === 0) return [];
+  const results = new Array<R>(items.length);
+  let nextIndex = 0;
+  const workerCount = Math.max(1, Math.min(Math.floor(limit), items.length));
+  await Promise.all(Array.from({ length: workerCount }, async () => {
+    while (nextIndex < items.length) {
+      const index = nextIndex++;
+      results[index] = await mapper(items[index]!, index);
+    }
+  }));
+  return results;
 }
 
 async function getRevisionContent(pi: ExtensionAPI, repoRoot: string, revision: string, path: string): Promise<string> {
@@ -346,61 +430,55 @@ export async function getWorkingTreeContent(repoRoot: string, path: string): Pro
   }
 }
 
-export function isReviewableFilePath(path: string): boolean {
-  const lowerPath = path.toLowerCase();
-  const fileName = lowerPath.split("/").pop() ?? lowerPath;
-  const extension = extname(fileName);
-
-  if (fileName.length === 0) return false;
-
-  const binaryExtensions = new Set([
-    ".7z",
-    ".a",
-    ".avi",
-    ".avif",
-    ".bin",
-    ".bmp",
-    ".class",
-    ".dll",
-    ".dylib",
-    ".eot",
-    ".exe",
-    ".gif",
-    ".gz",
-    ".ico",
-    ".jar",
-    ".jpeg",
-    ".jpg",
-    ".lockb",
-    ".map",
-    ".mov",
-    ".mp3",
-    ".mp4",
-    ".o",
-    ".otf",
-    ".pdf",
-    ".png",
-    ".pyc",
-    ".so",
-    ".svgz",
-    ".tar",
-    ".ttf",
-    ".wasm",
-    ".webm",
-    ".webp",
-    ".woff",
-    ".woff2",
-    ".zip",
-  ]);
-
-  if (binaryExtensions.has(extension)) return false;
-  if (fileName.endsWith(".min.js") || fileName.endsWith(".min.css")) return false;
-
-  return true;
-}
-
 function normalizeGitPath(path: string): string {
   return posix.normalize(path).replace(/^\.\//, "");
+}
+
+function inferWorkspacePath(repoRoot: string, cwd: string): string | undefined {
+  const relativePath = normalizeGitPath(relative(repoRoot, resolve(cwd)));
+  if (relativePath === "." || relativePath.startsWith("../")) return undefined;
+  const parts = relativePath.split("/").filter(Boolean);
+  return parts.length > 1 && MONOREPO_WORKSPACE_ROOTS.has(parts[0]!) ? `${parts[0]}/${parts[1]}` : undefined;
+}
+
+function normalizeDiffSha(sha: string): string | null {
+  return /^0+$/.test(sha) ? null : sha;
+}
+
+function isSubmoduleRawChange(change: RawDiffChange): boolean {
+  return change.oldMode === "160000" || change.newMode === "160000";
+}
+
+function rawDiffMap(changes: RawDiffChange[]): Map<string, RawDiffChange> {
+  return new Map(changes.map((change) => [normalizeGitPath(getChangeKey(change)), change]));
+}
+
+async function getNestedRepoRoot(pi: ExtensionAPI, parentRepoRoot: string, submodulePath: string): Promise<{ repoRoot: string } | { unavailableReason: string }> {
+  const result = await pi.exec("git", ["rev-parse", "--show-toplevel"], { cwd: join(parentRepoRoot, submodulePath) });
+  if (result.code !== 0) return { unavailableReason: "submodule is not initialized locally" };
+  const repoRoot = result.stdout.trim();
+  if (repoRoot.length === 0 || repoRoot === parentRepoRoot) return { unavailableReason: "submodule path does not resolve to a nested repository" };
+  return { repoRoot };
+}
+
+function buildSubmoduleInfo(repoRoot: string | null, raw: RawDiffChange, unavailableReason?: string): ReviewSubmoduleInfo {
+  return {
+    repoRoot: repoRoot ?? "",
+    path: raw.newPath ?? raw.oldPath ?? "(unknown)",
+    oldSha: normalizeDiffSha(raw.oldSha),
+    newSha: normalizeDiffSha(raw.newSha),
+    available: repoRoot != null,
+    ...(repoRoot == null ? { unavailableReason: unavailableReason ?? "submodule is not initialized locally" } : {}),
+  };
+}
+
+async function resolveSubmoduleInfo(pi: ExtensionAPI, repoRoot: string, raw: RawDiffChange): Promise<ReviewSubmoduleInfo> {
+  const submodulePath = raw.newPath ?? raw.oldPath;
+  if (submodulePath == null || raw.newPath == null) return buildSubmoduleInfo(null, raw, "submodule is not available in the working tree");
+  const nested = await getNestedRepoRoot(pi, repoRoot, submodulePath);
+  return "repoRoot" in nested
+    ? buildSubmoduleInfo(nested.repoRoot, raw)
+    : buildSubmoduleInfo(null, raw, nested.unavailableReason);
 }
 
 function getChangeKey(change: ChangedPath): string {
@@ -425,6 +503,10 @@ function getImportAliases(path: string): string[] {
   return aliases;
 }
 
+function canContainImportSpecifiers(path: string): boolean {
+  return IMPORT_SOURCE_EXTENSIONS.has(posix.extname(path).toLowerCase());
+}
+
 function extractImportSpecifiers(content: string): string[] {
   const specifiers: string[] = [];
   const patterns = [
@@ -442,9 +524,19 @@ function extractImportSpecifiers(content: string): string[] {
   return specifiers;
 }
 
-function resolveRelativeImport(sourcePath: string, specifier: string, aliases: Map<string, string>): string | null {
-  if (!specifier.startsWith(".")) return null;
-  const resolved = normalizeGitPath(posix.join(posix.dirname(sourcePath), specifier));
+function resolveImport(sourcePath: string, specifier: string, aliases: Map<string, string>, importAliases: Record<string, string>): string | null {
+  if (specifier.startsWith(".")) {
+    const resolved = normalizeGitPath(posix.join(posix.dirname(sourcePath), specifier));
+    return aliases.get(resolved) ?? null;
+  }
+
+  const configuredAlias = Object.entries(importAliases)
+    .filter(([prefix]) => specifier === prefix || specifier.startsWith(`${prefix}/`))
+    .sort(([left], [right]) => right.length - left.length)[0];
+  if (configuredAlias == null) return null;
+  const [prefix, target] = configuredAlias;
+  const suffix = specifier === prefix ? "" : specifier.slice(prefix.length + 1);
+  const resolved = normalizeGitPath(posix.join(target, suffix));
   return aliases.get(resolved) ?? null;
 }
 
@@ -454,7 +546,7 @@ export interface ChangedFileReferenceGraph {
   incoming: Map<string, string[]>;
 }
 
-export function getChangedFileReferenceGraph(changes: ChangedPath[], contentsByPath: Map<string, string>): ChangedFileReferenceGraph {
+export function getChangedFileReferenceGraph(changes: ChangedPath[], contentsByPath: Map<string, string>, options: { importAliases?: Record<string, string> } = {}): ChangedFileReferenceGraph {
   const paths = changes.map(getChangeKey).map(normalizeGitPath);
   const pathSet = new Set(paths);
   const aliases = new Map<string, string>();
@@ -475,7 +567,7 @@ export function getChangedFileReferenceGraph(changes: ChangedPath[], contentsByP
     const referencedPaths = new Set<string>();
 
     for (const specifier of extractImportSpecifiers(content)) {
-      const referencedPath = resolveRelativeImport(sourcePath, specifier, aliases);
+      const referencedPath = resolveImport(sourcePath, specifier, aliases, options.importAliases ?? {});
       if (referencedPath == null || referencedPath === sourcePath || !pathSet.has(referencedPath)) continue;
       referencedPaths.add(referencedPath);
     }
@@ -634,33 +726,48 @@ async function getBranchBaseRevision(pi: ExtensionAPI, repoRoot: string): Promis
   return result.stdout.trim() || null;
 }
 
-export async function getReviewWindowData(pi: ExtensionAPI, cwd: string): Promise<ReviewWindowData> {
+export async function getReviewWindowData(pi: ExtensionAPI, cwd: string, options: ReviewWindowOptions = {}): Promise<ReviewWindowData> {
   const repoRoot = await getRepoRoot(pi, cwd);
+  const requestedWorkspace = options.workspacePath == null ? inferWorkspacePath(repoRoot, cwd) : normalizeGitPath(options.workspacePath);
+  const workspacePath = options.wholeRepo || requestedWorkspace?.startsWith("../") ? undefined : requestedWorkspace;
+  const configuredPathspecs = options.wholeRepo ? [] : options.pathspecs ?? (workspacePath == null ? [] : [workspacePath]);
+  const pathspecs = [...new Set(configuredPathspecs.map(normalizeGitPath).filter((path) => path !== "." && !path.startsWith("../")))];
+  const diffPathArgs = ["--", ...pathspecs];
+  const optionalPathArgs = pathspecs.length > 0 ? ["--", ...pathspecs] : [];
   const repositoryHasHead = await hasHead(pi, repoRoot);
 
-  const trackedDiffOutput = repositoryHasHead
-    ? await runGit(pi, repoRoot, ["diff", "--find-renames", "-M", "--name-status", "HEAD", "--"])
-    : "";
-  const worktreeNumStatOutput = repositoryHasHead
-    ? await runGitAllowFailure(pi, repoRoot, ["diff", "--find-renames", "-M", "--numstat", "HEAD", "--"])
-    : "";
-  const untrackedOutput = await runGitAllowFailure(pi, repoRoot, ["ls-files", "--others", "--exclude-standard"]);
-  const statusOutput = await runGitAllowFailure(pi, repoRoot, ["status", "--porcelain=v1", "-z", "--untracked-files=all"]);
-  const trackedFilesOutput = await runGitAllowFailure(pi, repoRoot, ["ls-files", "--cached"]);
-  const deletedFilesOutput = await runGitAllowFailure(pi, repoRoot, ["ls-files", "--deleted"]);
-  const lastCommitOutput = repositoryHasHead
-    ? await runGitAllowFailure(pi, repoRoot, ["diff-tree", "--root", "--find-renames", "-M", "--name-status", "--no-commit-id", "-r", "HEAD"])
-    : "";
-  const lastCommitNumStatOutput = repositoryHasHead
-    ? await runGitAllowFailure(pi, repoRoot, ["diff-tree", "--root", "--find-renames", "-M", "--numstat", "--no-commit-id", "-r", "HEAD"])
-    : "";
-  const branchBaseRevision = repositoryHasHead ? await getBranchBaseRevision(pi, repoRoot) : null;
-  const branchDiffOutput = branchBaseRevision == null
-    ? ""
-    : await runGitAllowFailure(pi, repoRoot, ["diff", "--find-renames", "-M", "--name-status", branchBaseRevision, "HEAD", "--"]);
-  const branchNumStatOutput = branchBaseRevision == null
-    ? ""
-    : await runGitAllowFailure(pi, repoRoot, ["diff", "--find-renames", "-M", "--numstat", branchBaseRevision, "HEAD", "--"]);
+  const [
+    trackedDiffOutput,
+    worktreeNumStatOutput,
+    worktreeRawOutput,
+    untrackedOutput,
+    statusOutput,
+    trackedFilesOutput,
+    deletedFilesOutput,
+    lastCommitOutput,
+    lastCommitNumStatOutput,
+    lastCommitRawOutput,
+    branchBaseRevision,
+  ] = await Promise.all([
+    repositoryHasHead ? runGit(pi, repoRoot, ["diff", "--find-renames", "-M", "--name-status", "HEAD", ...diffPathArgs]) : Promise.resolve(""),
+    repositoryHasHead ? runGitAllowFailure(pi, repoRoot, ["diff", "--find-renames", "-M", "--numstat", "HEAD", ...diffPathArgs]) : Promise.resolve(""),
+    repositoryHasHead ? runGitAllowFailure(pi, repoRoot, ["diff", "--find-renames", "-M", "--raw", "-z", "HEAD", ...diffPathArgs]) : Promise.resolve(""),
+    runGitAllowFailure(pi, repoRoot, ["ls-files", "--others", "--exclude-standard", ...optionalPathArgs]),
+    runGitAllowFailure(pi, repoRoot, ["status", "--porcelain=v1", "-z", "--untracked-files=all", ...optionalPathArgs]),
+    runGitAllowFailure(pi, repoRoot, ["ls-files", "--cached", ...optionalPathArgs]),
+    runGitAllowFailure(pi, repoRoot, ["ls-files", "--deleted", ...optionalPathArgs]),
+    repositoryHasHead ? runGitAllowFailure(pi, repoRoot, ["diff-tree", "--root", "--find-renames", "-M", "--name-status", "--no-commit-id", "-r", "HEAD", ...optionalPathArgs]) : Promise.resolve(""),
+    repositoryHasHead ? runGitAllowFailure(pi, repoRoot, ["diff-tree", "--root", "--find-renames", "-M", "--numstat", "--no-commit-id", "-r", "HEAD", ...optionalPathArgs]) : Promise.resolve(""),
+    repositoryHasHead ? runGitAllowFailure(pi, repoRoot, ["diff-tree", "--root", "--find-renames", "-M", "--raw", "-z", "--no-commit-id", "-r", "HEAD", ...optionalPathArgs]) : Promise.resolve(""),
+    repositoryHasHead ? getBranchBaseRevision(pi, repoRoot) : Promise.resolve(null),
+  ]);
+  const [branchDiffOutput, branchNumStatOutput, branchRawOutput] = branchBaseRevision == null
+    ? ["", "", ""]
+    : await Promise.all([
+        runGitAllowFailure(pi, repoRoot, ["diff", "--find-renames", "-M", "--name-status", branchBaseRevision, "HEAD", ...diffPathArgs]),
+        runGitAllowFailure(pi, repoRoot, ["diff", "--find-renames", "-M", "--numstat", branchBaseRevision, "HEAD", ...diffPathArgs]),
+        runGitAllowFailure(pi, repoRoot, ["diff", "--find-renames", "-M", "--raw", "-z", branchBaseRevision, "HEAD", ...diffPathArgs]),
+      ]);
 
   const untrackedChanges = parseUntrackedPaths(untrackedOutput);
   const statusChanges = parseStatusPorcelain(statusOutput);
@@ -668,30 +775,34 @@ export async function getReviewWindowData(pi: ExtensionAPI, cwd: string): Promis
   const localChanges = statusChanges.length > 0 ? mergeMissingChangedPaths(statusChanges, diffChanges) : diffChanges;
   const lastCommitStats = parseNumStat(lastCommitNumStatOutput);
   const branchStats = parseNumStat(branchNumStatOutput);
+  const worktreeRaw = rawDiffMap(parseRawDiff(worktreeRawOutput));
+  const lastCommitRaw = rawDiffMap(parseRawDiff(lastCommitRawOutput));
+  const branchRaw = rawDiffMap(parseRawDiff(branchRawOutput));
   const worktreeChanges = limitReviewItems(localChanges
-    .filter((change) => isReviewableFilePath(change.newPath ?? change.oldPath ?? "")));
+    .filter((change) => isReviewableFilePath(change.newPath ?? change.oldPath ?? "", options)));
   const worktreeStats = parseNumStat(worktreeNumStatOutput);
-  await Promise.all(worktreeChanges.map(async (change) => {
+  await mapWithConcurrency(worktreeChanges, 8, async (change) => {
     if (change.oldPath != null || change.newPath == null || worktreeStats.has(normalizeGitPath(change.newPath))) return;
     const content = await getWorkingTreeContent(repoRoot, change.newPath);
     worktreeStats.set(normalizeGitPath(change.newPath), { additions: countContentLines(content), deletions: 0 });
-  }));
+  });
   const deletedPaths = new Set(parseTrackedPaths(deletedFilesOutput));
   const statusCurrentPaths = statusChanges.flatMap((change) => (change.newPath == null ? [] : [change.newPath]));
   const currentPaths = limitReviewItems(uniquePaths([...parseTrackedPaths(trackedFilesOutput), ...parseTrackedPaths(untrackedOutput), ...statusCurrentPaths])
     .filter((path) => !deletedPaths.has(path))
-    .filter(isReviewableFilePath));
+    .filter((path) => isReviewableFilePath(path, options)));
   const currentPathSet = new Set(currentPaths);
   const lastCommitChanges = limitReviewItems(parseNameStatus(lastCommitOutput)
-    .filter((change) => isReviewableFilePath(change.newPath ?? change.oldPath ?? "")));
+    .filter((change) => isReviewableFilePath(change.newPath ?? change.oldPath ?? "", options)));
   const branchChanges = limitReviewItems(parseNameStatus(branchDiffOutput)
-    .filter((change) => isReviewableFilePath(change.newPath ?? change.oldPath ?? "")));
+    .filter((change) => isReviewableFilePath(change.newPath ?? change.oldPath ?? "", options)));
   const branchContentsByPath = new Map<string, string>();
-  await Promise.all(branchChanges.map(async (change) => {
+  const relationshipChanges = branchChanges.filter((change) => change.newPath != null && canContainImportSpecifiers(change.newPath));
+  await mapWithConcurrency(relationshipChanges, 8, async (change) => {
     if (change.newPath == null) return;
     branchContentsByPath.set(normalizeGitPath(change.newPath), await getWorkingTreeContent(repoRoot, change.newPath));
-  }));
-  const branchReferenceGraph = getChangedFileReferenceGraph(branchChanges, branchContentsByPath);
+  });
+  const branchReferenceGraph = getChangedFileReferenceGraph(branchChanges, branchContentsByPath, options);
 
   const seeds = new Map<string, ReviewFileSeed>();
 
@@ -721,6 +832,30 @@ export async function getReviewWindowData(pi: ExtensionAPI, cwd: string): Promis
     seed.lastCommit = toComparison(change, lastCommitStats.get(normalizeGitPath(key)));
   }
 
+  const markSubmodules = async (scope: ReviewScope, rawChanges: Map<string, RawDiffChange>, stats: Map<string, ChangeStats>): Promise<void> => {
+    for (const [key, raw] of rawChanges.entries()) {
+      if (!isSubmoduleRawChange(raw)) continue;
+      const seed = upsertSeed(seeds, key, () => createSeed(key, raw.newPath != null));
+      if (scope === "git-diff") {
+        seed.worktreeStatus = raw.status;
+        seed.hasWorkingTreeFile = raw.newPath != null;
+        seed.inGitDiff = true;
+        seed.gitDiff ??= toComparison(raw, stats.get(key));
+      } else if (scope === "last-commit") {
+        seed.inLastCommit = true;
+        seed.lastCommit ??= toComparison(raw, stats.get(key));
+      } else {
+        seed.inAllFiles = true;
+        seed.allFiles ??= toComparison(raw, stats.get(key));
+      }
+      seed.submodule = { ...(seed.submodule ?? {}), [scope]: await resolveSubmoduleInfo(pi, repoRoot, raw) };
+    }
+  };
+
+  await markSubmodules("git-diff", worktreeRaw, worktreeStats);
+  await markSubmodules("last-commit", lastCommitRaw, lastCommitStats);
+  await markSubmodules("all-files", branchRaw, branchStats);
+
   if (seeds.size === 0) {
     for (const path of currentPaths) {
       const seed = createSeed(path, true);
@@ -730,38 +865,75 @@ export async function getReviewWindowData(pi: ExtensionAPI, cwd: string): Promis
   }
 
   const files = limitReviewItems([...seeds.values()].map(createReviewFile).sort(compareLocalReviewFilesForLimit));
-  return { repoRoot, files, branchBaseRevision, visibleScopes: ["git-diff", "last-commit"] };
+  const visibleScopes: ReviewScope[] = [];
+  if (files.some((file) => file.inGitDiff)) visibleScopes.push("git-diff");
+  if (files.some((file) => file.inAllFiles)) visibleScopes.push("all-files");
+  if (files.some((file) => file.inLastCommit)) visibleScopes.push("last-commit");
+  return { repoRoot, files, branchBaseRevision, visibleScopes, workspacePath };
 }
 
-export async function getReviewWindowDataForRevisionRange(pi: ExtensionAPI, cwd: string, branchBaseRevision: string, modifiedRevision: string): Promise<ReviewWindowData> {
+export async function getReviewWindowDataForRevisionRange(pi: ExtensionAPI, cwd: string, branchBaseRevision: string, modifiedRevision: string, options: RevisionRangeOptions = {}): Promise<ReviewWindowData> {
   const repoRoot = await getRepoRoot(pi, cwd);
-  const branchDiffOutput = await runGitAllowFailure(pi, repoRoot, ["diff", "--find-renames", "-M", "--name-status", branchBaseRevision, modifiedRevision, "--"]);
-  const branchNumStatOutput = await runGitAllowFailure(pi, repoRoot, ["diff", "--find-renames", "-M", "--numstat", branchBaseRevision, modifiedRevision, "--"]);
+  const resolvedBaseRevision = options.mergeBase
+    ? (await runGit(pi, repoRoot, ["merge-base", branchBaseRevision, modifiedRevision])).trim()
+    : branchBaseRevision;
+  if (resolvedBaseRevision.length === 0) throw new Error(`Could not resolve merge base for ${branchBaseRevision}...${modifiedRevision}.`);
+  const requestedWorkspace = options.workspacePath == null ? inferWorkspacePath(repoRoot, cwd) : normalizeGitPath(options.workspacePath);
+  const workspacePath = options.wholeRepo || requestedWorkspace?.startsWith("../") ? undefined : requestedWorkspace;
+  const configuredPathspecs = options.wholeRepo ? [] : options.pathspecs ?? (workspacePath == null ? [] : [workspacePath]);
+  const pathspecs = [...new Set(configuredPathspecs.map(normalizeGitPath).filter((path) => path !== "." && !path.startsWith("../")))];
+  const pathArgs = pathspecs.length > 0 ? ["--", ...pathspecs] : ["--"];
+  const branchDiffOutput = await runGitAllowFailure(pi, repoRoot, ["diff", "--find-renames", "-M", "--name-status", resolvedBaseRevision, modifiedRevision, ...pathArgs]);
+  const branchNumStatOutput = await runGitAllowFailure(pi, repoRoot, ["diff", "--find-renames", "-M", "--numstat", resolvedBaseRevision, modifiedRevision, ...pathArgs]);
+  const branchRawOutput = await runGitAllowFailure(pi, repoRoot, ["diff", "--find-renames", "-M", "--raw", "-z", resolvedBaseRevision, modifiedRevision, ...pathArgs]);
   const branchStats = parseNumStat(branchNumStatOutput);
+  const branchRaw = rawDiffMap(parseRawDiff(branchRawOutput));
   const branchChanges = limitReviewItems(parseNameStatus(branchDiffOutput)
-    .filter((change) => isReviewableFilePath(change.newPath ?? change.oldPath ?? "")));
+    .filter((change) => isReviewableFilePath(change.newPath ?? change.oldPath ?? "", options)));
   const branchContentsByPath = new Map<string, string>();
+  const relationshipChanges = branchChanges.filter((change) => change.newPath != null && canContainImportSpecifiers(change.newPath));
 
-  await Promise.all(branchChanges.map(async (change) => {
+  await mapWithConcurrency(relationshipChanges, 8, async (change) => {
     if (change.newPath == null) return;
     branchContentsByPath.set(normalizeGitPath(change.newPath), await getRevisionContent(pi, repoRoot, modifiedRevision, change.newPath));
-  }));
+  });
 
-  const branchReferenceGraph = getChangedFileReferenceGraph(branchChanges, branchContentsByPath);
+  const branchReferenceGraph = getChangedFileReferenceGraph(branchChanges, branchContentsByPath, options);
   const seeds = new Map<string, ReviewFileSeed>();
 
   for (const change of branchChanges) {
     const key = getChangeKey(change);
     const seed = upsertSeed(seeds, key, () => createSeed(key, false));
     seed.inAllFiles = true;
-    seed.allFiles = toComparison(change, branchStats.get(normalizeGitPath(key)));
+    seed.allFiles = toComparison(change, branchStats.get(normalizeGitPath(key)), {
+      originalRevision: resolvedBaseRevision,
+      modifiedRevision,
+    });
     seed.allFilesReferenceCount = branchReferenceGraph.counts.get(normalizeGitPath(key)) ?? 0;
     seed.allFilesOutgoingReferences = branchReferenceGraph.outgoing.get(normalizeGitPath(key)) ?? [];
     seed.allFilesIncomingReferences = branchReferenceGraph.incoming.get(normalizeGitPath(key)) ?? [];
   }
 
+  for (const [key, raw] of branchRaw.entries()) {
+    if (!isSubmoduleRawChange(raw)) continue;
+    const seed = upsertSeed(seeds, key, () => createSeed(key, raw.newPath != null));
+    seed.inAllFiles = true;
+    seed.allFiles ??= toComparison(raw, branchStats.get(key), {
+      originalRevision: resolvedBaseRevision,
+      modifiedRevision,
+    });
+    seed.submodule = { ...(seed.submodule ?? {}), "all-files": await resolveSubmoduleInfo(pi, repoRoot, raw) };
+  }
+
   const files = limitReviewItems([...seeds.values()].map(createReviewFile).sort(compareReviewFiles));
-  return { repoRoot, files, branchBaseRevision, modifiedRevision, visibleScopes: ["all-files"] };
+  return {
+    repoRoot,
+    files,
+    branchBaseRevision: resolvedBaseRevision,
+    modifiedRevision,
+    visibleScopes: ["all-files"],
+    workspacePath: workspacePath ?? (pathspecs.length === 1 ? pathspecs[0] : undefined),
+  };
 }
 
 export async function loadReviewFileContents(pi: ExtensionAPI, repoRoot: string, file: ReviewFile, scope: ReviewScope, branchBaseRevision?: string | null, modifiedRevision = "HEAD"): Promise<ReviewFileContents> {
@@ -776,9 +948,23 @@ export async function loadReviewFileContents(pi: ExtensionAPI, repoRoot: string,
     return { originalContent: "", modifiedContent: "" };
   }
 
-  const allFilesBaseRevision = scope === "all-files" ? branchBaseRevision ?? await getBranchBaseRevision(pi, repoRoot) : null;
-  const originalRevision = scope === "git-diff" ? "HEAD" : scope === "last-commit" ? "HEAD^" : allFilesBaseRevision;
-  const comparisonModifiedRevision = scope === "git-diff" ? null : scope === "last-commit" ? "HEAD" : modifiedRevision;
+  const allFilesBaseRevision = scope === "all-files" && comparison.originalRevision === undefined
+    ? branchBaseRevision ?? await getBranchBaseRevision(pi, repoRoot)
+    : null;
+  const originalRevision = comparison.originalRevision !== undefined
+    ? comparison.originalRevision
+    : scope === "git-diff"
+      ? "HEAD"
+      : scope === "last-commit"
+        ? "HEAD^"
+        : allFilesBaseRevision;
+  const comparisonModifiedRevision = comparison.modifiedRevision !== undefined
+    ? comparison.modifiedRevision
+    : scope === "git-diff"
+      ? null
+      : scope === "last-commit"
+        ? "HEAD"
+        : modifiedRevision;
 
   const originalContent = comparison.oldPath == null || originalRevision == null ? "" : await getRevisionContent(pi, repoRoot, originalRevision, comparison.oldPath);
   const modifiedContent = comparison.newPath == null
