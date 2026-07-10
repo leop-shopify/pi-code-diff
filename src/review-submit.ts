@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { DiffReviewComment, ReviewFile, ReviewSubmitPayload } from "./types.js";
+import { joinReviewPath } from "./types.js";
 
 export type ReviewVerdict = "approve" | "request_changes" | "comment";
 
@@ -45,7 +46,8 @@ const EVENT_BY_VERDICT: Record<ReviewVerdict, string> = {
 };
 
 function getCommentFilePath(files: ReviewFile[], fileId: string): string {
-  return files.find((file) => file.id === fileId)?.path ?? fileId;
+  const file = files.find((candidate) => candidate.id === fileId);
+  return file == null ? fileId : joinReviewPath(file.pathPrefix, file.path);
 }
 
 function cleanReviewText(text: string): string {
@@ -53,13 +55,14 @@ function cleanReviewText(text: string): string {
 }
 
 function formatModifyInlineBody(comment: DiffReviewComment): string {
-  const newText = cleanReviewText(comment.body);
-  const oldText = comment.originalText?.trim();
-  if (oldText == null || oldText.length === 0) return newText;
+  const oldText = comment.originalText;
+  if (oldText == null || oldText.length === 0) return comment.body;
 
   const lines = ["Suggested change:", "", "```diff"];
-  for (const line of oldText.split(/\r?\n/)) lines.push(`- ${line}`);
-  for (const line of newText.split(/\r?\n/)) lines.push(`+ ${line}`);
+  for (const line of oldText.split(/\r\n|\n|\r/)) lines.push(`- ${line}`);
+  if (comment.body.length > 0) {
+    for (const line of comment.body.split(/\r\n|\n|\r/)) lines.push(`+ ${line}`);
+  }
   lines.push("```");
   return lines.join("\n");
 }
@@ -73,6 +76,8 @@ export function buildInlineComments(files: ReviewFile[], comments: DiffReviewCom
   for (const comment of comments) {
     if (comment.intent !== "comment" && comment.intent !== "modify") continue;
     if (comment.side === "file" || comment.startLine == null) continue;
+    const file = files.find((candidate) => candidate.id === comment.fileId);
+    if (file?.pathPrefix != null) continue;
     const path = getCommentFilePath(files, comment.fileId);
     const side = comment.side === "deleted" ? "LEFT" : "RIGHT";
     const line = comment.endLine ?? comment.startLine;

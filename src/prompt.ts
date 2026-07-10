@@ -1,10 +1,8 @@
 import type { CommentIntent, DiffReviewComment, ReviewFile, ReviewScope, ReviewSubmitPayload } from "./types.js";
-import { formatIntentLabel } from "./types.js";
+import { formatIntentLabel, getReviewFileDisplayPath } from "./types.js";
 
 function getCommentFilePath(file: ReviewFile | undefined, scope: ReviewScope): string {
-  if (file == null) return "(unknown file)";
-  const comparison = scope === "git-diff" ? file.gitDiff : scope === "last-commit" ? file.lastCommit : file.allFiles;
-  return comparison?.displayPath ?? file.path;
+  return file == null ? "(unknown file)" : getReviewFileDisplayPath(file, scope);
 }
 
 function formatLocation(comment: DiffReviewComment, file: ReviewFile | undefined): string {
@@ -36,7 +34,9 @@ function scopeOrder(scope: ReviewScope): number {
 
 function sortComments(comments: DiffReviewComment[], fileMap: Map<string, ReviewFile>): DiffReviewComment[] {
   return [...comments]
-    .filter((comment) => comment.body.trim().length > 0)
+    .filter((comment) => comment.intent === "modify"
+      ? comment.body.length > 0 || (comment.originalText?.length ?? 0) > 0
+      : comment.body.trim().length > 0)
     .sort((a, b) => {
       const aFile = fileMap.get(a.fileId);
       const bFile = fileMap.get(b.fileId);
@@ -62,14 +62,18 @@ interface PromptItem {
 }
 
 function commentPromptBody(comment: DiffReviewComment): string {
-  const body = comment.body.trim();
-  if (comment.intent === "modify" && comment.originalText != null && comment.originalText.length > 0) {
-    const out = ["LINE CHANGED"];
-    for (const line of comment.originalText.split(/\r?\n/)) out.push(`- ${line}`);
-    for (const line of body.split(/\r?\n/)) out.push(`+ ${line}`);
-    return out.join("\n");
+  if (comment.intent === "modify") {
+    if (comment.originalText != null && comment.originalText.length > 0) {
+      const out = ["LINE CHANGED"];
+      for (const line of comment.originalText.split(/\r\n|\n|\r/)) out.push(`- ${line}`);
+      if (comment.body.length > 0) {
+        for (const line of comment.body.split(/\r\n|\n|\r/)) out.push(`+ ${line}`);
+      }
+      return out.join("\n");
+    }
+    return comment.body;
   }
-  return body;
+  return comment.body.trim();
 }
 
 interface IntentSectionContent {
@@ -224,5 +228,5 @@ export function composeReviewPrompt(files: ReviewFile[], payload: ReviewSubmitPa
     pushIntentSection(lines, title, section);
   });
 
-  return lines.join("\n").trim();
+  return lines.join("\n").replace(/^\n+|\n+$/g, "");
 }

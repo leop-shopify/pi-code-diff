@@ -1,5 +1,5 @@
 import { filterFilesBySearch } from "./search.js";
-import type { ChangeStatus, CommentIntent, CommentSide, DiffReviewComment, ReviewFile, ReviewFocus, ReviewLineTarget, ReviewScope, ReviewState } from "./types.js";
+import type { ChangeStatus, CommentIntent, CommentSide, DiffReviewComment, FileCommentTarget, ReviewFile, ReviewFocus, ReviewLineTarget, ReviewScope, ReviewState } from "./types.js";
 import { scopeFileKey } from "./types.js";
 
 function hasFilesForScope(files: ReviewFile[], scope: ReviewScope): boolean {
@@ -246,11 +246,12 @@ export function getLineComment(state: ReviewState, fileId: string, scope: Review
   ));
 }
 
-export function getFileComment(state: ReviewState, fileId: string, scope: ReviewScope): DiffReviewComment | undefined {
+export function getFileComment(state: ReviewState, fileId: string, scope: ReviewScope, fileTarget: FileCommentTarget = "file"): DiffReviewComment | undefined {
   return state.draft.comments.find((comment) => (
     comment.fileId === fileId
       && comment.scope === scope
       && comment.side === "file"
+      && (comment.fileTarget ?? "file") === fileTarget
   ));
 }
 
@@ -293,7 +294,10 @@ export function upsertLineComment(
   endLine = line,
   originalText?: string,
 ): ReviewState {
-  const trimmed = withTrimmedBody(body);
+  const storedBody = intent === "modify" ? body : withTrimmedBody(body);
+  const hasContent = intent === "modify"
+    ? storedBody !== originalText && (storedBody.length > 0 || (originalText?.length ?? 0) > 0)
+    : storedBody.length > 0;
   const nextRange = normalizeRange(line, endLine);
   const existing = state.draft.comments.find((comment) => (
     comment.fileId === fileId
@@ -302,9 +306,8 @@ export function upsertLineComment(
       && comment.startLine != null
       && rangesOverlap(comment.startLine, comment.endLine ?? comment.startLine, nextRange.startLine, nextRange.endLine)
   ));
-  const nextComment = trimmed.length === 0
-    ? null
-    : {
+  const nextComment = hasContent
+    ? {
         id: existing?.id ?? `line:${scope}:${fileId}:${side}:${nextRange.startLine}`,
         fileId,
         scope,
@@ -312,9 +315,10 @@ export function upsertLineComment(
         intent,
         startLine: nextRange.startLine,
         endLine: nextRange.endLine,
-        body: trimmed,
+        body: storedBody,
         ...(originalText != null ? { originalText } : {}),
-      };
+      }
+    : null;
 
   return replaceComment(
     state,
@@ -327,13 +331,13 @@ export function upsertLineComment(
   );
 }
 
-export function upsertFileComment(state: ReviewState, fileId: string, scope: ReviewScope, body: string, intent: CommentIntent = "comment"): ReviewState {
+export function upsertFileComment(state: ReviewState, fileId: string, scope: ReviewScope, body: string, intent: CommentIntent = "comment", fileTarget: FileCommentTarget = "file"): ReviewState {
   const trimmed = withTrimmedBody(body);
-  const existing = getFileComment(state, fileId, scope);
+  const existing = getFileComment(state, fileId, scope, fileTarget);
   const nextComment = trimmed.length === 0
     ? null
     : {
-        id: existing?.id ?? `file:${scope}:${fileId}`,
+        id: existing?.id ?? `file:${fileTarget}:${scope}:${fileId}`,
         fileId,
         scope,
         side: "file" as const,
@@ -341,11 +345,15 @@ export function upsertFileComment(state: ReviewState, fileId: string, scope: Rev
         startLine: null,
         endLine: null,
         body: trimmed,
+        fileTarget,
       };
 
   return replaceComment(
     state,
-    (comment) => comment.fileId === fileId && comment.scope === scope && comment.side === "file",
+    (comment) => comment.fileId === fileId
+      && comment.scope === scope
+      && comment.side === "file"
+      && (comment.fileTarget ?? "file") === fileTarget,
     nextComment,
   );
 }

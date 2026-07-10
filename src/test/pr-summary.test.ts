@@ -78,6 +78,7 @@ describe("remote PR summary source", () => {
         expect(args).toContain("--no-extensions");
         expect(args).toContain("-p");
         expect(args.join("\n")).toContain("Status must be exactly one of pending, blocked, approved");
+        expect(args.join("\n")).toContain("Diff: 2 files touched | +3/-9");
         expect(args.join("\n")).toContain("Open review comments:");
         expect(args.join("\n")).toContain("Can we keep the legacy checkout path compatible?");
         return {
@@ -97,6 +98,7 @@ describe("remote PR summary source", () => {
     expect(summary).toContain("Title:\nRemove old checkout path");
     expect(summary).toContain("URL:\nhttps://github.com/example/widgets/pull/12");
     expect(summary).toContain("Author:\nalice");
+    expect(summary).toContain("Diff:\n2 files touched | +3/-9");
     expect(summary).toContain("Status:\npending - open review comments");
     expect(summary).toContain("\n\nProblem:\nRemove the old path.");
     expect(summary).toContain("Open comments:\ncarol asked whether the legacy checkout path needs compatibility.");
@@ -134,6 +136,7 @@ describe("remote PR summary source", () => {
     const summary = await source.load();
 
     expect(summary).toContain("Author:\nalice");
+    expect(summary).toContain("Diff:\n2 files touched | +3/-9");
     expect(summary).toContain("Status:\nblocked");
     expect(summary).toContain("not mergeable");
   });

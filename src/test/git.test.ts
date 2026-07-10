@@ -2,7 +2,7 @@ import { mkdir, mkdtemp, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
-import { getBranchBaseRef, getChangedFileReferenceCounts, getChangedFileReferenceGraph, getReviewWindowData, getWorkingTreeContent, isPathInside, isReviewFileSizeAllowed, isReviewableFilePath, limitReviewItems, MAX_REVIEW_FILE_BYTES, MAX_REVIEW_FILE_COUNT, mergeChangedPaths, parseLocalBranchRefs, parseNameStatus, parseNumStat, parseStatusPorcelain, parseUntrackedPaths, selectClosestAncestorBranch } from "../git.js";
+import { getBranchBaseRef, getChangedFileReferenceCounts, getChangedFileReferenceGraph, getReviewWindowData, getReviewWindowDataForRevisionRange, getWorkingTreeContent, isPathInside, isReviewFileSizeAllowed, isReviewableFilePath, limitReviewItems, loadReviewFileContents, mapWithConcurrency, MAX_REVIEW_FILE_BYTES, MAX_REVIEW_FILE_COUNT, mergeChangedPaths, parseLocalBranchRefs, parseNameStatus, parseNumStat, parseRawDiff, parseStatusPorcelain, parseUntrackedPaths, selectClosestAncestorBranch } from "../git.js";
 
 describe("git helpers", () => {
   it("parses modified, added, deleted, and renamed files", () => {
@@ -18,6 +18,20 @@ describe("git helpers", () => {
       { status: "added", oldPath: null, newPath: "README.md" },
       { status: "deleted", oldPath: "old.txt", newPath: null },
       { status: "renamed", oldPath: "src/old-name.ts", newPath: "src/new-name.ts" },
+    ]);
+  });
+
+  it("parses raw submodule gitlink changes with exact commits", () => {
+    expect(parseRawDiff(":160000 160000 abc1234 def5678 M\0packages/app\0")).toEqual([
+      {
+        status: "modified",
+        oldPath: "packages/app",
+        newPath: "packages/app",
+        oldMode: "160000",
+        newMode: "160000",
+        oldSha: "abc1234",
+        newSha: "def5678",
+      },
     ]);
   });
 
@@ -61,6 +75,24 @@ describe("git helpers", () => {
       { status: "added", oldPath: null, newPath: "app/channels/game_play_channel.rb" },
       { status: "added", oldPath: null, newPath: "test/javascript/controllers/game_play_heartbeat_controller_test.js" },
     ]);
+  });
+
+  it("defaults local reviews invoked from a workspace to that workspace pathspec", async () => {
+    const exec = vi.fn(async (_command: string, args: string[]) => {
+      const key = args.join(" ");
+      if (key === "rev-parse --show-toplevel") return { code: 0, stdout: "/repo\n", stderr: "" };
+      if (key === "rev-parse --verify HEAD") return { code: 1, stdout: "", stderr: "" };
+      if (key === "ls-files --others --exclude-standard -- packages/widget") return { code: 0, stdout: "packages/widget/src/app.ts\n", stderr: "" };
+      if (key === "status --porcelain=v1 -z --untracked-files=all -- packages/widget") return { code: 0, stdout: "?? packages/widget/src/app.ts\0", stderr: "" };
+      if (key === "ls-files --cached -- packages/widget") return { code: 0, stdout: "", stderr: "" };
+      if (key === "ls-files --deleted -- packages/widget") return { code: 0, stdout: "", stderr: "" };
+      return { code: 1, stdout: "", stderr: `unexpected command: ${key}` };
+    });
+
+    const data = await getReviewWindowData({ exec } as never, "/repo/packages/widget");
+
+    expect(data.workspacePath).toBe("packages/widget");
+    expect(data.files.map((file) => file.path)).toEqual(["packages/widget/src/app.ts"]);
   });
 
   it("keeps every git status file in the git diff scope when branch comparison is huge", async () => {
@@ -181,6 +213,81 @@ describe("git helpers", () => {
     ]));
   });
 
+  it("preserves merge-base semantics and pathspecs for custom ranges", async () => {
+    const exec = vi.fn(async (_command: string, args: string[]) => {
+      const key = args.join(" ");
+      if (key === "rev-parse --show-toplevel") return { code: 0, stdout: "/repo\n", stderr: "" };
+      if (key === "merge-base base head") return { code: 0, stdout: "merged-base\n", stderr: "" };
+      if (key === "diff --find-renames -M --name-status merged-base head -- packages/widget") return { code: 0, stdout: "M\tpackages/widget/src/app.ts\n", stderr: "" };
+      if (key === "diff --find-renames -M --numstat merged-base head -- packages/widget") return { code: 0, stdout: "2\t1\tpackages/widget/src/app.ts\n", stderr: "" };
+      if (key === "cat-file -s head:packages/widget/src/app.ts") return { code: 0, stdout: "20\n", stderr: "" };
+      if (key === "show head:packages/widget/src/app.ts") return { code: 0, stdout: "export const app = 1;\n", stderr: "" };
+      return { code: 1, stdout: "", stderr: `unexpected command: ${key}` };
+    });
+
+    const data = await getReviewWindowDataForRevisionRange(
+      { exec } as never,
+      "/repo/packages/widget",
+      "base",
+      "head",
+      { mergeBase: true, pathspecs: ["packages/widget"] },
+    );
+
+    expect(data.branchBaseRevision).toBe("merged-base");
+    expect(data.workspacePath).toBe("packages/widget");
+    expect(data.files).toHaveLength(1);
+  });
+
+  it("marks nested submodule ranges and loads their explicit revisions", async () => {
+    const exec = vi.fn(async (_command: string, args: string[], options?: { cwd?: string }) => {
+      const key = args.join(" ");
+      if (key === "rev-parse --show-toplevel" && options?.cwd === "/repo") return { code: 0, stdout: "/repo\n", stderr: "" };
+      if (key === "rev-parse --show-toplevel" && options?.cwd === "/repo/packages/app") return { code: 0, stdout: "/repo/packages/app\n", stderr: "" };
+      if (key === "diff --find-renames -M --name-status old-sha new-sha --") return { code: 0, stdout: "M\tpackages/app\n", stderr: "" };
+      if (key === "diff --find-renames -M --numstat old-sha new-sha --") return { code: 0, stdout: "-\t-\tpackages/app\n", stderr: "" };
+      if (key === "diff --find-renames -M --raw -z old-sha new-sha --") return { code: 0, stdout: ":160000 160000 abc1234 def5678 M\0packages/app\0", stderr: "" };
+      if (key === "cat-file -s new-sha:packages/app") return { code: 0, stdout: "0\n", stderr: "" };
+      if (key === "show new-sha:packages/app") return { code: 0, stdout: "", stderr: "" };
+      if (key === "cat-file -s abc1234:src/app.ts") return { code: 0, stdout: "4\n", stderr: "" };
+      if (key === "show abc1234:src/app.ts") return { code: 0, stdout: "old\n", stderr: "" };
+      if (key === "cat-file -s def5678:src/app.ts") return { code: 0, stdout: "4\n", stderr: "" };
+      if (key === "show def5678:src/app.ts") return { code: 0, stdout: "new\n", stderr: "" };
+      return { code: 1, stdout: "", stderr: `unexpected command: ${key}` };
+    });
+
+    const data = await getReviewWindowDataForRevisionRange({ exec } as never, "/repo", "old-sha", "new-sha");
+    expect(data.files[0]?.submodule?.["all-files"]).toMatchObject({
+      repoRoot: "/repo/packages/app",
+      path: "packages/app",
+      oldSha: "abc1234",
+      newSha: "def5678",
+      available: true,
+    });
+
+    const contents = await loadReviewFileContents({ exec } as never, "/repo/packages/app", {
+      id: "nested",
+      path: "src/app.ts",
+      worktreeStatus: null,
+      hasWorkingTreeFile: true,
+      inGitDiff: false,
+      inLastCommit: false,
+      inAllFiles: true,
+      gitDiff: null,
+      lastCommit: null,
+      allFiles: {
+        status: "modified",
+        oldPath: "src/app.ts",
+        newPath: "src/app.ts",
+        displayPath: "src/app.ts",
+        hasOriginal: true,
+        hasModified: true,
+        originalRevision: "abc1234",
+        modifiedRevision: "def5678",
+      },
+    }, "all-files");
+    expect(contents).toEqual({ originalContent: "old\n", modifiedContent: "new\n" });
+  });
+
   it("counts changed files referenced by other changed files", () => {
     const changes = [
       { status: "added" as const, oldPath: null, newPath: "src/root.ts" },
@@ -196,6 +303,24 @@ describe("git helpers", () => {
     const graph = getChangedFileReferenceGraph(changes, contents);
     expect(graph.outgoing.get("src/a.ts")).toEqual(["src/root.ts"]);
     expect(graph.incoming.get("src/root.ts")).toEqual(["src/a.ts", "src/nested/b.ts"]);
+  });
+
+  it("resolves configured workspace import aliases between changed files", () => {
+    const changes = [
+      { status: "modified" as const, oldPath: "packages/app/src/page.ts", newPath: "packages/app/src/page.ts" },
+      { status: "modified" as const, oldPath: "packages/shared/src/button.ts", newPath: "packages/shared/src/button.ts" },
+    ];
+    const contents = new Map([
+      ["packages/app/src/page.ts", "import { Button } from '@workspace/shared/button';\n"],
+      ["packages/shared/src/button.ts", "export const Button = true;\n"],
+    ]);
+
+    const graph = getChangedFileReferenceGraph(changes, contents, {
+      importAliases: { "@workspace/shared": "packages/shared/src" },
+    });
+
+    expect(graph.outgoing.get("packages/app/src/page.ts")).toEqual(["packages/shared/src/button.ts"]);
+    expect(graph.incoming.get("packages/shared/src/button.ts")).toEqual(["packages/app/src/page.ts"]);
   });
 
   it("filters obvious binary or minified assets", () => {
@@ -246,6 +371,21 @@ describe("git helpers", () => {
     expect(isPathInside("/repo", "/repo")).toBe(true);
     expect(isPathInside("/repo", "/repo2/src/app.ts")).toBe(false);
     expect(isPathInside("/repo", "/tmp/secret.txt")).toBe(false);
+  });
+
+  it("bounds asynchronous file loading concurrency", async () => {
+    let active = 0;
+    let maximumActive = 0;
+    const results = await mapWithConcurrency([1, 2, 3, 4, 5], 2, async (value) => {
+      active += 1;
+      maximumActive = Math.max(maximumActive, active);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      active -= 1;
+      return value * 2;
+    });
+
+    expect(results).toEqual([2, 4, 6, 8, 10]);
+    expect(maximumActive).toBe(2);
   });
 
   it("limits review item counts and file sizes", () => {

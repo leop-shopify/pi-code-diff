@@ -137,55 +137,25 @@ function computeInlineHighlights(oldText: string, newText: string): { oldHighlig
     return { oldHighlights: fullHighlight(oldText), newHighlights: fullHighlight(newText) };
   }
 
-  const oldHighlights: InlineRange[] = [];
-  const newHighlights: InlineRange[] = [];
   const oldChars = Array.from(oldText);
   const newChars = Array.from(newText);
-  const table = Array.from({ length: oldChars.length + 1 }, () => new Uint16Array(newChars.length + 1));
+  const sharedLength = Math.min(oldChars.length, newChars.length);
+  let prefixLength = 0;
+  while (prefixLength < sharedLength && oldChars[prefixLength] === newChars[prefixLength]) prefixLength += 1;
 
-  for (let oldIndex = oldChars.length - 1; oldIndex >= 0; oldIndex -= 1) {
-    const current = table[oldIndex]!;
-    const next = table[oldIndex + 1]!;
-    for (let newIndex = newChars.length - 1; newIndex >= 0; newIndex -= 1) {
-      current[newIndex] = oldChars[oldIndex] === newChars[newIndex]
-        ? next[newIndex + 1]! + 1
-        : Math.max(next[newIndex]!, current[newIndex + 1]!);
-    }
+  let suffixLength = 0;
+  while (
+    suffixLength < sharedLength - prefixLength
+    && oldChars[oldChars.length - suffixLength - 1] === newChars[newChars.length - suffixLength - 1]
+  ) {
+    suffixLength += 1;
   }
 
-  let oldIndex = 0;
-  let newIndex = 0;
-
-  while (oldIndex < oldChars.length && newIndex < newChars.length) {
-    if (oldChars[oldIndex] === newChars[newIndex]) {
-      oldIndex += 1;
-      newIndex += 1;
-      continue;
-    }
-
-    if (table[oldIndex + 1]![newIndex]! >= table[oldIndex]![newIndex + 1]!) {
-      oldHighlights.push({ start: oldIndex, end: oldIndex + 1 });
-      oldIndex += 1;
-      continue;
-    }
-
-    newHighlights.push({ start: newIndex, end: newIndex + 1 });
-    newIndex += 1;
-  }
-
-  while (oldIndex < oldChars.length) {
-    oldHighlights.push({ start: oldIndex, end: oldIndex + 1 });
-    oldIndex += 1;
-  }
-
-  while (newIndex < newChars.length) {
-    newHighlights.push({ start: newIndex, end: newIndex + 1 });
-    newIndex += 1;
-  }
-
+  const oldEnd = oldChars.length - suffixLength;
+  const newEnd = newChars.length - suffixLength;
   return {
-    oldHighlights: coalesceRanges(oldHighlights),
-    newHighlights: coalesceRanges(newHighlights),
+    oldHighlights: prefixLength < oldEnd ? [{ start: prefixLength, end: oldEnd }] : [],
+    newHighlights: prefixLength < newEnd ? [{ start: prefixLength, end: newEnd }] : [],
   };
 }
 

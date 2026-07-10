@@ -23,13 +23,22 @@ describe("review preferences", () => {
     expect(loadReviewPreferences()).toEqual(DEFAULT_REVIEW_PREFERENCES);
   });
 
-  it("persists diff view mode across calls", () => {
-    saveReviewPreference({ diffViewMode: "side-by-side" });
+  it("persists review display and navigation preferences across calls", () => {
+    saveReviewPreference({
+      diffViewMode: "side-by-side",
+      navigatorTreeMode: false,
+      contextLineNavigation: true,
+      commentsGlobal: true,
+    });
 
-    expect(loadReviewPreferences().diffViewMode).toBe("side-by-side");
+    expect(loadReviewPreferences()).toEqual({
+      diffViewMode: "side-by-side",
+      navigatorTreeMode: false,
+      contextLineNavigation: true,
+      commentsGlobal: true,
+    });
 
     saveReviewPreference({ diffViewMode: "unified" });
-
     expect(loadReviewPreferences().diffViewMode).toBe("unified");
   });
 

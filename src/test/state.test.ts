@@ -126,6 +126,18 @@ describe("review state", () => {
     expect(comment?.body).toBe("const x = compute(1, true)");
   });
 
+  it("preserves modify text exactly and supports deleting the selected source", () => {
+    const files = [makeFile("src/a.ts")];
+    let state = createInitialReviewState(files);
+    const replacement = "\tchild()\r\n  nested()  \r\n";
+    state = upsertLineComment(state, "src/a.ts", "git-diff", "added", 12, replacement, "modify", 13, "\told()\r\n  nested()  ");
+
+    expect(getLineComment(state, "src/a.ts", "git-diff", "added", 12)?.body).toBe(replacement);
+
+    state = upsertLineComment(state, "src/a.ts", "git-diff", "added", 12, "", "modify", 13, "\told()\r\n  nested()  ");
+    expect(getLineComment(state, "src/a.ts", "git-diff", "added", 12)?.body).toBe("");
+  });
+
   it("omits originalText when none is provided", () => {
     const files = [makeFile("src/a.ts")];
     let state = createInitialReviewState(files);
@@ -163,6 +175,17 @@ describe("review state", () => {
     expect(state.draft.comments).toHaveLength(1);
     expect(getFileComment(state, "src/a.ts", "git-diff")?.body).toBe("Two");
     expect(getFileComment(state, "src/a.ts", "git-diff")?.intent).toBe("comment");
+  });
+
+  it("keeps file and all-lines comments as distinct annotations", () => {
+    const files = [makeFile("src/a.ts")];
+    let state = createInitialReviewState(files);
+    state = upsertFileComment(state, "src/a.ts", "git-diff", "File note", "comment", "file");
+    state = upsertFileComment(state, "src/a.ts", "git-diff", "All lines note", "comment", "all-lines");
+
+    expect(state.draft.comments).toHaveLength(2);
+    expect(getFileComment(state, "src/a.ts", "git-diff", "file")?.body).toBe("File note");
+    expect(getFileComment(state, "src/a.ts", "git-diff", "all-lines")?.body).toBe("All lines note");
   });
 
   it("filters files using search query", () => {

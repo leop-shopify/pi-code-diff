@@ -285,10 +285,7 @@ describe("buildStructuredDiff", () => {
         oldText: "beta",
         newText: "gamma",
         oldHighlights: [{ start: 0, end: 3 }],
-        newHighlights: [
-          { start: 0, end: 1 },
-          { start: 2, end: 5 },
-        ],
+        newHighlights: [{ start: 0, end: 4 }],
       },
     ]);
   });

@@ -33,9 +33,9 @@ Inside the review UI you can:
   - `COMMENT` — a real GitHub PR comment when the review is remote; for a local review it becomes a local comment to the agent about the change
   - `MODIFY` — an exact edit you make in place on the line; the agent applies it locally
 - insert the resulting local review prompt into Pi’s editor
-- for GitHub PR reviews, send a structured handoff to the agent so it can grammar-check comments, ask for confirmation, and call Pi's GitHub review submission tool
+- for GitHub PR reviews, run a grammar and semantic-safety pass with the active Pi model, automatically apply safe corrections, and submit the confirmed verdict directly
 
-For local reviews, the UI stages the next message for you. For GitHub PR verdicts, the UI sends the review-submission handoff to the agent automatically after you choose the verdict.
+For local reviews, the UI stages the next message for you. For GitHub PR verdicts, the UI grammar-checks the confirmed text and submits automatically when every correction preserves meaning, intent, tone, and technical substance.
 
 ## Quickstart
 
@@ -90,9 +90,11 @@ Configure the shortcut with `globalShortcut` in `~/.pi/agent/extensions/code-dif
 
 `/diff` (and `/code`, `/code-diff`) is the single entry point for every kind of review.
 
-- `/diff` with no arguments reviews local working-tree/uncommitted changes, including untracked files.
+- `/diff` with no arguments reviews local working-tree/uncommitted changes, including untracked files. When Pi is inside a recognized monorepo workspace such as `packages/app`, review is scoped to that workspace; add `--whole-repo` to include the entire checkout.
+- `/diff --include-generated` includes generated text such as `.rbi`, source maps, and minified JavaScript/CSS while still rejecting binary files.
+- Review state is saved locally while the UI is open and restored for the same repository/range. `/diff --resume <session-id>` selects an explicit session; `/diff --discard-resume` discards the matching saved session before opening.
 - `/diff remote <url | branch>` reviews a remote branch or GitHub PR. It accepts a remote branch, a GitHub or Graphite PR URL, or `owner/repo#123`.
-- `/diff <base>..<head>` (or `base...head`) reviews that custom range.
+- `/diff <base>..<head>` compares the two endpoints directly. `/diff <base>...<head>` compares the merge base with `head`.
 
 Local changes open the in-UI scope switcher described below.
 
@@ -113,11 +115,11 @@ Local changes open the in-UI scope switcher described below.
    In the branch-level `all files` scope, files are compared against the nearest local ancestor branch when one exists, so stacked branches review only their own layer. If there is no local parent branch, it falls back to the repository default branch. Files are ordered for review priority: changed files referenced by more other changed files come first, then modified/renamed before added before deleted, then source files before tests/docs/changesets, then path order. The navigator can filter to files related to the active file with `r`. In related mode, `→` means the active file references that file, `←` means that file references the active file, and `↔` means both. Press `r` again to return to all files.
 3. Move to the file and line you care about; press `v` when you want side-by-side diff view
 4. Add annotations:
-   - `Enter` or `m` to edit the line in place as a `MODIFY` (the editor opens seeded with the line's code)
+   - `Enter` or `m` to edit the line in place as a `MODIFY` (the current source starts highlighted)
    - `c` for a line `COMMENT`
    - `d` for a line `DISCUSS`
    - `l` for a file annotation (a `COMMENT`)
-   - `a` for an all-lines note on the current file (a `DISCUSS`)
+   - `a` for an all-lines note on the current file (a `COMMENT`)
 5. Press `s` to insert the review prompt into the editor
 6. Read it, tweak it if you want, then send it normally
 
@@ -129,14 +131,19 @@ Use `/diff` directly, or have an agent call `open_code_diff` with the same targe
 - `/diff` with no args or `open_code_diff({ args: "" })` reviews local working-tree/uncommitted changes, including untracked files, against the configured or detected checkout
 - `/diff base..head` or `open_code_diff({ args: "base..head" })` reviews a `base..head` or `base...head` custom range
 
-Remote branch and GitHub PR reviews fetch with `--no-tags` and a 15 second timeout, then review the fetched base/head range in the `/diff` UI. PR URLs and `owner/repo#number` do not require a checkout; if no matching local checkout is configured or detected, pi-code-diff uses a lightweight git cache under `~/.pi/agent/cache/pi-code-diff/remotes/`.
+Remote branch and GitHub PR reviews fetch with `--no-tags` and a 60 second timeout, then review the fetched base/head range in the `/diff` UI. GitHub PR reviews also show a `PR context` column with the exact title, URL, author, review status, problem summary, validation, open comments, files touched, and a compact `+added/-removed` line count. PR URLs and `owner/repo#number` do not require a checkout; if no matching local checkout is configured or detected, pi-code-diff uses a lightweight git cache under `~/.pi/agent/cache/pi-code-diff/remotes/`.
 
 For monorepos or repos that should resolve to a specific local checkout, add a `repositories` mapping to `~/.pi/agent/extensions/code-diff.json`:
 
 ```json
 {
   "repositories": {
-    "owner/repo": { "cwd": "/absolute/path/to/local/checkout" }
+    "owner/repo": {
+      "cwd": "/absolute/path/to/local/checkout",
+      "subdir": "packages/app",
+      "pathspecs": ["packages/app", "shared/ui"],
+      "importAliases": { "@workspace/shared": "shared/ui" }
+    }
   }
 }
 ```
@@ -150,14 +157,15 @@ When the review is a GitHub PR, finishing the review opens an end-action menu:
 - `Comment`
 - `Send feedback to the agent (no GitHub post)`
 
-The three GitHub verdicts use an agent-mediated submission flow:
+The three GitHub verdicts use an extension-owned submission flow:
 
-1. You pick a verdict in the review UI.
-2. pi-code-diff sends the agent a structured submission handoff with the exact repo, PR number, commit, file paths, lines, sides, verdict, body, and inline comments.
-3. The agent must not inspect code or change review locations. It only fixes grammar, spelling, capitalization, and punctuation in the supplied review text.
-4. The agent asks you to approve/edit/skip each changed text item, batching separate item questions when the current ask tool supports it. Approving an item is the confirmation to submit that item; after the last item is resolved, the agent calls `submit_pr_review` without a second confirmation.
-5. `COMMENT` line items are posted as GitHub inline comments. `MODIFY` line edits are posted as inline comments containing a suggested diff. `COMMENT` file/all-lines items become the review body. `DISCUSS` items are never sent to GitHub.
-6. Approval refuses self-approval with a clear message, and `request changes` requires a body or at least one inline comment.
+1. You pick a verdict in the review UI, confirming the review locations, verdict, and original text.
+2. pi-code-diff asks the active Pi model to correct grammar, spelling, capitalization, punctuation, and awkward syntax without changing meaning.
+3. A separate semantic-safety pass classifies every correction. Meaning-preserving grammar and clarity corrections are applied and submitted automatically without another approval screen.
+4. Only corrections that may alter meaning, intent, tone, technical substance, or requested scope are shown for an exact use/edit/keep/remove decision. Safe corrections in the same review remain automatic, and there is no final confirmation after uncertain items are resolved.
+5. Invalid model output fails closed and falls back to the agent-mediated submission prompt instead of posting unverified text.
+6. `COMMENT` line items are posted as GitHub inline comments. `MODIFY` line edits are posted as inline comments containing a suggested diff. `COMMENT` file/all-lines items become the review body. `DISCUSS` items are never sent to GitHub.
+7. Approval refuses self-approval with a clear message, and `request changes` requires a body or at least one inline comment.
 
 `Send feedback to the agent` skips GitHub entirely and inserts the normal local review prompt instead, so the agent can answer or ask follow-up questions.
 
@@ -230,7 +238,7 @@ Examples:
 
 #### MODIFY
 
-Use `MODIFY` when you already know the exact code change you want. Press `Enter` or `m` on a line and the inline editor opens pre-filled with that line's current code. You edit it in place, like a tiny code editor, and press Enter. The annotation is tracked as a `LINE CHANGED` block that records the original line and your edited line:
+Use `MODIFY` when you already know the exact code change you want. Press `Enter` or `m` on a line and the inline editor opens with that line's current code highlighted. Typing or pasting replaces the highlighted source; an arrow key keeps it and starts editing from that edge. Tabs, indentation, trailing whitespace, and large pastes are preserved. Press Enter to save. An unchanged edit is rejected instead of creating a no-op annotation. The annotation is tracked as a `LINE CHANGED` block that records the original line and your edited line:
 
 ```text
 LINE CHANGED
@@ -265,17 +273,24 @@ When the review UI generates the local prompt, it uses different wording dependi
 
 #### Navigator
 
+New reviews select the first file in the visible Navigator order. Locale and translation directories show English variants and Brazilian Portuguese by default; other locales remain in the review and can be revealed at any time.
+
 - `↑↓` or `j/k` — move between files, wrapping from top to bottom and bottom to top
+- `T` — toggle package-grouped tree and flat review-priority order
+- `L` — show/hide locale files other than English and Brazilian Portuguese
+- `R` — mark the active file reviewed/unreviewed
+- `] / [` — jump to the next / previous unreviewed file
 - `Ctrl+d` / `Ctrl+u` — move down / up by half a pane
 - `Ctrl+f` / `Ctrl+b` or `PageDown` / `PageUp` — move down / up by a full pane
 - `gg / G` — jump to the top / bottom
 - `r` — toggle related-files filter in `all files` scope
+- `Enter / →` — open a changed submodule at its exact nested commit range; `b` returns to the parent review
 - file rows show change counts as `+added -deleted`
 - `Enter` — move focus to diff
 
 #### Diff
 
-- `↑↓` or `j/k` — move between selectable added/deleted lines
+- `↑↓` or `j/k` — move between changed lines; press `C` to include selectable unchanged context lines
 - `Shift+↑↓` — extend the selection into a multiline range on the current side
 - `← / →` — choose the old/deleted or new/added side on replacement rows in side-by-side view
 - `Ctrl+d` / `Ctrl+u` — move down / up by half a pane
@@ -284,13 +299,17 @@ When the review UI generates the local prompt, it uses different wording dependi
 - `n / N` — next / previous code search match when diff search is active
 - `n / p` — next / previous hunk when there is no active diff search
 - `o` — open the selected source location in `$EDITOR` inside the same Pi shell, then return to the review UI when the editor exits
-- `Enter` or `m` — edit the line in place as a `MODIFY`; the editor opens seeded with the line's code and saves a `LINE CHANGED` edit
+- `Enter` or `m` — edit the line in place as a `MODIFY`; the source starts highlighted, and typing or pasting replaces it
+- `y` — copy the selected source, or the selected comment when Comments is focused
+- `Y` — copy `path:start-end` for the selected source
+- `P` — copy a unified patch snippet, using the saved `MODIFY` replacement when present
+- `S` — copy a GitHub suggestion block, using the saved `MODIFY` replacement when present
 - `c` — line `COMMENT`
 - `d` — line `DISCUSS`
 - `e` — edit the existing line comment on the selected line
 - `x` — delete the existing line comment on the selected line
 - `l` — file comment (a `COMMENT`)
-- `a` — all-lines note for the current file (a `DISCUSS`)
+- `a` — all-lines note for the current file (a `COMMENT`)
 - `t` — open template shortcut mode for the selected line
 
 Opening a source location in `$EDITOR` returns you to the review UI when the editor exits and keeps your draft feedback available for submission. The editor command comes from your local `$EDITOR` or `$VISUAL` and is run through your shell, so configure those variables only to commands you trust.
@@ -311,13 +330,15 @@ Line comment markers in the diff gutter:
 - `gg / G` — jump to the top / bottom
 - `e` or `Enter` — edit selected comment
 - `d` — delete selected comment
+- `y` — copy selected comment
+- `A` — toggle active-file comments and the cross-file comments overview
 
 #### Editor
 
 The note editor opens inline in the diff, directly under the line you are annotating, so you type your note in place instead of in the comments panel. File and all-lines notes open the editor at the top of the diff pane.
 
-- `Tab` — cycle `DISCUSS` / `COMMENT` / `MODIFY`
-- `Enter` — save
+- `Tab` — cycle `DISCUSS` / `COMMENT` / `MODIFY` for line annotations; file annotations cycle `DISCUSS` / `COMMENT`
+- `Enter` — save; unchanged `MODIFY` input stays open with an explanation
 - `Shift+Enter` — newline
 - `Esc` — cancel editor
 
@@ -354,6 +375,16 @@ Example:
 {
   "version": 1,
   "globalShortcut": "ctrl+alt+r",
+  "repositories": {
+    "example/widgets": {
+      "cwd": "/absolute/path/to/monorepo",
+      "subdir": "packages/widgets",
+      "pathspecs": ["packages/widgets", "shared/ui"],
+      "importAliases": {
+        "@workspace/shared": "shared/ui"
+      }
+    }
+  },
   "builtins": {
     "disable": ["restore-deleted"]
   },
@@ -374,6 +405,8 @@ Example:
 
 - `version` — schema version, currently `1`
 - `globalShortcut` — global Pi shortcut that opens the review UI, defaults to `alt+s`. Use Pi key identifiers such as `alt+s`, `ctrl+alt+r`, `shift+f5`, or `f5`. Single printable characters require a modifier, so normal typing stays in the editor. Bare special keys such as `f5`, `home`, and `pageUp` are supported. Escape is supported as `escape` or `esc` without modifiers. The shortcut is registered when the extension loads; restart Pi or run `/reload` after changing it. If the configured shortcut is invalid, pi-code-diff uses `alt+s` and shows a config warning.
+- `repositories` — optional remote repository profiles. Each entry accepts a checkout `cwd` or `path`, a default workspace `subdir`, review `pathspecs`, and JavaScript/TypeScript `importAliases`. Configured checkouts are validated against their `origin` before use.
+- Review display preferences are stored in `code-diff-preferences.json`; in-progress versioned sessions are stored under Pi's local `cache/pi-code-diff/sessions` directory and removed after submit or explicit discard.
 - `builtins.disable` — built-in shortcut ids to turn off
 - `shortcuts` — your custom shortcuts
 

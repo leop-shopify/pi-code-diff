@@ -8,10 +8,16 @@ export type PersistedDiffViewMode = "unified" | "side-by-side";
 
 export interface ReviewPreferences {
   diffViewMode: PersistedDiffViewMode;
+  navigatorTreeMode: boolean;
+  contextLineNavigation: boolean;
+  commentsGlobal: boolean;
 }
 
 export const DEFAULT_REVIEW_PREFERENCES: ReviewPreferences = {
   diffViewMode: "unified",
+  navigatorTreeMode: true,
+  contextLineNavigation: false,
+  commentsGlobal: false,
 };
 
 function getPreferencesPath(): string {
@@ -32,6 +38,9 @@ export function loadReviewPreferences(): ReviewPreferences {
     const record = parsed as Record<string, unknown>;
     return {
       diffViewMode: isPersistedDiffViewMode(record.diffViewMode) ? record.diffViewMode : DEFAULT_REVIEW_PREFERENCES.diffViewMode,
+      navigatorTreeMode: typeof record.navigatorTreeMode === "boolean" ? record.navigatorTreeMode : DEFAULT_REVIEW_PREFERENCES.navigatorTreeMode,
+      contextLineNavigation: typeof record.contextLineNavigation === "boolean" ? record.contextLineNavigation : DEFAULT_REVIEW_PREFERENCES.contextLineNavigation,
+      commentsGlobal: typeof record.commentsGlobal === "boolean" ? record.commentsGlobal : DEFAULT_REVIEW_PREFERENCES.commentsGlobal,
     };
   } catch {
     return { ...DEFAULT_REVIEW_PREFERENCES };
