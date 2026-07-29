@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { composeReviewPrompt } from "../prompt.js";
+import { composeDiscussionPrompt, composeReviewPrompt } from "../prompt.js";
 import type { ReviewFile } from "../types.js";
 
 const files: ReviewFile[] = [
@@ -295,6 +295,76 @@ describe("composeReviewPrompt", () => {
     });
 
     expect(prompt).toContain("1. src/bar.ts:27-29 (added)");
+  });
+
+  it("keeps only DISCUSS items in an agent discussion prompt", () => {
+    const prompt = composeDiscussionPrompt(files, {
+      type: "submit",
+      allComment: "Why do we need this review-wide change?",
+      allIntent: "discuss",
+      comments: [
+        {
+          id: "1",
+          fileId: "bar",
+          scope: "git-diff",
+          side: "added",
+          intent: "comment",
+          startLine: 10,
+          endLine: 10,
+          body: "Tell the PR author to handle nil.",
+        },
+        {
+          id: "2",
+          fileId: "bar",
+          scope: "git-diff",
+          side: "added",
+          intent: "modify",
+          startLine: 20,
+          endLine: 20,
+          originalText: "oldCall()",
+          body: "newCall()",
+        },
+        {
+          id: "3",
+          fileId: "bar",
+          scope: "git-diff",
+          side: "added",
+          intent: "discuss",
+          startLine: 30,
+          endLine: 30,
+          body: "Can you explain this branch?",
+        },
+      ],
+    });
+
+    expect(prompt).toContain("Why do we need this review-wide change?");
+    expect(prompt).toContain("Can you explain this branch?");
+    expect(prompt).not.toContain("Tell the PR author to handle nil.");
+    expect(prompt).not.toContain("oldCall()");
+    expect(prompt).not.toContain("newCall()");
+    expect(prompt).not.toContain("COMMENT");
+    expect(prompt).not.toContain("MODIFY");
+  });
+
+  it("returns an empty agent discussion prompt when the review has no DISCUSS items", () => {
+    const prompt = composeDiscussionPrompt(files, {
+      type: "submit",
+      allComment: "Review-wide human comment",
+      allIntent: "comment",
+      comments: [{
+        id: "1",
+        fileId: "bar",
+        scope: "git-diff",
+        side: "added",
+        intent: "modify",
+        startLine: 20,
+        endLine: 20,
+        originalText: "oldCall()",
+        body: "newCall()",
+      }],
+    });
+
+    expect(prompt).toBe("");
   });
 
   it("separates modify, comment, and discuss sections in mixed mode", () => {

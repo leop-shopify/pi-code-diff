@@ -2164,6 +2164,7 @@ export class ReviewApp {
       this.requestRender();
       return;
     }
+    this.persistSession();
     this.done({ type: "submit", ...this.state.draft });
   }
 
@@ -2912,7 +2913,7 @@ export class ReviewApp {
         this.editSelectedComment();
         return;
       }
-      if (data === "d") {
+      if (matchesReviewAction("commentDelete", data)) {
         this.deleteSelectedComment();
         return;
       }

@@ -155,7 +155,7 @@ When the review is a GitHub PR, finishing the review opens an end-action menu:
 - `Approve`
 - `Request changes`
 - `Comment`
-- `Send feedback to the agent (no GitHub post)`
+- `Start discussion with agents` when at least one `DISCUSS` item exists
 
 The three GitHub verdicts use an extension-owned submission flow:
 
@@ -167,7 +167,9 @@ The three GitHub verdicts use an extension-owned submission flow:
 6. `COMMENT` line items are posted as GitHub inline comments. `MODIFY` line edits are posted as inline comments containing a suggested diff. `COMMENT` file/all-lines items become the review body. `DISCUSS` items are never sent to GitHub.
 7. Approval refuses self-approval with a clear message, and `request changes` requires a body or at least one inline comment.
 
-`Send feedback to the agent` skips GitHub entirely and inserts the normal local review prompt instead, so the agent can answer or ask follow-up questions.
+`Start discussion with agents` skips GitHub entirely and stages only the `DISCUSS` items as the prompt for an agent conversation. When an agent opened the review with `open_code_diff`, that prompt returns to the waiting agent; after a direct `/diff remote`, it stays in Pi's editor for you to submit. The `DISCUSS` items are consumed when the discussion starts, while existing `COMMENT` and `MODIFY` items stay in the saved review for the PR author.
+
+If the discussion produces material findings, the agent asks `Want me to prepopulate the findings as comments?` before adding any confirmed findings as editable `COMMENT` items. It then asks `Good to continue the review?`; only that confirmation reopens the saved review. If the PR head changed during the discussion, pi-code-diff starts a fresh review instead of applying saved comments to stale line mappings.
 
 ### Fastest path
 
@@ -218,7 +220,7 @@ This distinction is central to how `/diff` works.
 
 #### DISCUSS
 
-Use `DISCUSS` (`d` on a line, `a` for all lines in the current file) when you want explanation, rationale, tradeoffs, or a proposal. It is agent-only and never touches GitHub. A fix can still come out of a discussion, but the agent answers in prose first rather than editing to satisfy the note.
+Use `DISCUSS` (`d` on a line, `a` for all lines in the current file) when you want explanation, rationale, tradeoffs, or a proposal. It is agent-only and never touches GitHub. In a remote PR review, `Start discussion with agents` consumes only these items, keeps `COMMENT` and `MODIFY` items in the saved review, and resumes that review only after you confirm the conversation is done. A fix can still come out of a discussion, but the agent answers in prose first rather than editing to satisfy the note.
 
 Examples:
 
@@ -329,7 +331,7 @@ Line comment markers in the diff gutter:
 - `Ctrl+f` / `Ctrl+b` or `PageDown` / `PageUp` — move down / up by a full pane
 - `gg / G` — jump to the top / bottom
 - `e` or `Enter` — edit selected comment
-- `d` — delete selected comment
+- `d` or `r` — delete selected comment
 - `y` — copy selected comment
 - `A` — toggle active-file comments and the cross-file comments overview
 

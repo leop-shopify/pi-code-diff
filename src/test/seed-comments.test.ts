@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { composeReviewPrompt } from "../prompt.js";
-import { applyResolvedSeedComments, resolveSeedComments } from "../seed-comments.js";
-import { createInitialReviewState, getFileComment, getLineComment } from "../state.js";
+import { applyResolvedSeedComments, partitionResolvedSeedComments, resolveSeedComments } from "../seed-comments.js";
+import { createInitialReviewState, getFileComment, getLineComment, upsertLineComment } from "../state.js";
 import type { ChangeStatus, ReviewFile, ReviewFileComparison } from "../types.js";
 
 function makeComparison(path: string, status: ChangeStatus = "modified"): ReviewFileComparison {
@@ -120,6 +120,30 @@ describe("resolveSeedComments", () => {
     ]);
 
     expect(resolved[0]).toMatchObject({ fileId: renamed.id, scope: "git-diff" });
+  });
+});
+
+describe("partitionResolvedSeedComments", () => {
+  it("keeps existing COMMENT and MODIFY items when findings target overlapping lines", () => {
+    const files = [makeFile("src/app.ts")];
+    let state = createInitialReviewState(files);
+    state = upsertLineComment(state, "src/app.ts", "git-diff", "added", 4, "Existing human comment", "comment", 6);
+    state = upsertLineComment(state, "src/app.ts", "git-diff", "added", 10, "replacement()", "modify", 10, "original()");
+    const { resolved } = resolveSeedComments(files, ["git-diff"], [
+      { path: "src/app.ts", body: "Overlaps the human comment", line: 5 },
+      { path: "src/app.ts", body: "Overlaps the modification", line: 10 },
+      { path: "src/app.ts", body: "New finding", line: 20 },
+    ]);
+
+    const partition = partitionResolvedSeedComments(state, resolved);
+
+    expect(partition.conflicts.map((comment) => comment.body)).toEqual([
+      "Overlaps the human comment",
+      "Overlaps the modification",
+    ]);
+    expect(partition.applicable.map((comment) => comment.body)).toEqual(["New finding"]);
+    expect(getLineComment(state, "src/app.ts", "git-diff", "added", 5)?.body).toBe("Existing human comment");
+    expect(getLineComment(state, "src/app.ts", "git-diff", "added", 10)?.intent).toBe("modify");
   });
 });
 

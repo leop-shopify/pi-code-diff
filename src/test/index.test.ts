@@ -9,7 +9,9 @@ const mocks = vi.hoisted(() => ({
   getReviewWindowDataForRevisionRange: vi.fn(),
   loadReviewFileContents: vi.fn(),
   composeReviewPrompt: vi.fn(),
+  composeDiscussionPrompt: vi.fn(),
   runReviewApp: vi.fn(),
+  resolveRemoteReviewTarget: vi.fn(),
   createReviewSessionId: vi.fn(() => "automatic-session"),
   loadReviewSession: vi.fn(),
   saveReviewSession: vi.fn(),
@@ -30,6 +32,12 @@ vi.mock("../git.js", () => ({
 
 vi.mock("../prompt.js", () => ({
   composeReviewPrompt: mocks.composeReviewPrompt,
+  composeDiscussionPrompt: mocks.composeDiscussionPrompt,
+}));
+
+vi.mock("../remote.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../remote.js")>()),
+  resolveRemoteReviewTarget: mocks.resolveRemoteReviewTarget,
 }));
 
 vi.mock("../review-session.js", () => ({
@@ -53,7 +61,7 @@ vi.mock("../review-submit.js", async (importOriginal) => ({
   submitPullRequestReview: mocks.submitPullRequestReview,
 }));
 
-const { composeRemoteReviewPrompt, composeReviewSubmissionPrompt, mergeReviewBodies, submitUiConfirmedReview, default: codeDiffExtension } = await import("../index.js");
+const { composeRemoteDiscussionPrompt, composeReviewSubmissionPrompt, mergeReviewBodies, submitUiConfirmedReview, default: codeDiffExtension } = await import("../index.js");
 
 function remoteTarget() {
   return {
@@ -81,6 +89,56 @@ function remoteTarget() {
   };
 }
 
+function remoteReviewFile() {
+  return {
+    id: "src/app.ts::all::origin/main::origin/pr/1/head",
+    path: "src/app.ts",
+    worktreeStatus: "modified" as const,
+    hasWorkingTreeFile: true,
+    inGitDiff: false,
+    inLastCommit: false,
+    inAllFiles: true,
+    gitDiff: null,
+    lastCommit: null,
+    allFiles: {
+      status: "modified" as const,
+      oldPath: "src/app.ts",
+      newPath: "src/app.ts",
+      displayPath: "src/app.ts",
+      hasOriginal: true,
+      hasModified: true,
+    },
+  };
+}
+
+function reviewSessionData(
+  draft: { allComment: string; allIntent: "discuss" | "comment" | "modify"; comments: any[] },
+  activeFileId = remoteReviewFile().id,
+  activeScope: "git-diff" | "all-files" = "all-files",
+) {
+  return {
+    state: {
+      activeScope,
+      activeFileId,
+      searchQuery: "",
+      focus: "diff" as const,
+      wrapLines: true,
+      hideUnchanged: false,
+      selectedCommentIndex: 0,
+      selectedLineTargetByScopeFile: {},
+      draft,
+    },
+    diffViewMode: "unified" as const,
+    navigatorTreeMode: false,
+    contextLineNavigation: true,
+    commentsGlobal: false,
+    reviewedFileIds: [],
+    navigatorScroll: 0,
+    diffScroll: 0,
+    commentsScroll: 0,
+  };
+}
+
 describe("code diff extension", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -91,6 +149,8 @@ describe("code diff extension", () => {
       warnings: ["bad shortcut config"],
       path: "/tmp/code-diff.json",
     });
+    mocks.composeDiscussionPrompt.mockReturnValue("");
+    mocks.resolveRemoteReviewTarget.mockResolvedValue(remoteTarget());
     mocks.reviewGrammar.mockImplementation(async (_ctx, original) => ({ status: "safe", corrected: original, changes: [] }));
     mocks.submitPullRequestReview.mockResolvedValue({ ok: true, message: "https://github.com/example/widgets/pull/1\nReview comment was posted at 12:00.\n1 inline comment was added." });
   });
@@ -240,38 +300,20 @@ describe("code diff extension", () => {
     expect(pi.registerTool).toHaveBeenCalledWith(expect.objectContaining({ name: "submit_pr_review" }));
   });
 
-  it("keeps the remote DISCUSS handoff prose-only and never tells the agent to reopen the diff", () => {
-    const prompt = composeRemoteReviewPrompt({
-      gitRoot: "/repo",
-      baseRef: "origin/main",
-      headRef: "origin/feature/review",
-      remote: "https://github.com/example/widgets/pull/1",
-      branch: "feature/review",
-      repo: "example/widgets",
-      pullRequest: {
-        number: "1",
-        repo: "example/widgets",
-        title: "Add review mode",
-        body: "",
-        additions: 1,
-        deletions: 0,
-        changedFiles: 1,
-        authorLogin: "alice",
-        state: "OPEN",
-        reviews: [],
-        headRefName: "feature/review",
-        headRefOid: "abc123",
-        baseRefName: "main",
-      },
-    }, "Respond to the following review discussion items in prose only.");
+  it("builds a DISCUSS-only continuation contract for the agent", () => {
+    const prompt = composeRemoteDiscussionPrompt(remoteTarget(), "Respond to the following review discussion items in prose only.");
 
-    expect(prompt).toContain("This handoff is for the agent only.");
-    expect(prompt).toContain("DISCUSS items are agent-only questions. Answer them in prose");
-    expect(prompt).not.toMatch(/open_code_diff/);
-    expect(prompt).not.toMatch(/restore|reopen/i);
+    expect(prompt).toContain("Existing COMMENT and MODIFY items remain in the saved review for the PR author.");
+    expect(prompt).toContain("Want me to prepopulate the findings as comments?");
+    expect(prompt).toContain("Good to continue the review?");
+    expect(prompt).toContain("A yes is the user's direct authorization to reopen this saved review.");
+    expect(prompt).toContain('"args": "remote example/widgets#1"');
+    expect(prompt).toContain('"cwd": "/repo"');
+    expect(prompt).toContain("intent comment");
+    expect(prompt).toContain("Do not call open_code_diff merely because this handoff mentions it.");
   });
 
-  it("only instructs opening open_code_diff on a direct user request", () => {
+  it("allows open_code_diff continuation only after the explicit remote discussion confirmation", () => {
     const tools = new Map<string, any>();
     const pi = {
       registerCommand: vi.fn(),
@@ -284,8 +326,182 @@ describe("code diff extension", () => {
     const guidelines: string[] = tools.get("open_code_diff").promptGuidelines;
 
     expect(guidelines.some((line) => /only when the user directly asks/i.test(line))).toBe(true);
-    expect(guidelines.some((line) => /do not call .*open_code_diff.*(?:on your own|automatically|because a prompt)/i.test(line))).toBe(true);
-    expect(guidelines.join("\n")).not.toMatch(/restore\/reopen|restore the diff/i);
+    expect(guidelines.some((line) => /explicit yes to `Good to continue the review\?`/i.test(line))).toBe(true);
+    expect(guidelines.some((line) => /handoff never authorizes reopening before the user's continuation confirmation/i.test(line))).toBe(true);
+    expect(guidelines.some((line) => /Want me to prepopulate the findings as comments\?/i.test(line))).toBe(true);
+    expect(guidelines.some((line) => /intent `comment`/i.test(line))).toBe(true);
+  });
+
+  it("starts a DISCUSS-only agent conversation and preserves human review items", async () => {
+    const tools = new Map<string, any>();
+    const file = remoteReviewFile();
+    const comments = [
+      {
+        id: "discuss",
+        fileId: file.id,
+        scope: "all-files" as const,
+        side: "added" as const,
+        intent: "discuss" as const,
+        startLine: 3,
+        endLine: 3,
+        body: "Why is this branch needed?",
+      },
+      {
+        id: "comment",
+        fileId: file.id,
+        scope: "all-files" as const,
+        side: "added" as const,
+        intent: "comment" as const,
+        startLine: 4,
+        endLine: 4,
+        body: "Human-facing comment",
+      },
+      {
+        id: "modify",
+        fileId: file.id,
+        scope: "all-files" as const,
+        side: "added" as const,
+        intent: "modify" as const,
+        startLine: 5,
+        endLine: 5,
+        originalText: "original()",
+        body: "replacement()",
+      },
+    ];
+    const payload = { type: "submit" as const, allComment: "Discuss this overall", allIntent: "discuss" as const, comments };
+    const session = reviewSessionData({ allComment: payload.allComment, allIntent: payload.allIntent, comments: payload.comments });
+    mocks.getReviewWindowDataForRevisionRange.mockResolvedValue({
+      repoRoot: "/repo",
+      files: [file],
+      branchBaseRevision: "origin/main",
+      modifiedRevision: "origin/pr/1/head",
+      visibleScopes: ["all-files"],
+    });
+    mocks.composeDiscussionPrompt.mockReturnValue("DISCUSS ONLY\n\nWhy is this branch needed?");
+    mocks.runReviewApp.mockImplementation(async (_ctx, options) => {
+      options.onSessionChange(session);
+      return payload;
+    });
+    const pi = {
+      registerCommand: vi.fn(),
+      registerTool: vi.fn((tool) => tools.set(tool.name, tool)),
+      registerShortcut: vi.fn(),
+      on: vi.fn(),
+    };
+    const ctx = {
+      hasUI: true,
+      cwd: "/repo",
+      ui: {
+        notify: vi.fn(),
+        setWidget: vi.fn(),
+        setEditorText: vi.fn(),
+        select: vi.fn(async () => "Start discussion with agents"),
+        editor: vi.fn(),
+      },
+    };
+
+    codeDiffExtension(pi as never);
+    const result = await tools.get("open_code_diff").execute(
+      "tool-call",
+      { args: "remote example/widgets#1" },
+      new AbortController().signal,
+      vi.fn(),
+      ctx,
+    );
+
+    expect(ctx.ui.select).toHaveBeenCalledWith("PR #1: Add review mode", [
+      "Approve",
+      "Request changes",
+      "Comment",
+      "Start discussion with agents",
+    ]);
+    expect(mocks.composeDiscussionPrompt).toHaveBeenCalledWith([file], payload);
+    expect(mocks.createReviewSessionId).toHaveBeenCalledWith("/repo|origin/main|abc123|example/widgets#1");
+    const prompt = ctx.ui.setEditorText.mock.calls[0]?.[0] as string;
+    expect(prompt).toContain("DISCUSS ONLY");
+    expect(prompt).not.toContain("Human-facing comment");
+    expect(prompt).not.toContain("replacement()");
+    expect(prompt).toContain("Want me to prepopulate the findings as comments?");
+    expect(prompt).toContain("Good to continue the review?");
+    expect(mocks.saveReviewSession).toHaveBeenLastCalledWith(
+      "/repo|origin/main|abc123|example/widgets#1",
+      expect.objectContaining({
+        state: expect.objectContaining({
+          draft: {
+            allComment: "",
+            allIntent: "discuss",
+            comments: [comments[1], comments[2]],
+          },
+        }),
+      }),
+      "automatic-session",
+    );
+    expect(mocks.deleteReviewSession).not.toHaveBeenCalled();
+    expect(result.details.prompt).toBe(prompt);
+  });
+
+  it("does not offer an agent discussion when no DISCUSS items exist and keeps the draft on dismissal", async () => {
+    const tools = new Map<string, any>();
+    const file = remoteReviewFile();
+    const payload = {
+      type: "submit" as const,
+      allComment: "Human review body",
+      allIntent: "comment" as const,
+      comments: [{
+        id: "comment",
+        fileId: file.id,
+        scope: "all-files" as const,
+        side: "added" as const,
+        intent: "comment" as const,
+        startLine: 4,
+        endLine: 4,
+        body: "Human-facing comment",
+      }],
+    };
+    const session = reviewSessionData({ allComment: payload.allComment, allIntent: payload.allIntent, comments: payload.comments });
+    mocks.getReviewWindowDataForRevisionRange.mockResolvedValue({
+      repoRoot: "/repo",
+      files: [file],
+      branchBaseRevision: "origin/main",
+      modifiedRevision: "origin/pr/1/head",
+      visibleScopes: ["all-files"],
+    });
+    mocks.composeDiscussionPrompt.mockReturnValue("");
+    mocks.runReviewApp.mockImplementation(async (_ctx, options) => {
+      options.onSessionChange(session);
+      return payload;
+    });
+    const pi = {
+      registerCommand: vi.fn(),
+      registerTool: vi.fn((tool) => tools.set(tool.name, tool)),
+      registerShortcut: vi.fn(),
+      on: vi.fn(),
+    };
+    const ctx = {
+      hasUI: true,
+      cwd: "/repo",
+      ui: {
+        notify: vi.fn(),
+        setWidget: vi.fn(),
+        setEditorText: vi.fn(),
+        select: vi.fn(async () => undefined),
+        editor: vi.fn(),
+      },
+    };
+
+    codeDiffExtension(pi as never);
+    await tools.get("open_code_diff").execute(
+      "tool-call",
+      { args: "remote example/widgets#1" },
+      new AbortController().signal,
+      vi.fn(),
+      ctx,
+    );
+
+    expect(ctx.ui.select).toHaveBeenCalledWith("PR #1: Add review mode", ["Approve", "Request changes", "Comment"]);
+    expect(ctx.ui.setEditorText).not.toHaveBeenCalled();
+    expect(mocks.deleteReviewSession).not.toHaveBeenCalled();
+    expect(ctx.ui.notify).toHaveBeenCalledWith("Review kept as a draft; nothing was submitted.", "info");
   });
 
   it("open_code_diff waits for local review completion and returns prompt details", async () => {
@@ -427,6 +643,63 @@ describe("code diff extension", () => {
       ],
     }));
     expect(ctx.ui.notify).toHaveBeenCalledWith("code-diff: could not place 1 prepopulated comment (src/missing.ts).", "warning");
+  });
+
+  it("keeps saved review items when prepopulated findings target the same location", async () => {
+    const tools = new Map<string, any>();
+    const file = {
+      id: "src/app.ts::working::::",
+      path: "src/app.ts",
+      worktreeStatus: "modified" as const,
+      hasWorkingTreeFile: true,
+      inGitDiff: true,
+      inLastCommit: false,
+      inAllFiles: false,
+      gitDiff: { status: "modified" as const, oldPath: "src/app.ts", newPath: "src/app.ts", displayPath: "src/app.ts", hasOriginal: true, hasModified: true },
+      lastCommit: null,
+      allFiles: null,
+    };
+    const existing = {
+      id: "existing",
+      fileId: file.id,
+      scope: "git-diff" as const,
+      side: "added" as const,
+      intent: "comment" as const,
+      startLine: 3,
+      endLine: 3,
+      body: "Keep this human comment.",
+    };
+    mocks.loadReviewSession.mockReturnValue(reviewSessionData({ allComment: "", allIntent: "discuss", comments: [existing] }, file.id, "git-diff"));
+    mocks.getReviewWindowData.mockResolvedValue({ repoRoot: "/repo", files: [file], branchBaseRevision: null, modifiedRevision: undefined, visibleScopes: ["git-diff"] });
+    mocks.runReviewApp.mockResolvedValue({ type: "cancel" });
+    const pi = {
+      registerCommand: vi.fn(),
+      registerTool: vi.fn((tool) => tools.set(tool.name, tool)),
+      registerShortcut: vi.fn(),
+      on: vi.fn(),
+    };
+    const ctx = {
+      hasUI: true,
+      cwd: "/repo",
+      ui: { notify: vi.fn(), setWidget: vi.fn(), setEditorText: vi.fn() },
+    };
+
+    codeDiffExtension(pi as never);
+    await tools.get("open_code_diff").execute("tool-call", {
+      args: "",
+      comments: [
+        { path: "src/app.ts", body: "Conflicting generated finding.", line: 3 },
+        { path: "src/app.ts", body: "New generated finding.", line: 5 },
+      ],
+    }, new AbortController().signal, vi.fn(), ctx);
+
+    expect(mocks.runReviewApp).toHaveBeenCalledWith(ctx, expect.objectContaining({
+      initialSession: expect.objectContaining({ state: expect.objectContaining({ draft: expect.objectContaining({ comments: [existing] }) }) }),
+      seedComments: [
+        { fileId: file.id, scope: "git-diff", side: "added", intent: "comment", startLine: 5, endLine: 5, body: "New generated finding." },
+      ],
+    }));
+    expect(ctx.ui.notify).toHaveBeenCalledWith("code-diff: kept 1 existing review item; skipped conflicting prepopulated comment.", "warning");
   });
 
   it("open_code_diff seeds prepopulated comments into the all-files scope for a custom range", async () => {

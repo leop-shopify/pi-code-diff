@@ -188,6 +188,85 @@ describe("ReviewApp interaction", () => {
     }
   });
 
+  it("removes only the selected comment with r from the comments panel", async () => {
+    const { app, loadFileContents } = createHarness();
+    await vi.waitFor(() => expect(loadFileContents).toHaveBeenCalled());
+    const fileId = "src/app.ts::working::::";
+    (app as any).state = {
+      ...(app as any).state,
+      focus: "comments",
+      selectedCommentIndex: 1,
+      draft: {
+        allComment: "Keep the review-wide note",
+        allIntent: "discuss",
+        comments: [
+          {
+            id: "line:git-diff:src/app.ts:added:1",
+            fileId,
+            scope: "git-diff",
+            side: "added",
+            intent: "comment",
+            startLine: 1,
+            endLine: 1,
+            body: "Remove this selected comment",
+          },
+          {
+            id: "line:git-diff:src/app.ts:added:2",
+            fileId,
+            scope: "git-diff",
+            side: "added",
+            intent: "discuss",
+            startLine: 2,
+            endLine: 2,
+            body: "Keep this other comment",
+          },
+        ],
+      },
+    };
+
+    app.handleInput("r");
+
+    expect((app as any).state.draft.allComment).toBe("Keep the review-wide note");
+    expect((app as any).state.draft.comments.map((comment: { body: string }) => comment.body)).toEqual([
+      "Keep this other comment",
+    ]);
+    const rendered = app.render(120).join("\n");
+    expect(rendered).toContain("Keep this other comment");
+    expect(rendered).not.toContain("Remove this selected comment");
+    app.dispose();
+  });
+
+  it("flushes the current review session before submitting", async () => {
+    const { app, done, loadFileContents } = createHarness();
+    await vi.waitFor(() => expect(loadFileContents).toHaveBeenCalled());
+    const onSessionChange = vi.fn();
+    (app as any).options.onSessionChange = onSessionChange;
+    (app as any).state = {
+      ...(app as any).state,
+      draft: {
+        allComment: "",
+        allIntent: "discuss",
+        comments: [{
+          id: "line:git-diff:src/app.ts:added:1",
+          fileId: "src/app.ts::working::::",
+          scope: "git-diff",
+          side: "added",
+          intent: "discuss",
+          startLine: 1,
+          endLine: 1,
+          body: "Why is this needed?",
+        }],
+      },
+    };
+
+    app.handleInput("s");
+
+    expect(onSessionChange).toHaveBeenCalledTimes(1);
+    expect(done).toHaveBeenCalledWith(expect.objectContaining({ type: "submit" }));
+    expect(onSessionChange.mock.invocationCallOrder[0]).toBeLessThan(done.mock.invocationCallOrder[0]!);
+    app.dispose();
+  });
+
   it("opens highlighted MODIFY input with Enter, pastes exactly, saves, and cancels", async () => {
     const { app, loadFileContents } = createHarness();
     await vi.waitFor(() => expect(loadFileContents).toHaveBeenCalled());
