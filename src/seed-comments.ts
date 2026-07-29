@@ -26,6 +26,11 @@ export interface SeedResolution {
   unresolved: SeedReviewComment[];
 }
 
+export interface SeedPartition {
+  applicable: ResolvedSeedComment[];
+  conflicts: ResolvedSeedComment[];
+}
+
 const FALLBACK_VISIBLE_SCOPES: ReviewScope[] = ["git-diff", "last-commit"];
 
 function normalizePath(path: string): string {
@@ -80,6 +85,33 @@ export function resolveSeedComments(files: ReviewFile[], visibleScopes: ReviewSc
   }
 
   return { resolved, unresolved };
+}
+
+function rangesOverlap(firstStart: number, firstEnd: number, secondStart: number, secondEnd: number): boolean {
+  return firstStart <= secondEnd && secondStart <= firstEnd;
+}
+
+function conflictsWithExistingComment(state: ReviewState, seed: ResolvedSeedComment): boolean {
+  return state.draft.comments.some((comment) => {
+    if (comment.fileId !== seed.fileId || comment.scope !== seed.scope || comment.side !== seed.side) return false;
+    if (seed.side === "file" || seed.startLine == null) return comment.side === "file";
+    if (comment.startLine == null) return false;
+    return rangesOverlap(
+      comment.startLine,
+      comment.endLine ?? comment.startLine,
+      seed.startLine,
+      seed.endLine ?? seed.startLine,
+    );
+  });
+}
+
+export function partitionResolvedSeedComments(state: ReviewState, resolved: ResolvedSeedComment[]): SeedPartition {
+  const applicable: ResolvedSeedComment[] = [];
+  const conflicts: ResolvedSeedComment[] = [];
+  for (const seed of resolved) {
+    (conflictsWithExistingComment(state, seed) ? conflicts : applicable).push(seed);
+  }
+  return { applicable, conflicts };
 }
 
 export function applyResolvedSeedComments(state: ReviewState, resolved: ResolvedSeedComment[]): ReviewState {

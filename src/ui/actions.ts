@@ -48,7 +48,7 @@ export const REVIEW_ACTIONS: ReviewActionDefinition[] = [
   { id: "allLines", section: "Diff actions", keys: "a", label: "all-lines comment", inputs: ["a"] },
   { id: "commentMove", section: "Comments", keys: "↑↓/j/k", label: "move comments" },
   { id: "commentEdit", section: "Comments", keys: "e/Enter", label: "edit selected comment" },
-  { id: "commentDelete", section: "Comments", keys: "d", label: "delete selected comment" },
+  { id: "commentDelete", section: "Comments", keys: "d/r", label: "delete selected comment", inputs: ["d", "r"] },
   { id: "commentCopy", section: "Comments", keys: "y", label: "copy selected comment" },
   { id: "globalComments", section: "Comments", keys: "A", label: "active-file/all-comments view", inputs: ["A"] },
   { id: "intent", section: "Editor", keys: "Tab", label: "toggle intent" },

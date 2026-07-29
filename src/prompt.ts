@@ -230,3 +230,12 @@ export function composeReviewPrompt(files: ReviewFile[], payload: ReviewSubmitPa
 
   return lines.join("\n").replace(/^\n+|\n+$/g, "");
 }
+
+export function composeDiscussionPrompt(files: ReviewFile[], payload: ReviewSubmitPayload): string {
+  return composeReviewPrompt(files, {
+    type: "submit",
+    allComment: payload.allIntent === "discuss" ? payload.allComment : "",
+    allIntent: "discuss",
+    comments: payload.comments.filter((comment) => comment.intent === "discuss"),
+  });
+}
