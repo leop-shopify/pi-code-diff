@@ -257,12 +257,23 @@ function formatDiffStats(target: RemoteReviewTarget): string {
   return `${pr.changedFiles} ${fileLabel} touched | +${pr.additions}/-${pr.deletions}`;
 }
 
+function formatAuthor(authorLogin: string, body: string): string {
+  if (authorLogin !== "example/river") return authorLogin;
+
+  const requester = body.match(/^[ \t]*Requested by[ \t]+([^<\r\n]+?)[ \t]+<([^<>\s]+@[^<>\s]+)>[ \t]*$/im);
+  const name = requester?.[1]?.replace(/\s+/g, " ").trim();
+  const email = requester?.[2]?.trim();
+  if (name == null || name.length === 0 || email == null || email.length === 0) return authorLogin;
+
+  return `${authorLogin} requested by ${name} ${email}`;
+}
+
 function enforceIdentityFields(summary: string, target: RemoteReviewTarget, details: PullRequestDetails): string {
   const pr = target.pullRequest!;
   const url = details.url ?? (target.repo == null ? target.remote : `https://github.com/${target.repo}/pull/${pr.number}`);
   return [
     ["Diff", formatDiffStats(target)],
-    ["Author", pr.authorLogin],
+    ["Author", formatAuthor(pr.authorLogin, pr.body)],
     ["URL", url],
     ["Title", pr.title],
   ].reduce((current, [label, value]) => replaceSummaryField(current, label, value), summary);
@@ -281,7 +292,7 @@ function fallbackSummary(target: RemoteReviewTarget, details: PullRequestDetails
   return [
     `Title: ${pr.title}`,
     `URL: ${details.url ?? (target.repo == null ? target.remote : `https://github.com/${target.repo}/pull/${pr.number}`)}`,
-    `Author: ${pr.authorLogin}`,
+    `Author: ${formatAuthor(pr.authorLogin, pr.body)}`,
     `Diff: ${formatDiffStats(target)}`,
     `Status: ${status.status} - ${status.reason}`,
     `Problem: ${bodySignal || "PR body did not include a clear problem statement."}`,
@@ -308,7 +319,7 @@ function formatSummaryInput(target: RemoteReviewTarget, details: PullRequestDeta
   return [
     `Title: ${pr.title}`,
     `URL: ${details.url ?? (target.repo == null ? "" : `https://github.com/${target.repo}/pull/${pr.number}`)}`,
-    `Author: ${pr.authorLogin}`,
+    `Author: ${formatAuthor(pr.authorLogin, pr.body)}`,
     `Diff: ${formatDiffStats(target)}`,
     `State: ${pr.state}`,
     `Computed status: ${status.status} - ${status.reason}`,

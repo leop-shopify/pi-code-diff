@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { createRemotePullRequestSummarySource } from "../pr-summary.js";
 import type { RemoteReviewTarget } from "../remote.js";
 
-function target(): RemoteReviewTarget {
+function target(pullRequest: Partial<NonNullable<RemoteReviewTarget["pullRequest"]>> = {}): RemoteReviewTarget {
   return {
     gitRoot: "/repo",
     baseRef: "origin/main",
@@ -24,6 +24,7 @@ function target(): RemoteReviewTarget {
       headRefName: "feature",
       headRefOid: "abc123",
       baseRefName: "main",
+      ...pullRequest,
     },
   };
 }
@@ -108,7 +109,51 @@ describe("remote PR summary source", () => {
     expect(exec).toHaveBeenCalledWith("pi", expect.arrayContaining(["--model", "openai/gpt-5"]), expect.objectContaining({ cwd: "/repo" }));
   });
 
-  it("falls back to a deterministic summary when the agent call fails", async () => {
+  it("shows the example River requester as the visible author", async () => {
+    const exec = vi.fn(async (command: string, args: string[]) => {
+      if (command === "provider-cli" && args[0] === "pr") {
+        return {
+          code: 0,
+          stdout: JSON.stringify({
+            url: "https://github.com/example/widgets/pull/12",
+            isDraft: false,
+            mergeStateStatus: "CLEAN",
+            reviewDecision: "APPROVED",
+            comments: [],
+            reviews: [],
+            statusCheckRollup: [],
+          }),
+          stderr: "",
+          killed: false,
+        };
+      }
+      if (command === "provider-cli" && args[0] === "api") {
+        return { code: 0, stdout: JSON.stringify({ data: { repository: { pullRequest: { reviewThreads: { nodes: [] } } } } }), stderr: "", killed: false };
+      }
+      if (command === "pi") {
+        expect(args.join("\n")).toContain("Author: example/river requested by Andre Amaral andre.amaral@example.com");
+        return {
+          code: 0,
+          stdout: "Title: Remove old checkout path\nURL: https://github.com/example/widgets/pull/12\nAuthor: example/river\nDiff: 2 files touched | +3/-9\nStatus: approved - review decision approved\nProblem: Remove the old path.\nChanges: Deletes old checkout code.\nValidation: Unit tests pass.\nOpen comments: None found.",
+          stderr: "",
+          killed: false,
+        };
+      }
+      return { code: 1, stdout: "", stderr: `unexpected ${command}`, killed: false };
+    });
+    const riverTarget = target({
+      authorLogin: "example/river",
+      body: "# Context\nRemove the old path.\n\nRequested by Andre Amaral <andre.amaral@example.com>\nSlack thread: https://example.com/thread",
+    });
+
+    const source = createRemotePullRequestSummarySource({ exec } as never, {} as never, riverTarget)!;
+    const summary = await source.load();
+
+    expect(summary).toContain("Author:\nexample/river requested by Andre Amaral andre.amaral@example.com");
+    expect(summary).not.toContain("Author:\nexample/river\n");
+  });
+
+  it("falls back deterministically and keeps the bot login without requester metadata", async () => {
     const exec = vi.fn(async (command: string, args: string[]) => {
       if (command === "provider-cli" && args[0] === "pr") {
         return {
@@ -139,5 +184,14 @@ describe("remote PR summary source", () => {
     expect(summary).toContain("Diff:\n2 files touched | +3/-9");
     expect(summary).toContain("Status:\nblocked");
     expect(summary).toContain("not mergeable");
+
+    const riverSource = createRemotePullRequestSummarySource({ exec } as never, {} as never, target({
+      authorLogin: "example/river",
+      body: "# Context\nNo requester metadata is available.",
+    }))!;
+    const riverSummary = await riverSource.load();
+
+    expect(riverSummary).toContain("Author:\nexample/river");
+    expect(riverSummary).not.toContain("requested by");
   });
 });
