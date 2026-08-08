@@ -561,7 +561,7 @@ export default function codeDiffExtension(pi: ExtensionAPI) {
 
     const approveChoice = "Approve";
     const requestChoice = "Request changes";
-    const commentChoice = "Comment";
+    const commentChoice = "Post Comments";
     const discussionChoice = "Start discussion with agents";
     const choices = [approveChoice, requestChoice, commentChoice];
     if (discussionPrompt.length > 0) choices.push(discussionChoice);
@@ -580,7 +580,7 @@ export default function codeDiffExtension(pi: ExtensionAPI) {
 
     const verdict: ReviewVerdict = choice === approveChoice ? "approve" : choice === requestChoice ? "request_changes" : "comment";
     const reviewBody = buildReviewBody(files, result);
-    const optionalBody = verdict === "comment" ? undefined : await ctx.ui.editor(`${choice}: optional review body comment`, "");
+    const optionalBody = await ctx.ui.editor(`${choice}: optional review body comment`, "");
     const body = mergeReviewBodies(optionalBody, reviewBody);
     return { status: await submitUiConfirmedReview(pi, ctx, target, verdict, body, inlineComments), sessionAction: "delete" };
   }

@@ -1223,7 +1223,6 @@ export class ReviewApp {
   private relatedFilterAnchorFileId: string | null = null;
   private relatedFilterReturnFileId: string | null = null;
   private mousePaneLayout: MousePaneLayout | null = null;
-  private mouseTrackingEnabled = false;
   private lastWidth = 120;
   private pendingVimSequence: "g" | null = null;
   private readonly previousHardwareCursor: boolean;
@@ -1280,7 +1279,6 @@ export class ReviewApp {
       ? this.tui.getShowHardwareCursor()
       : false;
     this.syncCursorMode();
-    this.setMouseTracking(true);
 
     queueMicrotask(() => {
       this.ensureActiveEntry();
@@ -1295,7 +1293,6 @@ export class ReviewApp {
       this.sessionSaveTimer = null;
       this.persistSession();
     }
-    this.setMouseTracking(false);
     if (typeof this.tui.setShowHardwareCursor === "function") {
       this.tui.setShowHardwareCursor(this.previousHardwareCursor);
     }
@@ -1366,20 +1363,6 @@ export class ReviewApp {
 
   private hasContextPanel(): boolean {
     return this.options.contextPanelSource != null && !this.commentsHidden;
-  }
-
-  private writeTerminal(data: string): void {
-    if (typeof this.tui.terminal?.write === "function") {
-      this.tui.terminal.write(data);
-    } else {
-      process.stdout.write(data);
-    }
-  }
-
-  private setMouseTracking(enabled: boolean): void {
-    if (this.mouseTrackingEnabled === enabled) return;
-    this.mouseTrackingEnabled = enabled;
-    this.writeTerminal(enabled ? "\x1b[?1000h\x1b[?1006h" : "\x1b[?1000l\x1b[?1006l");
   }
 
   private getPaneAtMousePosition(col: number, row: number): PaneName | null {
@@ -2140,7 +2123,6 @@ export class ReviewApp {
     this.requestRender();
 
     try {
-      this.setMouseTracking(false);
       if (typeof this.tui.stop === "function") this.tui.stop();
       if (typeof this.tui.terminal?.clearScreen === "function") this.tui.terminal.clearScreen();
       const code = await runShellCommand(command, this.repoRoot);
@@ -2153,7 +2135,6 @@ export class ReviewApp {
       this.invalidateEntry(file.id, this.state.activeScope);
       void this.ensureActiveEntry();
       if (typeof this.tui.start === "function") this.tui.start();
-      this.setMouseTracking(true);
       if (typeof this.tui.requestRender === "function") this.tui.requestRender(true);
     }
   }

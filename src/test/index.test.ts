@@ -412,7 +412,7 @@ describe("code diff extension", () => {
     expect(ctx.ui.select).toHaveBeenCalledWith("PR #1: Add review mode", [
       "Approve",
       "Request changes",
-      "Comment",
+      "Post Comments",
       "Start discussion with agents",
     ]);
     expect(mocks.composeDiscussionPrompt).toHaveBeenCalledWith([file], payload);
@@ -438,6 +438,86 @@ describe("code diff extension", () => {
     );
     expect(mocks.deleteReviewSession).not.toHaveBeenCalled();
     expect(result.details.prompt).toBe(prompt);
+  });
+
+  it("posts inline and general comments together", async () => {
+    type RegisteredTool = {
+      name: string;
+      execute: (
+        toolCallId: string,
+        params: Record<string, unknown>,
+        signal: AbortSignal,
+        onUpdate: (...args: unknown[]) => unknown,
+        ctx: unknown,
+      ) => Promise<unknown>;
+    };
+    const tools = new Map<string, RegisteredTool>();
+    const file = remoteReviewFile();
+    const payload = {
+      type: "submit" as const,
+      allComment: "Existing review-wide note",
+      allIntent: "comment" as const,
+      comments: [{
+        id: "comment",
+        fileId: file.id,
+        scope: "all-files" as const,
+        side: "added" as const,
+        intent: "comment" as const,
+        startLine: 4,
+        endLine: 4,
+        body: "Keep this inline comment",
+      }],
+    };
+    mocks.getReviewWindowDataForRevisionRange.mockResolvedValue({
+      repoRoot: "/repo",
+      files: [file],
+      branchBaseRevision: "origin/main",
+      modifiedRevision: "origin/pr/1/head",
+      visibleScopes: ["all-files"],
+    });
+    mocks.runReviewApp.mockResolvedValue(payload);
+    const pi = {
+      registerCommand: vi.fn(),
+      registerTool: vi.fn((tool: RegisteredTool) => tools.set(tool.name, tool)),
+      registerShortcut: vi.fn(),
+      on: vi.fn(),
+      sendUserMessage: vi.fn(),
+    };
+    const ctx = {
+      hasUI: true,
+      cwd: "/repo",
+      model: { id: "test-model" },
+      modelRegistry: {},
+      isIdle: vi.fn(() => true),
+      ui: {
+        notify: vi.fn(),
+        setWidget: vi.fn(),
+        setEditorText: vi.fn(),
+        setStatus: vi.fn(),
+        select: vi.fn(async () => "Post Comments"),
+        editor: vi.fn(async () => "General review comment"),
+      },
+    };
+
+    codeDiffExtension(pi as never);
+    const openCodeDiff = tools.get("open_code_diff");
+    if (openCodeDiff == null) throw new Error("open_code_diff was not registered");
+    await openCodeDiff.execute(
+      "tool-call",
+      { args: "remote example/widgets#1" },
+      new AbortController().signal,
+      vi.fn(),
+      ctx,
+    );
+
+    expect(ctx.ui.select).toHaveBeenCalledWith("PR #1: Add review mode", ["Approve", "Request changes", "Post Comments"]);
+    expect(ctx.ui.editor).toHaveBeenCalledWith("Post Comments: optional review body comment", "");
+    expect(mocks.submitPullRequestReview).toHaveBeenCalledWith(pi, expect.objectContaining({
+      verdict: "comment",
+      body: "General review comment\n\nExisting review-wide note",
+      comments: [{ path: "src/app.ts", line: 4, side: "RIGHT", body: "Keep this inline comment" }],
+    }));
+    expect(mocks.deleteReviewSession).toHaveBeenCalled();
   });
 
   it("does not offer an agent discussion when no DISCUSS items exist and keeps the draft on dismissal", async () => {
@@ -498,7 +578,7 @@ describe("code diff extension", () => {
       ctx,
     );
 
-    expect(ctx.ui.select).toHaveBeenCalledWith("PR #1: Add review mode", ["Approve", "Request changes", "Comment"]);
+    expect(ctx.ui.select).toHaveBeenCalledWith("PR #1: Add review mode", ["Approve", "Request changes", "Post Comments"]);
     expect(ctx.ui.setEditorText).not.toHaveBeenCalled();
     expect(mocks.deleteReviewSession).not.toHaveBeenCalled();
     expect(ctx.ui.notify).toHaveBeenCalledWith("Review kept as a draft; nothing was submitted.", "info");

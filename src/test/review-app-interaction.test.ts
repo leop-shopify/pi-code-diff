@@ -29,7 +29,7 @@ function createHarness(
   files = [makeFile()],
 ) {
   const loadFileContents = vi.fn(async () => contents);
-  const terminalWrite = vi.fn();
+  const terminalWrite = vi.fn<(data: string) => void>();
   const tui = {
     terminal: { write: terminalWrite, rows: 30, columns: 120 },
     requestRender: vi.fn(),
@@ -49,10 +49,19 @@ function createHarness(
     visibleScopes: ["git-diff"],
     notify: vi.fn(),
   });
-  return { app, done, loadFileContents };
+  return { app, done, loadFileContents, terminalWrite };
 }
 
 describe("ReviewApp interaction", () => {
+  it("leaves mouse reporting to tmux for native selection", async () => {
+    const { app, loadFileContents, terminalWrite } = createHarness();
+    await vi.waitFor(() => expect(loadFileContents).toHaveBeenCalled());
+
+    expect(terminalWrite).not.toHaveBeenCalled();
+    app.dispose();
+    expect(terminalWrite).not.toHaveBeenCalled();
+  });
+
   it("starts a new grouped review on the first visible navigator file", async () => {
     const files = [makeFile("zeta/important.ts"), makeFile("alpha/first.ts")];
     const { app, loadFileContents } = createHarness(undefined, files);
