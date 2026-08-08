@@ -154,8 +154,10 @@ When the review is a GitHub PR, finishing the review opens an end-action menu:
 
 - `Approve`
 - `Request changes`
-- `Comment`
+- `Post Comments`
 - `Start discussion with agents` when at least one `DISCUSS` item exists
+
+All three GitHub verdicts open an optional review-body editor, so `Post Comments` can publish inline comments and a general comment together.
 
 The three GitHub verdicts use an extension-owned submission flow:
 
@@ -259,7 +261,8 @@ When the review UI generates the local prompt, it uses different wording dependi
 #### Global
 
 - `1 / 2 / 3` — switch scope
-- mouse wheel — scroll the pane under the cursor
+- mouse drag — use normal terminal/tmux text selection and copy behavior
+- mouse wheel — scroll the pane under the cursor in Pi fullscreen mode
 - `Tab` / `Shift+Tab` — cycle focus forward / backward
 - `/` — search the focused pane: files in Navigator, code in Diff, comments in Comments
 - `Esc` while searching — clear that pane's search
@@ -313,6 +316,8 @@ New reviews select the first file in the visible Navigator order. Locale and tra
 - `l` — file comment (a `COMMENT`)
 - `a` — all-lines note for the current file (a `COMMENT`)
 - `t` — open template shortcut mode for the selected line
+
+In Pi's regular TUI mode, pi-code-diff leaves mouse handling to the terminal so tmux selection works normally without an in-app key, mode, or automatic copy. In Pi fullscreen mode, Pi owns drag selection and mouse-wheel scrolling.
 
 Opening a source location in `$EDITOR` returns you to the review UI when the editor exits and keeps your draft feedback available for submission. The editor command comes from your local `$EDITOR` or `$VISUAL` and is run through your shell, so configure those variables only to commands you trust.
 
