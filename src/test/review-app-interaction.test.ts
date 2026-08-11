@@ -1,6 +1,23 @@
-import { describe, expect, it, vi } from "vitest";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ReviewFile } from "../types.js";
 import { ReviewApp } from "../ui/review-app.js";
+
+const originalPreferencesPath = process.env.PI_CODE_DIFF_PREFERENCES_PATH;
+let preferencesDir: string;
+
+beforeEach(() => {
+  preferencesDir = mkdtempSync(join(tmpdir(), "pi-code-diff-review-app-"));
+  process.env.PI_CODE_DIFF_PREFERENCES_PATH = join(preferencesDir, "preferences.json");
+});
+
+afterEach(() => {
+  if (originalPreferencesPath == null) delete process.env.PI_CODE_DIFF_PREFERENCES_PATH;
+  else process.env.PI_CODE_DIFF_PREFERENCES_PATH = originalPreferencesPath;
+  rmSync(preferencesDir, { recursive: true, force: true });
+});
 
 function makeFile(path = "src/app.ts"): ReviewFile {
   return {
@@ -27,11 +44,13 @@ function makeFile(path = "src/app.ts"): ReviewFile {
 function createHarness(
   contents = { originalContent: "\told()  \n", modifiedContent: "\tcurrent()  \n" },
   files = [makeFile()],
+  overrides: Partial<ConstructorParameters<typeof ReviewApp>[3]> = {},
+  terminal: { rows?: number; columns?: number } = {},
 ) {
   const loadFileContents = vi.fn(async () => contents);
   const terminalWrite = vi.fn<(data: string) => void>();
   const tui = {
-    terminal: { write: terminalWrite, rows: 30, columns: 120 },
+    terminal: { write: terminalWrite, rows: terminal.rows ?? 30, columns: terminal.columns ?? 120 },
     requestRender: vi.fn(),
     getShowHardwareCursor: vi.fn(() => false),
     setShowHardwareCursor: vi.fn(),
@@ -48,6 +67,7 @@ function createHarness(
     commentShortcuts: [],
     visibleScopes: ["git-diff"],
     notify: vi.fn(),
+    ...overrides,
   });
   return { app, done, loadFileContents, terminalWrite };
 }
@@ -101,20 +121,153 @@ describe("ReviewApp interaction", () => {
     app.dispose();
   });
 
-  it("does not shift the entire viewport on every downward move after crossing its edge", async () => {
+  it("toggles panes with number keys and restores visibility in the next review", async () => {
+    const contextPanelSource = {
+      title: "PR context",
+      loadingText: "Loading PR context",
+      load: vi.fn(async () => "Problem:\nKeep pane state"),
+    };
+    const first = createHarness(undefined, undefined, {
+      visibleScopes: ["git-diff", "last-commit"],
+      contextPanelSource,
+    });
+    await vi.waitFor(() => expect(first.loadFileContents).toHaveBeenCalled());
+
+    for (const key of ["1", "2", "3", "4"]) first.app.handleInput(key);
+
+    expect((first.app as any).state.activeScope).toBe("git-diff");
+    expect((first.app as any).paneVisibility).toEqual({
+      navigator: false,
+      diff: false,
+      comments: false,
+      context: false,
+    });
+    expect(first.app.render(200).join("\n")).toContain("All panes are hidden");
+    first.app.dispose();
+
+    const second = createHarness(undefined, undefined, { contextPanelSource });
+    await vi.waitFor(() => expect(second.loadFileContents).toHaveBeenCalled());
+    expect((second.app as any).paneVisibility).toEqual({
+      navigator: false,
+      diff: false,
+      comments: false,
+      context: false,
+    });
+
+    second.app.handleInput("2");
+    expect((second.app as any).state.focus).toBe("diff");
+    const rendered = second.app.render(200).join("\n");
+    expect(rendered).toContain("▶ Diff");
+    expect((second.app as any).mousePaneLayout).toMatchObject({
+      navigator: null,
+      comments: null,
+    });
+    expect((second.app as any).mousePaneLayout.diff).not.toBeNull();
+    second.app.dispose();
+  });
+
+  it("uses Alt+number for scope switching after number keys become pane toggles", async () => {
+    const { app, loadFileContents } = createHarness(undefined, undefined, {
+      visibleScopes: ["git-diff", "last-commit"],
+    });
+    await vi.waitFor(() => expect(loadFileContents).toHaveBeenCalled());
+
+    app.handleInput("1");
+    expect((app as any).state.activeScope).toBe("git-diff");
+    expect((app as any).paneVisibility.navigator).toBe(false);
+
+    app.handleInput("\x1b2");
+    expect((app as any).state.activeScope).toBe("last-commit");
+    app.dispose();
+  });
+
+  it("expands ten hidden lines above or below the selected diff line", async () => {
+    const originalLines = Array.from({ length: 40 }, (_, index) => `line ${index + 1}`);
+    const modifiedLines = [...originalLines];
+    modifiedLines[19] = "changed line 20";
+    const { app, loadFileContents } = createHarness({
+      originalContent: `${originalLines.join("\n")}\n`,
+      modifiedContent: `${modifiedLines.join("\n")}\n`,
+    });
+    await vi.waitFor(() => expect(loadFileContents).toHaveBeenCalled());
+    app.handleInput("\r");
+
+    const fileId = (app as any).state.activeFileId;
+    const before = (app as any).getDiffLayout(fileId, "git-diff").displayDiff;
+    const beforeVisibleRows = before.visibleItems.filter((item: { type: string }) => item.type === "row").length;
+
+    const selectedBeforeExpansion = structuredClone((app as any).state.selectedLineTargetByScopeFile);
+    app.handleInput("j");
+    expect((app as any).state.selectedLineTargetByScopeFile).toEqual(selectedBeforeExpansion);
+    const entryKey = (app as any).cacheKey(fileId, "git-diff");
+    expect((app as any).expandedContextRows.get(entryKey).size).toBe(10);
+    const below = (app as any).getDiffLayout(fileId, "git-diff").displayDiff;
+    expect(below.visibleItems.filter((item: { type: string }) => item.type === "row")).toHaveLength(beforeVisibleRows + 10);
+
+    app.handleInput("k");
+    expect((app as any).expandedContextRows.get(entryKey).size).toBe(20);
+    app.dispose();
+  });
+
+  it("renders the final wrapped shortcut on short three-pane and four-pane terminals", async () => {
+    const contextPanelSource = {
+      title: "PR context",
+      loadingText: "Loading PR context",
+      load: vi.fn(async () => "Problem:\nKeep every shortcut visible"),
+    };
+    const scenarios = [
+      { width: 80, terminal: { rows: 20, columns: 80 }, overrides: { contextPanelSource } },
+      { width: 54, terminal: { rows: 20, columns: 54 }, overrides: {} },
+      { width: 80, terminal: { rows: 20, columns: 80 }, overrides: { contextPanelSource, visibleScopes: ["git-diff", "last-commit"] as Array<"git-diff" | "last-commit"> } },
+    ];
+
+    for (const scenario of scenarios) {
+      const { app, loadFileContents } = createHarness(undefined, undefined, scenario.overrides, scenario.terminal);
+      await vi.waitFor(() => expect(loadFileContents).toHaveBeenCalled());
+      const rendered = app.render(scenario.width).join("\n");
+      expect(rendered).toContain("Esc / Ctrl+C exit review");
+      expect(rendered).not.toContain("more • ? help");
+      app.dispose();
+    }
+  });
+
+  it("keeps arrow navigation and Shift+arrow range extension in Diff focus", async () => {
+    const { app, loadFileContents } = createHarness({
+      originalContent: "",
+      modifiedContent: "one\ntwo\nthree\nfour\n",
+    });
+    await vi.waitFor(() => expect(loadFileContents).toHaveBeenCalled());
+    app.handleInput("\r");
+
+    const fileId = (app as any).state.activeFileId;
+    const targetKey = `git-diff::${fileId}`;
+    const initial = structuredClone((app as any).state.selectedLineTargetByScopeFile[targetKey]);
+    app.handleInput("\x1b[B");
+    const moved = structuredClone((app as any).state.selectedLineTargetByScopeFile[targetKey]);
+    expect(moved.line).toBeGreaterThan(initial.line);
+
+    app.handleInput("\x1b[b");
+    const extended = (app as any).state.selectedLineTargetByScopeFile[targetKey];
+    expect(extended.line).toBeGreaterThan(moved.line);
+    expect(extended.endLine).toBe(moved.line);
+    app.dispose();
+  });
+
+  it("does not shift the entire viewport on every downward arrow move after crossing its edge", async () => {
     const modifiedContent = Array.from({ length: 80 }, (_, index) => `line ${index + 1}`).join("\n") + "\n";
     const { app, loadFileContents } = createHarness({ originalContent: "", modifiedContent });
     await vi.waitFor(() => expect(loadFileContents).toHaveBeenCalled());
 
     app.render(120);
     app.handleInput("\r");
-    for (let index = 0; index < 12; index += 1) {
-      app.handleInput("j");
+    const movesPastViewport = (app as any).diffPageSize + 4;
+    for (let index = 0; index < movesPastViewport; index += 1) {
+      app.handleInput("\x1b[B");
       app.render(120);
     }
     const recenteredScroll = (app as any).diffScroll;
 
-    app.handleInput("j");
+    app.handleInput("\x1b[B");
     app.render(120);
 
     expect(recenteredScroll).toBeGreaterThan(1);

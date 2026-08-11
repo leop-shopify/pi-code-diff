@@ -2,7 +2,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { DEFAULT_REVIEW_PREFERENCES, loadReviewPreferences, saveReviewPreference } from "../preferences.js";
+import { DEFAULT_REVIEW_PANE_VISIBILITY, DEFAULT_REVIEW_PREFERENCES, loadReviewPreferences, saveReviewPreference } from "../preferences.js";
 
 const originalEnvPath = process.env.PI_CODE_DIFF_PREFERENCES_PATH;
 let tempDir: string;
@@ -29,6 +29,12 @@ describe("review preferences", () => {
       navigatorTreeMode: false,
       contextLineNavigation: true,
       commentsGlobal: true,
+      paneVisibility: {
+        navigator: false,
+        diff: true,
+        comments: false,
+        context: true,
+      },
     });
 
     expect(loadReviewPreferences()).toEqual({
@@ -36,10 +42,35 @@ describe("review preferences", () => {
       navigatorTreeMode: false,
       contextLineNavigation: true,
       commentsGlobal: true,
+      paneVisibility: {
+        navigator: false,
+        diff: true,
+        comments: false,
+        context: true,
+      },
     });
 
     saveReviewPreference({ diffViewMode: "unified" });
-    expect(loadReviewPreferences().diffViewMode).toBe("unified");
+    expect(loadReviewPreferences()).toMatchObject({
+      diffViewMode: "unified",
+      paneVisibility: {
+        navigator: false,
+        diff: true,
+        comments: false,
+        context: true,
+      },
+    });
+  });
+
+  it("fills missing pane visibility keys from defaults", async () => {
+    await writeFile(process.env.PI_CODE_DIFF_PREFERENCES_PATH!, JSON.stringify({
+      paneVisibility: { comments: false },
+    }), "utf8");
+
+    expect(loadReviewPreferences().paneVisibility).toEqual({
+      ...DEFAULT_REVIEW_PANE_VISIBILITY,
+      comments: false,
+    });
   });
 
   it("ignores corrupted preference files and keeps defaults", async () => {

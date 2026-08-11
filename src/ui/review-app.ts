@@ -2,13 +2,11 @@ import { spawn } from "node:child_process";
 import { join } from "node:path";
 import { copyToClipboard, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { CURSOR_MARKER, Editor, type EditorTheme, Key, matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
-import { adjustStructuredDiffContext, buildStructuredDiff, type StructuredDiff, type StructuredDiffVisibleItem } from "../diff.js";
+import { adjustStructuredDiffContext, buildStructuredDiff, getContextExpansionRowIndexes, revealStructuredDiffRows, type ContextExpansionDirection, type StructuredDiff, type StructuredDiffVisibleItem } from "../diff.js";
 import { filterReviewFilesByLocale } from "../locale-files.js";
 import {
   clampSelectedLineTarget,
   createInitialReviewState,
-  cycleFocus,
-  cycleFocusBackward,
   deleteComment,
   ensureActiveFile,
   extendSelectedLineTarget,
@@ -33,7 +31,7 @@ import {
   upsertLineComment,
 } from "../state.js";
 import { detectPiLanguage, highlightCodeLineWithPi } from "../pi-render.js";
-import { loadReviewPreferences, saveReviewPreference } from "../preferences.js";
+import { loadReviewPreferences, saveReviewPreference, type ReviewPaneVisibility } from "../preferences.js";
 import type { PersistedReviewSession, ReviewSessionData } from "../review-session.js";
 import { applyResolvedSeedComments, type ResolvedSeedComment } from "../seed-comments.js";
 import { getShortcutConfigPath, getShortcutsForSide, type CommentShortcut } from "../shortcuts.js";
@@ -110,20 +108,46 @@ interface MousePaneBounds {
 }
 
 interface MousePaneLayout {
-  navigator: MousePaneBounds;
-  diff: MousePaneBounds;
+  navigator: MousePaneBounds | null;
+  diff: MousePaneBounds | null;
   comments: MousePaneBounds | null;
 }
 
 const SEARCHABLE_SCOPES: ReviewScope[] = ["git-diff", "last-commit", "all-files"];
 const DEFAULT_VISIBLE_SCOPES: ReviewScope[] = ["git-diff", "last-commit"];
 const DEFAULT_CONTEXT_LINES = 3;
+const CONTEXT_EXPANSION_LINES = 10;
 const STACKED_LAYOUT_MAX_WIDTH = 99;
 const STACKED_CONTEXT_LAYOUT_MAX_WIDTH = 155;
 const CONTEXT_PANEL_PADDING_X = 2;
 const MAX_LOADED_FILE_ENTRIES = 50;
 const MAX_DIFF_LAYOUT_ENTRIES = 100;
 const MAX_SYNTAX_LINE_ENTRIES = 5000;
+const REVIEW_PANE_ORDER = ["navigator", "diff", "comments", "context"] as const;
+type ReviewPaneName = typeof REVIEW_PANE_ORDER[number];
+
+const FOCUSABLE_PANE_ORDER: ReviewFocus[] = ["navigator", "diff", "comments"];
+const SCOPE_KEYS = [Key.alt("1"), Key.alt("2"), Key.alt("3")] as const;
+const REVIEW_PANE_LABELS: Record<ReviewPaneName, string> = {
+  navigator: "Navigator",
+  diff: "Diff",
+  comments: "Comments",
+  context: "PR context",
+};
+
+export interface ReviewPaneLayout {
+  navigatorWidth: number;
+  diffWidth: number;
+  commentsWidth: number;
+  contextWidth: number;
+}
+
+export interface StackedReviewPaneLayout {
+  navigatorHeight: number;
+  diffHeight: number;
+  commentsHeight: number;
+  contextHeight: number;
+}
 
 function shellQuote(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`;
@@ -217,6 +241,27 @@ export function getPaneLayoutWithContext(frameInnerWidth: number, commentsHidden
   };
 }
 
+export function getPaneLayoutForVisibility(frameInnerWidth: number, visibility: ReviewPaneVisibility): ReviewPaneLayout {
+  const base = getPaneLayoutWithContext(frameInnerWidth, false, visibility.context);
+  const layout: ReviewPaneLayout = {
+    navigatorWidth: visibility.navigator ? base.navigatorWidth : 0,
+    diffWidth: visibility.diff ? base.diffWidth : 0,
+    commentsWidth: visibility.comments ? base.commentsWidth : 0,
+    contextWidth: visibility.context ? base.contextWidth : 0,
+  };
+  const visiblePanes = REVIEW_PANE_ORDER.filter((pane) => visibility[pane]);
+  if (visiblePanes.length === 0) return layout;
+
+  const usedWidth = visiblePanes.reduce((total, pane) => total + layout[`${pane}Width`], 0) + visiblePanes.length - 1;
+  const primaryPane = visiblePanes.includes("diff")
+    ? "diff"
+    : visiblePanes.includes("context")
+      ? "context"
+      : visiblePanes[0]!;
+  layout[`${primaryPane}Width`] += Math.max(0, frameInnerWidth - usedWidth);
+  return layout;
+}
+
 export function getStackedPaneLayout(bodyHeight: number, commentsHidden: boolean): { navigatorHeight: number; diffHeight: number; commentsHeight: number } {
   const safeBodyHeight = Math.max(commentsHidden ? 6 : 9, Math.floor(bodyHeight));
   const minimums = commentsHidden ? [3, 3] : [3, 3, 3];
@@ -268,6 +313,33 @@ export function getStackedPaneLayoutWithContext(bodyHeight: number, commentsHidd
     commentsHeight: heights[2]!,
     contextHeight: heights[3]!,
   };
+}
+
+export function getStackedPaneLayoutForVisibility(bodyHeight: number, visibility: ReviewPaneVisibility, minimumPaneHeight = 3): StackedReviewPaneLayout {
+  const visiblePanes = REVIEW_PANE_ORDER.filter((pane) => visibility[pane]);
+  const layout: StackedReviewPaneLayout = {
+    navigatorHeight: 0,
+    diffHeight: 0,
+    commentsHeight: 0,
+    contextHeight: 0,
+  };
+  if (visiblePanes.length === 0) return layout;
+
+  const paneMinimum = Math.max(1, Math.floor(minimumPaneHeight));
+  const safeBodyHeight = Math.max(visiblePanes.length * paneMinimum, Math.floor(bodyHeight));
+  for (const pane of visiblePanes) layout[`${pane}Height`] = paneMinimum;
+  let remaining = safeBodyHeight - visiblePanes.length * paneMinimum;
+  while (remaining > 0) {
+    let selectedPane = visiblePanes[0]!;
+    for (const pane of visiblePanes.slice(1)) {
+      const paneWeight = pane === "diff" ? 2 : 1;
+      const selectedWeight = selectedPane === "diff" ? 2 : 1;
+      if (layout[`${pane}Height`] / paneWeight < layout[`${selectedPane}Height`] / selectedWeight) selectedPane = pane;
+    }
+    layout[`${selectedPane}Height`] += 1;
+    remaining -= 1;
+  }
+  return layout;
 }
 
 export type MouseWheelDirection = "up" | "down";
@@ -650,15 +722,18 @@ export function formatFocusStatus(focus: ReviewState["focus"]): string {
 
 function renderBox(title: string, width: number, height: number, theme: Theme, lines: string[], focused = false): string[] {
   const innerWidth = Math.max(1, width - 2);
-  const innerHeight = Math.max(1, height - 2);
+  const safeHeight = Math.max(1, Math.floor(height));
+  const innerHeight = Math.max(0, safeHeight - 2);
   const titleText = truncateToWidth(` ${formatPaneTitle(title, focused)} `, Math.max(1, innerWidth - 2), "", false);
   const leftPad = Math.max(0, Math.floor((innerWidth - visibleWidth(titleText)) / 2));
   const rightPad = Math.max(0, innerWidth - visibleWidth(titleText) - leftPad);
   const borderColor = focused ? "accent" : "border";
   const top = theme.fg(borderColor, `┌${repeat("─", leftPad)}${titleText}${repeat("─", rightPad)}┐`);
   const bottom = theme.fg(borderColor, `└${repeat("─", innerWidth)}┘`);
-  const body: string[] = [];
+  if (safeHeight === 1) return [top];
+  if (safeHeight === 2) return [top, bottom];
 
+  const body: string[] = [];
   for (let i = 0; i < innerHeight; i += 1) {
     const line = padLine(lines[i] ?? "", innerWidth);
     body.push(`${theme.fg(borderColor, "│")}${line}${theme.fg(borderColor, "│")}`);
@@ -771,6 +846,7 @@ export function buildDiffActionHintLine(theme: Theme, width: number): string {
     part("d", "discuss", "warning"),
     part("l", "file", "muted"),
     part("a", "all lines", "muted"),
+    part("k/j", "context", "muted"),
     part("y", "copy", "muted"),
     part("w", "wrap", "muted"),
   ].join(sep);
@@ -803,10 +879,49 @@ export function buildRelatedFilePanelLines(theme: Theme, width: number, file: Re
 }
 
 export function buildFooterLines(theme: Theme, promptStatus: string, frameInnerWidth: number): string[] {
+  const width = Math.max(1, frameInnerWidth);
   return [
-    truncateToWidth(theme.fg("dim", promptStatus), frameInnerWidth, "…", false),
-    truncateToWidth(theme.fg("dim", FOOTER_ACTION_HINT), frameInnerWidth, "…", false),
+    ...wrapAnsiText(theme.fg("dim", promptStatus), width, true),
+    ...wrapAnsiText(theme.fg("dim", FOOTER_ACTION_HINT), width, true),
   ];
+}
+
+export function fitFooterLines(theme: Theme, lines: string[], maxLines: number, width: number): string[] {
+  const budget = Math.max(0, Math.floor(maxLines));
+  if (lines.length <= budget) return lines;
+  if (budget === 0) return [];
+
+  const visibleLineCount = budget - 1;
+  const hiddenLineCount = lines.length - visibleLineCount;
+  const marker = truncateToWidth(theme.fg("warning", `+${hiddenLineCount} more • ? help`), Math.max(1, width), "", false);
+  return [...lines.slice(0, visibleLineCount), marker];
+}
+
+export interface ReviewVerticalLayout {
+  bodyHeight: number;
+  footerLines: string[];
+  stackedPaneMinimumHeight: number;
+}
+
+export function getReviewVerticalLayout(
+  theme: Theme,
+  frameInnerHeight: number,
+  headerLineCount: number,
+  visiblePaneCount: number,
+  stacked: boolean,
+  footerLines: string[],
+  width: number,
+): ReviewVerticalLayout {
+  const safeHeight = Math.max(1, Math.floor(frameInnerHeight));
+  const safeHeaderCount = Math.max(0, Math.floor(headerLineCount));
+  const minimumBodyHeight = visiblePaneCount === 0 ? 1 : stacked ? visiblePaneCount : 1;
+  const footerBudget = Math.max(0, safeHeight - safeHeaderCount - minimumBodyHeight);
+  const fittedFooterLines = fitFooterLines(theme, footerLines, footerBudget, width);
+  const bodyHeight = Math.max(minimumBodyHeight, safeHeight - safeHeaderCount - fittedFooterLines.length);
+  const stackedPaneMinimumHeight = stacked && visiblePaneCount > 0
+    ? Math.max(1, Math.min(3, Math.floor(bodyHeight / visiblePaneCount)))
+    : 3;
+  return { bodyHeight, footerLines: fittedFooterLines, stackedPaneMinimumHeight };
 }
 
 export function buildHelpPanelLines(theme: Theme, width: number, activeShortcuts: CommentShortcut[], configPath: string): string[] {
@@ -1190,6 +1305,7 @@ export class ReviewApp {
   private readonly frameStack: ReviewFrame[] = [];
   private openingSubmodule = false;
   private readonly cache = new Map<string, LoadedEntry>();
+  private readonly expandedContextRows = new Map<string, Set<number>>();
   private searchMode = false;
   private searchBuffer = "";
   private searchInitialQuery = "";
@@ -1207,7 +1323,7 @@ export class ReviewApp {
   private commentsGlobal: boolean;
   private showAllLocales: boolean;
   private confirmCancel = false;
-  private commentsHidden = false;
+  private paneVisibility: ReviewPaneVisibility;
   private externalEditorOpen = false;
   private editTarget: EditTarget | null = null;
   private editor: Editor;
@@ -1243,6 +1359,7 @@ export class ReviewApp {
     this.contextLineNavigation = options.initialSession?.contextLineNavigation ?? preferences.contextLineNavigation;
     this.navigatorTreeMode = options.initialSession?.navigatorTreeMode ?? preferences.navigatorTreeMode;
     this.commentsGlobal = options.initialSession?.commentsGlobal ?? preferences.commentsGlobal;
+    this.paneVisibility = { ...preferences.paneVisibility };
     this.showAllLocales = options.initialSession?.showAllLocales ?? false;
     this.currentVisibleScopes = options.visibleScopes?.filter((scope) => SEARCHABLE_SCOPES.includes(scope)) ?? [];
     if (this.currentVisibleScopes.length === 0) this.currentVisibleScopes = DEFAULT_VISIBLE_SCOPES;
@@ -1261,6 +1378,7 @@ export class ReviewApp {
       this.state = applyResolvedSeedComments(this.state, options.seedComments);
     }
     this.ensureActiveNavigatorFile(options.initialSession == null);
+    this.ensureVisibleFocus();
     this.searchBuffer = this.state.searchQuery;
 
     const editorTheme: EditorTheme = {
@@ -1347,7 +1465,7 @@ export class ReviewApp {
 
   private ensureContextPanel(): void {
     const source = this.options.contextPanelSource;
-    if (source == null || this.contextPanelState.status !== "idle") return;
+    if (source == null || !this.paneVisibility.context || this.contextPanelState.status !== "idle") return;
 
     this.contextPanelState = { status: "loading" };
     this.requestRender();
@@ -1361,8 +1479,11 @@ export class ReviewApp {
     });
   }
 
-  private hasContextPanel(): boolean {
-    return this.options.contextPanelSource != null && !this.commentsHidden;
+  private effectivePaneVisibility(): ReviewPaneVisibility {
+    return {
+      ...this.paneVisibility,
+      context: this.paneVisibility.context && this.options.contextPanelSource != null,
+    };
   }
 
   private getPaneAtMousePosition(col: number, row: number): PaneName | null {
@@ -1594,7 +1715,9 @@ export class ReviewApp {
   }
 
   private invalidateEntry(fileId: string, scope: ReviewScope): void {
-    this.cache.delete(this.cacheKey(fileId, scope));
+    const key = this.cacheKey(fileId, scope);
+    this.cache.delete(key);
+    this.expandedContextRows.delete(key);
     this.syntaxLineCache.clear();
     this.diffLayoutCache.clear();
   }
@@ -1610,9 +1733,13 @@ export class ReviewApp {
       return cached;
     }
 
-    const displayDiff = scope === "all-files"
+    const contextAdjustedDiff = scope === "all-files"
       ? entry.baseDiff
       : adjustStructuredDiffContext(entry.baseDiff, this.state.hideUnchanged ? 0 : DEFAULT_CONTEXT_LINES);
+    const expandedRows = this.expandedContextRows.get(this.cacheKey(fileId, scope));
+    const displayDiff = expandedRows == null || expandedRows.size === 0
+      ? contextAdjustedDiff
+      : revealStructuredDiffRows(contextAdjustedDiff, expandedRows);
     const unifiedRows = buildDisplayRows(displayDiff);
     const sideBySideRows = buildSideBySideDisplayRows(displayDiff);
 
@@ -1833,7 +1960,8 @@ export class ReviewApp {
   }
 
   private openEditor(target: EditTarget): void {
-    this.commentsHidden = false;
+    this.paneVisibility = { ...this.paneVisibility, diff: true };
+    this.state = setFocus(this.state, "diff");
     this.editTarget = target;
     if (target.kind !== "line") this.diffScroll = 0;
     if (this.usesExactEditor(target)) {
@@ -2160,7 +2288,6 @@ export class ReviewApp {
     }
 
     this.confirmCancel = true;
-    this.commentsHidden = false;
     this.helpMode = false;
     this.shortcutMode = false;
     this.requestRender();
@@ -2212,6 +2339,35 @@ export class ReviewApp {
     this.requestRender();
   }
 
+  private expandContextFromSelectedLine(direction: ContextExpansionDirection): void {
+    const file = this.activeFile();
+    const target = getSelectedLineTarget(this.state, file?.id ?? null, this.state.activeScope);
+    const layout = this.getDiffLayout(file?.id ?? null, this.state.activeScope);
+    if (file == null || target == null || layout == null) {
+      this.setMessage("No selected diff line to expand from.");
+      this.requestRender();
+      return;
+    }
+
+    const rowIndex = layout.displayDiff.rows.findIndex((row) => (
+      target.side === "added" ? row.newLineNumber === target.line : row.oldLineNumber === target.line
+    ));
+    const expansion = getContextExpansionRowIndexes(layout.displayDiff, rowIndex, direction, CONTEXT_EXPANSION_LINES);
+    if (expansion.length === 0) {
+      this.setMessage(`No hidden lines ${direction} the selected line.`);
+      this.requestRender();
+      return;
+    }
+
+    const key = this.cacheKey(file.id, this.state.activeScope);
+    const expandedRows = new Set(this.expandedContextRows.get(key) ?? []);
+    for (const expandedRow of expansion) expandedRows.add(expandedRow);
+    this.expandedContextRows.set(key, expandedRows);
+    this.diffLayoutCache.clear();
+    this.setMessage(`Expanded ${expansion.length} line${expansion.length === 1 ? "" : "s"} ${direction}.`);
+    this.requestRender();
+  }
+
   private getAvailableShortcuts(): CommentShortcut[] {
     const file = this.activeFile();
     const target = getSelectedLineTarget(this.state, file?.id ?? null, this.state.activeScope);
@@ -2231,7 +2387,7 @@ export class ReviewApp {
       this.requestRender();
       return;
     }
-    this.commentsHidden = false;
+    this.paneVisibility = { ...this.paneVisibility, diff: true, comments: true };
     this.helpMode = false;
     this.confirmCancel = false;
     this.shortcutMode = true;
@@ -2245,7 +2401,7 @@ export class ReviewApp {
 
   private toggleHelpMode(): void {
     this.helpMode = !this.helpMode;
-    if (this.helpMode) this.commentsHidden = false;
+    if (this.helpMode) this.paneVisibility = { ...this.paneVisibility, comments: true };
     this.requestRender();
   }
 
@@ -2275,24 +2431,59 @@ export class ReviewApp {
     this.cycleVisibleFocus(direction < 0);
   }
 
-  private toggleCommentsPane(): void {
-    this.commentsHidden = !this.commentsHidden;
-    if (this.commentsHidden) this.helpMode = false;
-    if (this.commentsHidden && this.state.focus === "comments") {
-      this.state = setFocus(this.state, "diff");
+  private ensureVisibleFocus(): void {
+    const visibility = this.effectivePaneVisibility();
+    if (visibility[this.state.focus]) return;
+
+    const currentIndex = FOCUSABLE_PANE_ORDER.indexOf(this.state.focus);
+    for (let offset = 1; offset <= FOCUSABLE_PANE_ORDER.length; offset += 1) {
+      const pane = FOCUSABLE_PANE_ORDER[(currentIndex + offset) % FOCUSABLE_PANE_ORDER.length]!;
+      if (visibility[pane]) {
+        this.state = setFocus(this.state, pane);
+        return;
+      }
     }
-    this.requestRender();
   }
 
-  private cycleVisibleFocus(backward = false): void {
-    if (!this.commentsHidden) {
-      this.state = backward ? cycleFocusBackward(this.state) : cycleFocus(this.state);
+  private toggleReviewPane(pane: ReviewPaneName): void {
+    if (pane === "context" && this.options.contextPanelSource == null) {
+      this.setMessage("PR context is not available in this review.");
       this.requestRender();
       return;
     }
 
-    const nextFocus = this.state.focus === "navigator" ? "diff" : "navigator";
-    this.state = setFocus(this.state, nextFocus);
+    const visible = !this.paneVisibility[pane];
+    this.paneVisibility = { ...this.paneVisibility, [pane]: visible };
+    if (pane === "comments" && !visible) {
+      this.helpMode = false;
+      this.shortcutMode = false;
+    }
+    if (pane === "context" && visible) this.ensureContextPanel();
+    this.ensureVisibleFocus();
+    saveReviewPreference({ paneVisibility: this.paneVisibility });
+    this.setMessage(`${REVIEW_PANE_LABELS[pane]} ${visible ? "shown" : "hidden"}.`);
+    this.requestRender();
+  }
+
+  private toggleCommentsPane(): void {
+    this.toggleReviewPane("comments");
+  }
+
+  private cycleVisibleFocus(backward = false): void {
+    const visibility = this.effectivePaneVisibility();
+    const visiblePanes = FOCUSABLE_PANE_ORDER.filter((pane) => visibility[pane]);
+    if (visiblePanes.length === 0) {
+      this.setMessage("No focusable pane is visible. Press 1, 2, or 3 to show one.");
+      this.requestRender();
+      return;
+    }
+
+    const currentIndex = visiblePanes.indexOf(this.state.focus);
+    const step = backward ? -1 : 1;
+    const nextIndex = currentIndex < 0
+      ? 0
+      : (currentIndex + step + visiblePanes.length) % visiblePanes.length;
+    this.state = setFocus(this.state, visiblePanes[nextIndex]!);
     this.requestRender();
   }
 
@@ -2552,7 +2743,7 @@ export class ReviewApp {
       this.moveDiffSelection(delta);
       return true;
     }
-    if (pane === "comments" && !this.commentsHidden) {
+    if (pane === "comments") {
       this.state = setFocus(this.state, "comments");
       this.moveCommentSelection(delta);
       return true;
@@ -2702,10 +2893,15 @@ export class ReviewApp {
       return;
     }
 
-    if (/^[1-9]$/.test(data)) {
-      const scopes = this.visibleScopes();
-      const index = Number.parseInt(data, 10) - 1;
-      if (scopes.length > 1 && index < scopes.length) { this.setScope(scopes[index]!); return; }
+    if (/^[1-4]$/.test(data)) {
+      this.toggleReviewPane(REVIEW_PANE_ORDER[Number.parseInt(data, 10) - 1]!);
+      return;
+    }
+    const scopeIndex = SCOPE_KEYS.findIndex((key) => matchesKey(data, key));
+    const scopes = this.visibleScopes();
+    if (scopeIndex >= 0 && scopes.length > 1 && scopeIndex < scopes.length) {
+      this.setScope(scopes[scopeIndex]!);
+      return;
     }
     if (matchesKey(data, Key.shift("tab"))) { this.cycleVisibleFocus(true); return; }
     if (matchesKey(data, Key.tab)) { this.cycleVisibleFocus(); return; }
@@ -2724,7 +2920,7 @@ export class ReviewApp {
     if (matchesReviewAction("contextNavigation", data)) {
       this.contextLineNavigation = !this.contextLineNavigation;
       saveReviewPreference({ contextLineNavigation: this.contextLineNavigation });
-      this.setMessage(this.contextLineNavigation ? "j/k includes unchanged context lines." : "j/k moves through changed lines only.");
+      this.setMessage(this.contextLineNavigation ? "Up/Down includes unchanged context lines." : "Up/Down moves through changed lines only.");
       this.requestRender();
       return;
     }
@@ -2798,6 +2994,14 @@ export class ReviewApp {
     }
 
     if (this.state.focus === "diff") {
+      if (matchesReviewAction("expandAbove", data)) {
+        this.expandContextFromSelectedLine("above");
+        return;
+      }
+      if (matchesReviewAction("expandBelow", data)) {
+        this.expandContextFromSelectedLine("below");
+        return;
+      }
       if (data === "t") {
         this.openShortcutMode();
         return;
@@ -2812,11 +3016,11 @@ export class ReviewApp {
           this.extendDiffSelection(-1);
           return;
         }
-        if (matchesKey(data, Key.down) || data === "j") {
+        if (matchesKey(data, Key.down)) {
           this.moveDiffSelection(1);
           return;
         }
-        if (matchesKey(data, Key.up) || data === "k") {
+        if (matchesKey(data, Key.up)) {
           this.moveDiffSelection(-1);
           return;
         }
@@ -3477,6 +3681,13 @@ export class ReviewApp {
     return renderBox("Comments", width, height, this.theme, lines, this.state.focus === "comments");
   }
 
+  private renderReviewPane(pane: ReviewPaneName, width: number, height: number): string[] {
+    if (pane === "navigator") return this.renderNavigator(width, height);
+    if (pane === "diff") return this.renderDiff(width, height);
+    if (pane === "comments") return this.renderComments(width, height);
+    return this.renderContextPanel(width, height);
+  }
+
   render(width: number): string[] {
     this.lastWidth = Math.max(40, width);
     const terminalRows = this.tui?.terminal?.rows ?? 28;
@@ -3484,83 +3695,98 @@ export class ReviewApp {
     const frameColor = "accent" as const;
     const frameInnerWidth = Math.max(20, this.lastWidth - 2 - MODAL_INNER_PADDING_X * 2);
     const frameInnerHeight = Math.max(10, totalHeight - 2 - MODAL_INNER_PADDING_Y * 2);
-
-    const contextVisible = this.hasContextPanel();
-    const stackPanes = shouldStackPanesWithContext(frameInnerWidth, contextVisible);
-    const bodyHeight = Math.max(stackPanes && !this.commentsHidden ? (contextVisible ? 12 : 9) : 6, frameInnerHeight - 5);
+    const visibility = this.effectivePaneVisibility();
+    const visiblePanes = REVIEW_PANE_ORDER.filter((pane) => visibility[pane]);
+    const stackPanes = visiblePanes.length > 1 && shouldStackPanesWithContext(frameInnerWidth, visibility.context);
     const terminalCols = this.tui?.terminal?.columns ?? this.lastWidth;
     const overlayOriginCol = Math.max(0, Math.floor((terminalCols - this.lastWidth) / 2));
     const overlayOriginRow = Math.max(0, Math.floor((terminalRows - totalHeight) / 2));
     const contentLeft = overlayOriginCol + 1 + MODAL_INNER_PADDING_X;
 
     const visibleScopes = this.visibleScopes();
-    const scopeHint = visibleScopes.length > 1 ? `${visibleScopes.map((_, index) => index + 1).join("/")} scopes • ` : "";
+    const scopeHint = visibleScopes.length > 1 ? `Alt+${visibleScopes.map((_, index) => index + 1).join("/")} scopes • ` : "";
     const headerLines = visibleScopes.length > 1
       ? [truncateToWidth(visibleScopes.map((scope, index) => {
           const active = this.state.activeScope === scope;
           const count = getScopedFiles(this.files, scope).length;
-          const text = `${index + 1}:${formatScopeLabel(scope)}(${count})`;
+          const text = `Alt+${index + 1}:${formatScopeLabel(scope)}(${count})`;
           return active ? this.theme.bg("selectedBg", this.theme.fg("text", ` ${text} `)) : this.theme.fg("muted", ` ${text} `);
         }).join(" "), frameInnerWidth, "", false)]
       : [];
 
     const bodyTop = overlayOriginRow + 1 + MODAL_INNER_PADDING_Y + headerLines.length;
-
     const layoutStatus = stackPanes ? "stacked layout • " : "";
+    const allPanesHiddenStatus = visiblePanes.length === 0 ? "All panes hidden • 1 Navigator • 2 Diff • 3 Comments • 4 PR context" : null;
     const promptStatus = this.shortcutMode
       ? "Template shortcuts • choose from the comments panel • Esc cancel"
       : this.helpMode
         ? "Help open • ? toggle • Esc close"
-        : this.message ?? (this.searchMode
+        : allPanesHiddenStatus ?? this.message ?? (this.searchMode
           ? `Search ${formatFocusStatus(this.searchPane).replace("Focus: ", "")}: ${sanitizeTerminalText(this.searchBuffer)}`
           : this.editTarget != null
             ? `Editing ${formatIntentLabel(this.editTarget.intent).toLowerCase()} comment`
-            : `${formatFocusStatus(this.state.focus)} • ${layoutStatus}Tab/←/→ focus • / search • t templates • v diff view • ? help • ${scopeHint}h ${this.commentsHidden ? "show" : "hide"} comments • o open in $EDITOR • s submit${this.frameStack.length > 0 ? " • b parent" : ""} • Esc exit • Ctrl+C exit`);
+            : `${formatFocusStatus(this.state.focus)} • ${layoutStatus}Tab/←/→ focus • / search • t templates • v diff view • ? help • ${scopeHint}1/2/3/4 panes • o open in $EDITOR • s submit${this.frameStack.length > 0 ? " • b parent" : ""} • Esc exit • Ctrl+C exit`);
+    const verticalLayout = getReviewVerticalLayout(
+      this.theme,
+      frameInnerHeight,
+      headerLines.length,
+      visiblePanes.length,
+      stackPanes,
+      buildFooterLines(this.theme, promptStatus, frameInnerWidth),
+      frameInnerWidth,
+    );
+    const footer = verticalLayout.footerLines;
+    const bodyHeight = verticalLayout.bodyHeight;
 
     const body: string[] = [];
+    const mouseBounds: Partial<Record<PaneName, MousePaneBounds>> = {};
 
-    if (stackPanes) {
-      const { navigatorHeight, diffHeight, commentsHeight, contextHeight } = getStackedPaneLayoutWithContext(bodyHeight, this.commentsHidden, contextVisible);
-      const paneLeft = contentLeft;
-      const paneRight = contentLeft + frameInnerWidth - 1;
-      const navigatorTop = bodyTop;
-      const diffTop = navigatorTop + navigatorHeight;
-      const commentsTop = diffTop + diffHeight;
-      this.mousePaneLayout = {
-        navigator: { top: navigatorTop, bottom: navigatorTop + navigatorHeight - 1, left: paneLeft, right: paneRight },
-        diff: { top: diffTop, bottom: diffTop + diffHeight - 1, left: paneLeft, right: paneRight },
-        comments: this.commentsHidden ? null : { top: commentsTop, bottom: commentsTop + commentsHeight - 1, left: paneLeft, right: paneRight },
-      };
-
-      body.push(...this.renderNavigator(frameInnerWidth, navigatorHeight));
-      body.push(...this.renderDiff(frameInnerWidth, diffHeight));
-      if (!this.commentsHidden) body.push(...this.renderComments(frameInnerWidth, commentsHeight));
-      if (contextVisible) body.push(...this.renderContextPanel(frameInnerWidth, contextHeight));
+    if (visiblePanes.length === 0) {
+      body.push(padLine(centerText("All panes are hidden. Press 1, 2, 3, or 4 to show one.", frameInnerWidth), frameInnerWidth));
+      while (body.length < bodyHeight) body.push(" ".repeat(frameInnerWidth));
+    } else if (stackPanes) {
+      const layout = getStackedPaneLayoutForVisibility(bodyHeight, visibility, verticalLayout.stackedPaneMinimumHeight);
+      let paneTop = bodyTop;
+      for (const pane of visiblePanes) {
+        const paneHeight = layout[`${pane}Height`];
+        if (pane !== "context") {
+          mouseBounds[pane] = {
+            top: paneTop,
+            bottom: paneTop + paneHeight - 1,
+            left: contentLeft,
+            right: contentLeft + frameInnerWidth - 1,
+          };
+        }
+        body.push(...this.renderReviewPane(pane, frameInnerWidth, paneHeight));
+        paneTop += paneHeight;
+      }
     } else {
-      const { navigatorWidth, diffWidth, commentsWidth, contextWidth } = getPaneLayoutWithContext(frameInnerWidth, this.commentsHidden, contextVisible);
-      const diffLeft = contentLeft + navigatorWidth + 1;
-      const commentsLeft = this.commentsHidden ? null : diffLeft + diffWidth + 1;
-      this.mousePaneLayout = {
-        navigator: { top: bodyTop, bottom: bodyTop + bodyHeight - 1, left: contentLeft, right: contentLeft + navigatorWidth - 1 },
-        diff: { top: bodyTop, bottom: bodyTop + bodyHeight - 1, left: diffLeft, right: diffLeft + diffWidth - 1 },
-        comments: commentsLeft == null ? null : { top: bodyTop, bottom: bodyTop + bodyHeight - 1, left: commentsLeft, right: commentsLeft + commentsWidth - 1 },
-      };
-
-      const navigator = this.renderNavigator(navigatorWidth, bodyHeight);
-      const diff = this.renderDiff(diffWidth, bodyHeight);
-      const comments = this.commentsHidden ? [] : this.renderComments(commentsWidth, bodyHeight);
-      const context = contextVisible ? this.renderContextPanel(contextWidth, bodyHeight) : [];
-
-      for (let i = 0; i < bodyHeight; i += 1) {
-        body.push(this.commentsHidden
-          ? `${navigator[i] ?? ""} ${diff[i] ?? ""}`
-          : contextVisible
-            ? `${navigator[i] ?? ""} ${diff[i] ?? ""} ${comments[i] ?? ""} ${context[i] ?? ""}`
-            : `${navigator[i] ?? ""} ${diff[i] ?? ""} ${comments[i] ?? ""}`);
+      const layout = getPaneLayoutForVisibility(frameInnerWidth, visibility);
+      const renderedPanes: Array<{ pane: ReviewPaneName; lines: string[] }> = [];
+      let paneLeft = contentLeft;
+      for (const pane of visiblePanes) {
+        const paneWidth = layout[`${pane}Width`];
+        if (pane !== "context") {
+          mouseBounds[pane] = {
+            top: bodyTop,
+            bottom: bodyTop + bodyHeight - 1,
+            left: paneLeft,
+            right: paneLeft + paneWidth - 1,
+          };
+        }
+        renderedPanes.push({ pane, lines: this.renderReviewPane(pane, paneWidth, bodyHeight) });
+        paneLeft += paneWidth + 1;
+      }
+      for (let index = 0; index < bodyHeight; index += 1) {
+        body.push(renderedPanes.map(({ lines }) => lines[index] ?? "").join(" "));
       }
     }
 
-    const footer = buildFooterLines(this.theme, promptStatus, frameInnerWidth);
+    this.mousePaneLayout = {
+      navigator: mouseBounds.navigator ?? null,
+      diff: mouseBounds.diff ?? null,
+      comments: mouseBounds.comments ?? null,
+    };
 
     const rendered = renderOuterFrame(this.lastWidth, totalHeight, this.theme, "code-diff", [...headerLines, ...body, ...footer], frameColor);
     if (!this.confirmCancel) return rendered;
