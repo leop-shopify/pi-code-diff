@@ -2,7 +2,7 @@ import { visibleWidth } from "@earendil-works/pi-tui";
 import { describe, expect, it } from "vitest";
 import { buildStructuredDiff } from "../diff.js";
 import type { DiffReviewComment, ReviewFile, ReviewState } from "../types.js";
-import { buildCommentPanelEmptyStateLines, buildCommentPanelTextLines, buildContextPanelLines, buildDiffActionHintLine, buildDisplayRows, buildEditorLaunchCommand, buildFooterLines, buildHelpPanelLines, buildModifyPreviewLines, buildSelectionClipboardText, buildSideBySideDisplayRows, diffTextMatchesSearch, formatFocusStatus, formatPaneTitle, formatSelectedLineTargetLabel, getCancelAction, getChangedLineTargets, getDraftCommentCount, getEditorLineForTarget, getHalfPageStep, getMatchingDiffLineTargets, getMeasuredPageRange, getNavigatorGroup, getNavigatorMoveIndex, getNextSearchIndex, getPaneLayout, getPaneLayoutWithContext, getRelatedFileMarker, getRelatedFilePanelSections, getRelatedFilePaths, getSideBySideColumnTarget, getSideBySideLineTargets, getSideBySidePairedLineTarget, getSourceLineRangeText, getStableDiffScroll, getStackedPaneLayout, getStackedPaneLayoutWithContext, getVirtualRowRange, groupNavigatorFiles, isUnchangedModify, parseMouseWheelInput, renderCenteredOverlay, setBoundedMapEntry, shouldStackPanes, shouldStackPanesWithContext } from "../ui/review-app.js";
+import { buildCommentPanelEmptyStateLines, buildCommentPanelTextLines, buildContextPanelLines, buildDiffActionHintLine, buildDisplayRows, buildEditorLaunchCommand, buildFooterLines, buildHelpPanelLines, buildModifyPreviewLines, buildSelectionClipboardText, buildSideBySideDisplayRows, diffTextMatchesSearch, fitFooterLines, formatFocusStatus, formatPaneTitle, formatSelectedLineTargetLabel, getCancelAction, getChangedLineTargets, getDraftCommentCount, getEditorLineForTarget, getHalfPageStep, getMatchingDiffLineTargets, getMeasuredPageRange, getNavigatorGroup, getNavigatorMoveIndex, getNextSearchIndex, getPaneLayout, getPaneLayoutForVisibility, getPaneLayoutWithContext, getRelatedFileMarker, getRelatedFilePanelSections, getRelatedFilePaths, getReviewVerticalLayout, getSideBySideColumnTarget, getSideBySideLineTargets, getSideBySidePairedLineTarget, getSourceLineRangeText, getStableDiffScroll, getStackedPaneLayout, getStackedPaneLayoutForVisibility, getStackedPaneLayoutWithContext, getVirtualRowRange, groupNavigatorFiles, isUnchangedModify, parseMouseWheelInput, renderCenteredOverlay, setBoundedMapEntry, shouldStackPanes, shouldStackPanesWithContext } from "../ui/review-app.js";
 
 function makeFile(path: string, flags?: Partial<ReviewFile>): ReviewFile {
   return {
@@ -249,11 +249,30 @@ describe("pane layout", () => {
     expect(remote.navigatorWidth + remote.diffWidth + remote.commentsWidth + remote.contextWidth + 3).toBe(200);
   });
 
-  it("hides the remote context column with the comments pane", () => {
-    const hidden = getPaneLayoutWithContext(120, true, true);
+  it("allocates hidden pane widths to the visible diff pane", () => {
+    const layout = getPaneLayoutForVisibility(120, {
+      navigator: false,
+      diff: true,
+      comments: true,
+      context: false,
+    });
 
-    expect(hidden.commentsWidth).toBe(0);
-    expect(hidden.contextWidth).toBe(0);
+    expect(layout.navigatorWidth).toBe(0);
+    expect(layout.contextWidth).toBe(0);
+    expect(layout.diffWidth + layout.commentsWidth + 1).toBe(120);
+  });
+
+  it("keeps PR context visible when Comments is hidden", () => {
+    const layout = getPaneLayoutForVisibility(200, {
+      navigator: true,
+      diff: true,
+      comments: false,
+      context: true,
+    });
+
+    expect(layout.commentsWidth).toBe(0);
+    expect(layout.contextWidth).toBeGreaterThan(0);
+    expect(layout.navigatorWidth + layout.diffWidth + layout.contextWidth + 2).toBe(200);
   });
 
   it("stacks panes below the desktop width breakpoint", () => {
@@ -287,6 +306,34 @@ describe("pane layout", () => {
       diffHeight: 5,
       commentsHeight: 3,
       contextHeight: 3,
+    });
+  });
+
+  it("allocates stacked height only to visible panes", () => {
+    expect(getStackedPaneLayoutForVisibility(11, {
+      navigator: false,
+      diff: true,
+      comments: false,
+      context: true,
+    })).toEqual({
+      navigatorHeight: 0,
+      diffHeight: 7,
+      commentsHeight: 0,
+      contextHeight: 4,
+    });
+  });
+
+  it("compresses stacked panes below three rows when the footer needs the space", () => {
+    expect(getStackedPaneLayoutForVisibility(10, {
+      navigator: true,
+      diff: true,
+      comments: true,
+      context: true,
+    }, 2)).toEqual({
+      navigatorHeight: 2,
+      diffHeight: 4,
+      commentsHeight: 2,
+      contextHeight: 2,
     });
   });
 });
@@ -418,14 +465,51 @@ describe("focused panel feedback", () => {
 });
 
 describe("action and shortcut help rendering", () => {
-  it("keeps the persistent footer concise and panel-scoped", () => {
+  it("wraps the persistent footer without hiding later shortcuts", () => {
     const lines = buildFooterLines(plainTheme as any, "Tab focus • / search • ? help • 1/2/3 scopes • h hide comments • o open in $EDITOR • s submit • Esc exit", 80);
+    const text = lines.join(" ");
 
-    expect(lines).toHaveLength(2);
-    expect(lines[1]).not.toContain("navigator:");
-    expect(lines[1]).not.toContain("diff:");
-    expect(lines[1]).not.toContain("comments:");
+    expect(lines.length).toBeGreaterThan(2);
+    expect(text).toContain("1/2/3/4 toggle Navigator/Diff/Comments/PR context");
+    expect(text).toContain("Esc / Ctrl+C exit");
+    expect(text).not.toContain("navigator:");
+    expect(text).not.toContain("diff:");
+    expect(text).not.toContain("comments:");
+    expect(text).not.toContain("…");
     expect(lines.every((line) => visibleWidth(line) <= 80)).toBe(true);
+  });
+
+  it("uses an explicit help marker when the frame cannot fit every footer line", () => {
+    const fitted = fitFooterLines(plainTheme as any, ["one", "two", "three", "four", "five"], 3, 40);
+
+    expect(fitted).toEqual(["one", "two", "+3 more • ? help"]);
+  });
+
+  it("keeps header, panes, and footer within the vertical frame budget", () => {
+    const prompt = "Focus: Navigator • stacked layout • Tab/Left/Right focus • / search • t templates • v diff view • ? help • 1/2/3/4 panes • o editor • s submit • Esc exit";
+    for (const height of [10, 16, 22]) {
+      for (const width of [20, 48, 74, 120]) {
+        for (const headerLineCount of [0, 1]) {
+          for (const visiblePaneCount of [0, 1, 3, 4]) {
+            const stacked = visiblePaneCount > 1;
+            const footer = buildFooterLines(plainTheme as any, prompt, width);
+            const layout = getReviewVerticalLayout(
+              plainTheme as any,
+              height,
+              headerLineCount,
+              visiblePaneCount,
+              stacked,
+              footer,
+              width,
+            );
+
+            expect(headerLineCount + layout.bodyHeight + layout.footerLines.length).toBeLessThanOrEqual(height);
+            expect(layout.footerLines.every((line) => visibleWidth(line) <= width)).toBe(true);
+            expect(layout.bodyHeight).toBeGreaterThanOrEqual(visiblePaneCount === 0 ? 1 : stacked ? visiblePaneCount : 1);
+          }
+        }
+      }
+    }
   });
 
   it("wraps full help text to the comments sidebar width", () => {
@@ -469,7 +553,7 @@ describe("action and shortcut help rendering", () => {
   it("shows line action keys in the diff pane hint", () => {
     const hint = buildDiffActionHintLine(plainTheme as any, 120);
 
-    for (const token of ["Enter/m", "modify", "c", "comment", "d", "discuss", "l", "file", "a", "all lines", "w", "wrap"]) {
+    for (const token of ["Enter/m", "modify", "c", "comment", "d", "discuss", "l", "file", "a", "all lines", "k/j", "context", "w", "wrap"]) {
       expect(hint).toContain(token);
     }
   });

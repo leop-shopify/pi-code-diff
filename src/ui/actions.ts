@@ -10,14 +10,15 @@ export interface ReviewActionDefinition {
 }
 
 export const REVIEW_ACTIONS: ReviewActionDefinition[] = [
-  { id: "scope", section: "Core", keys: "1/2/3", label: "switch review scope" },
+  { id: "scope", section: "Core", keys: "Alt+1/2/3", label: "switch review scope" },
+  { id: "panes", section: "Core", keys: "1/2/3/4", label: "toggle Navigator/Diff/Comments/PR context", footer: true },
   { id: "focus", section: "Core", keys: "Tab / Shift+Tab", label: "cycle focus", footer: true },
   { id: "search", section: "Core", keys: "/", label: "search focused pane • n/N next/prev search", footer: true },
   { id: "help", section: "Core", keys: "?", label: "toggle help/actions", inputs: ["?"], footer: true },
   { id: "wrap", section: "Core", keys: "w", label: "wrap lines", inputs: ["w"] },
   { id: "view", section: "Core", keys: "v", label: "toggle diff view", inputs: ["v"], footer: true },
   { id: "unchanged", section: "Core", keys: "u", label: "toggle unchanged context", inputs: ["u"] },
-  { id: "contextNavigation", section: "Core", keys: "C", label: "include context in j/k", inputs: ["C"] },
+  { id: "contextNavigation", section: "Core", keys: "C", label: "include context in Up/Down", inputs: ["C"] },
   { id: "commentsPane", section: "Core", keys: "h", label: "hide/show comments", inputs: ["h"] },
   { id: "submit", section: "Core", keys: "s", label: "submit", inputs: ["s"], footer: true },
   { id: "exit", section: "Core", keys: "Esc / Ctrl+C", label: "exit review", footer: true },
@@ -32,7 +33,9 @@ export const REVIEW_ACTIONS: ReviewActionDefinition[] = [
   { id: "related", section: "Navigation", keys: "r", label: "related filter", inputs: ["r"] },
   { id: "submodule", section: "Navigation", keys: "Enter/Right", label: "open submodule" },
   { id: "parent", section: "Navigation", keys: "b", label: "return to parent submodule review", inputs: ["b", "B"] },
-  { id: "diffMove", section: "Diff actions", keys: "↑↓/j/k", label: "move changed lines" },
+  { id: "diffMove", section: "Diff actions", keys: "↑↓", label: "move changed lines" },
+  { id: "expandAbove", section: "Diff actions", keys: "k/K", label: "expand 10 lines above", inputs: ["k", "K"] },
+  { id: "expandBelow", section: "Diff actions", keys: "j/J", label: "expand 10 lines below", inputs: ["j", "J"] },
   { id: "side", section: "Diff actions", keys: "←/→", label: "cross old/new before pane focus" },
   { id: "extend", section: "Diff actions", keys: "Shift+↑↓", label: "extend range" },
   { id: "hunk", section: "Diff actions", keys: "n/p", label: "next/previous hunk without search" },

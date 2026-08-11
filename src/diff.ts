@@ -480,6 +480,68 @@ export function adjustStructuredDiffContext(diff: StructuredDiff, contextLines: 
   return buildStructuredDiffFromRows(diff.rows, diff.totalOldLines, diff.totalNewLines, contextLines);
 }
 
+export type ContextExpansionDirection = "above" | "below";
+
+export function revealStructuredDiffRows(diff: StructuredDiff, rowIndexes: Iterable<number>): StructuredDiff {
+  const visibleRows = new Set<number>();
+  for (const item of diff.visibleItems) {
+    if (item.type === "row") visibleRows.add(item.fullRowIndex);
+  }
+  for (const rowIndex of rowIndexes) {
+    if (rowIndex >= 0 && rowIndex < diff.rows.length) visibleRows.add(rowIndex);
+  }
+
+  const visibleItems: StructuredDiffVisibleItem[] = [];
+  let rowIndex = 0;
+  while (rowIndex < diff.rows.length) {
+    if (visibleRows.has(rowIndex)) {
+      visibleItems.push({ type: "row", fullRowIndex: rowIndex, row: diff.rows[rowIndex]! });
+      rowIndex += 1;
+      continue;
+    }
+
+    const hiddenStart = rowIndex;
+    while (rowIndex < diff.rows.length && !visibleRows.has(rowIndex)) rowIndex += 1;
+    const hiddenRows = diff.rows.slice(hiddenStart, rowIndex);
+    const hiddenRowCount = hiddenRows.length;
+    const position = hiddenStart === 0 ? "start" : rowIndex === diff.rows.length ? "end" : "middle";
+    visibleItems.push({
+      type: "gap",
+      beforeRowIndex: hiddenStart - 1,
+      afterRowIndex: rowIndex,
+      hiddenRowCount,
+      hiddenOldLines: hiddenRows.filter((row) => row.oldLineNumber != null).length,
+      hiddenNewLines: hiddenRows.filter((row) => row.newLineNumber != null).length,
+      label: createGapLabel(position, hiddenRowCount),
+    });
+  }
+
+  return { ...diff, visibleItems };
+}
+
+export function getContextExpansionRowIndexes(
+  diff: StructuredDiff,
+  selectedRowIndex: number,
+  direction: ContextExpansionDirection,
+  lineCount: number,
+): number[] {
+  const visibleRows = new Set(diff.visibleItems.flatMap((item) => item.type === "row" ? [item.fullRowIndex] : []));
+  if (!visibleRows.has(selectedRowIndex)) return [];
+
+  const step = direction === "above" ? -1 : 1;
+  let edge = selectedRowIndex;
+  while (visibleRows.has(edge + step)) edge += step;
+
+  const expansion: number[] = [];
+  let candidate = edge + step;
+  while (candidate >= 0 && candidate < diff.rows.length && expansion.length < Math.max(0, lineCount)) {
+    if (visibleRows.has(candidate)) break;
+    expansion.push(candidate);
+    candidate += step;
+  }
+  return expansion.sort((left, right) => left - right);
+}
+
 export function getCommentableVisibleLines(diff: StructuredDiff): number[] {
   const lines = new Set<number>();
   for (const item of diff.visibleItems) {

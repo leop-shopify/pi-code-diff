@@ -6,18 +6,34 @@ import { getShortcutConfigPath } from "./shortcuts.js";
 
 export type PersistedDiffViewMode = "unified" | "side-by-side";
 
+export interface ReviewPaneVisibility {
+  navigator: boolean;
+  diff: boolean;
+  comments: boolean;
+  context: boolean;
+}
+
 export interface ReviewPreferences {
   diffViewMode: PersistedDiffViewMode;
   navigatorTreeMode: boolean;
   contextLineNavigation: boolean;
   commentsGlobal: boolean;
+  paneVisibility: ReviewPaneVisibility;
 }
+
+export const DEFAULT_REVIEW_PANE_VISIBILITY: ReviewPaneVisibility = {
+  navigator: true,
+  diff: true,
+  comments: true,
+  context: true,
+};
 
 export const DEFAULT_REVIEW_PREFERENCES: ReviewPreferences = {
   diffViewMode: "unified",
   navigatorTreeMode: true,
   contextLineNavigation: false,
   commentsGlobal: false,
+  paneVisibility: DEFAULT_REVIEW_PANE_VISIBILITY,
 };
 
 function getPreferencesPath(): string {
@@ -28,29 +44,53 @@ function isPersistedDiffViewMode(value: unknown): value is PersistedDiffViewMode
   return value === "unified" || value === "side-by-side";
 }
 
+function defaultReviewPreferences(): ReviewPreferences {
+  return {
+    ...DEFAULT_REVIEW_PREFERENCES,
+    paneVisibility: { ...DEFAULT_REVIEW_PANE_VISIBILITY },
+  };
+}
+
+function loadPaneVisibility(value: unknown): ReviewPaneVisibility {
+  const record = value != null && typeof value === "object" ? value as Record<string, unknown> : {};
+  return {
+    navigator: typeof record.navigator === "boolean" ? record.navigator : DEFAULT_REVIEW_PANE_VISIBILITY.navigator,
+    diff: typeof record.diff === "boolean" ? record.diff : DEFAULT_REVIEW_PANE_VISIBILITY.diff,
+    comments: typeof record.comments === "boolean" ? record.comments : DEFAULT_REVIEW_PANE_VISIBILITY.comments,
+    context: typeof record.context === "boolean" ? record.context : DEFAULT_REVIEW_PANE_VISIBILITY.context,
+  };
+}
+
 export function loadReviewPreferences(): ReviewPreferences {
   const path = getPreferencesPath();
-  if (!existsSync(path)) return { ...DEFAULT_REVIEW_PREFERENCES };
+  if (!existsSync(path)) return defaultReviewPreferences();
 
   try {
     const parsed = JSON.parse(readFileSync(path, "utf8")) as unknown;
-    if (parsed == null || typeof parsed !== "object") return { ...DEFAULT_REVIEW_PREFERENCES };
+    if (parsed == null || typeof parsed !== "object") return defaultReviewPreferences();
     const record = parsed as Record<string, unknown>;
     return {
       diffViewMode: isPersistedDiffViewMode(record.diffViewMode) ? record.diffViewMode : DEFAULT_REVIEW_PREFERENCES.diffViewMode,
       navigatorTreeMode: typeof record.navigatorTreeMode === "boolean" ? record.navigatorTreeMode : DEFAULT_REVIEW_PREFERENCES.navigatorTreeMode,
       contextLineNavigation: typeof record.contextLineNavigation === "boolean" ? record.contextLineNavigation : DEFAULT_REVIEW_PREFERENCES.contextLineNavigation,
       commentsGlobal: typeof record.commentsGlobal === "boolean" ? record.commentsGlobal : DEFAULT_REVIEW_PREFERENCES.commentsGlobal,
+      paneVisibility: loadPaneVisibility(record.paneVisibility),
     };
   } catch {
-    return { ...DEFAULT_REVIEW_PREFERENCES };
+    return defaultReviewPreferences();
   }
 }
 
 export function saveReviewPreference(patch: Partial<ReviewPreferences>): void {
   const path = getPreferencesPath();
   const current = loadReviewPreferences();
-  const next: ReviewPreferences = { ...current, ...patch };
+  const next: ReviewPreferences = {
+    ...current,
+    ...patch,
+    paneVisibility: patch.paneVisibility == null
+      ? current.paneVisibility
+      : { ...current.paneVisibility, ...patch.paneVisibility },
+  };
 
   try {
     mkdirSync(dirname(path), { recursive: true });

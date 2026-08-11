@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.3.4 - 2026-08-10
+
+### Added
+
+- Toggle Navigator, Diff, Comments, and PR context with `1` through `4`, preserving pane visibility across reviews.
+- Expand up to 10 hidden file lines above or below the selected diff line with `k` or `j` (`K` and `J` remain aliases).
+
+### Changed
+
+- Move review-scope shortcuts from `1` through `3` to `Alt+1` through `Alt+3`.
+- Reserve Up/Down for diff-line navigation and use `k`/`j` for contextual expansion.
+- Wrap footer status and shortcut descriptions onto additional lines instead of truncating later actions.
+
 ## 0.3.3 - 2026-08-07
 
 ### Added

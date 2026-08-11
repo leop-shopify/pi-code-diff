@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildStructuredDiff } from "../diff.js";
+import { buildStructuredDiff, getContextExpansionRowIndexes, revealStructuredDiffRows } from "../diff.js";
 
 function file(...lines: string[]): string {
   return `${lines.join("\n")}\n`;
@@ -224,6 +224,37 @@ describe("buildStructuredDiff", () => {
         label: "End of file · 1 unchanged line",
       },
     ]);
+  });
+
+  it("reveals ten adjacent hidden rows above or below a selected row", () => {
+    const originalLines = Array.from({ length: 30 }, (_, index) => `line ${index + 1}`);
+    const modifiedLines = [...originalLines];
+    modifiedLines[14] = "changed line 15";
+    const diff = buildStructuredDiff(file(...originalLines), file(...modifiedLines), 1);
+
+    const below = getContextExpansionRowIndexes(diff, 14, "below", 10);
+    const above = getContextExpansionRowIndexes(diff, 14, "above", 10);
+
+    expect(below).toEqual([16, 17, 18, 19, 20, 21, 22, 23, 24, 25]);
+    expect(above).toEqual([3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+
+    const expanded = revealStructuredDiffRows(diff, below);
+    expect(expanded.visibleItems).toContainEqual({
+      type: "row",
+      fullRowIndex: 25,
+      row: diff.rows[25],
+    });
+    expect(getContextExpansionRowIndexes(expanded, 14, "below", 10)).toEqual([26, 27, 28, 29]);
+  });
+
+  it("stops contextual expansion at the next visible hunk", () => {
+    const originalLines = Array.from({ length: 15 }, (_, index) => `line ${index + 1}`);
+    const modifiedLines = [...originalLines];
+    modifiedLines[4] = "changed line 5";
+    modifiedLines[9] = "changed line 10";
+    const diff = buildStructuredDiff(file(...originalLines), file(...modifiedLines), 0);
+
+    expect(getContextExpansionRowIndexes(diff, 4, "below", 10)).toEqual([5, 6, 7, 8]);
   });
 
   it("keeps normalized line text when only the trailing newline changes", () => {

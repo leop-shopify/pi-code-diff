@@ -260,7 +260,8 @@ When the review UI generates the local prompt, it uses different wording dependi
 
 #### Global
 
-- `1 / 2 / 3` — switch scope
+- `1 / 2 / 3 / 4` — toggle Navigator, Diff, Comments, or PR context; pane visibility is restored in the next code-diff review
+- `Alt+1 / Alt+2 / Alt+3` — switch scope
 - mouse drag — use normal terminal/tmux text selection and copy behavior
 - mouse wheel — scroll the pane under the cursor in Pi fullscreen mode
 - `Tab` / `Shift+Tab` — cycle focus forward / backward
@@ -271,7 +272,7 @@ When the review UI generates the local prompt, it uses different wording dependi
 - `w` — toggle wrapping
 - `v` — toggle unified / side-by-side diff view
 - `u` — toggle unchanged context in diff scopes
-- `h` — hide/show the comments pane
+- `h` — hide/show the Comments pane as an alias for `3`
 - `s` — insert the generated prompt into the editor
 - `Esc` — request review exit; confirms before discarding draft feedback
 - `Ctrl+C` — request review exit with the same confirmation flow
@@ -295,7 +296,8 @@ New reviews select the first file in the visible Navigator order. Locale and tra
 
 #### Diff
 
-- `↑↓` or `j/k` — move between changed lines; press `C` to include selectable unchanged context lines
+- `↑↓` — move between changed lines; press `C` to include selectable unchanged context lines
+- `k` / `j` — reveal up to 10 hidden file lines above / below the selected line; repeat to continue expanding (`K` / `J` are aliases)
 - `Shift+↑↓` — extend the selection into a multiline range on the current side
 - `← / →` — choose the old/deleted or new/added side on replacement rows in side-by-side view
 - `Ctrl+d` / `Ctrl+u` — move down / up by half a pane
