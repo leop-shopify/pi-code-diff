@@ -600,7 +600,7 @@ describe("code diff extension", () => {
     }];
     const expandedCwd = join(homedir(), "custom-repo");
     mocks.getReviewWindowData.mockResolvedValue({ repoRoot: expandedCwd, files, branchBaseRevision: null, modifiedRevision: undefined, visibleScopes: ["git-diff"] });
-    mocks.runReviewApp.mockResolvedValue({ type: "submit", allComment: "", allIntent: "discuss", comments: [] });
+    mocks.runReviewApp.mockResolvedValue({ type: "submit", allComment: "Overall note", allIntent: "discuss", comments: [] });
     mocks.composeReviewPrompt.mockReturnValue("generated review prompt");
     const pi = {
       registerCommand: vi.fn(),
@@ -627,6 +627,52 @@ describe("code diff extension", () => {
     expect(result.details).toMatchObject({ started: true, args: "", cwd: expandedCwd, prompt: "generated review prompt" });
     expect(result.content[0].text).toContain("local working-tree/uncommitted changes");
     expect(result.content[0].text).toContain("generated review prompt");
+  });
+
+  it("sends 'PR approved' to the agent when a local review is submitted empty", async () => {
+    const tools = new Map<string, any>();
+    const files = [{
+      id: "src/app.ts::working::::",
+      path: "src/app.ts",
+      worktreeStatus: "modified",
+      hasWorkingTreeFile: true,
+      inGitDiff: true,
+      inLastCommit: false,
+      inAllFiles: false,
+      gitDiff: { status: "modified", oldPath: "src/app.ts", newPath: "src/app.ts", displayPath: "src/app.ts", hasOriginal: true, hasModified: true },
+      lastCommit: null,
+      allFiles: null,
+    }];
+    mocks.getReviewWindowData.mockResolvedValue({ repoRoot: "/repo", files, branchBaseRevision: null, modifiedRevision: undefined, visibleScopes: ["git-diff"] });
+    mocks.runReviewApp.mockResolvedValue({ type: "submit", allComment: "", allIntent: "discuss", comments: [] });
+    const pi = {
+      registerCommand: vi.fn(),
+      registerTool: vi.fn((tool) => tools.set(tool.name, tool)),
+      registerShortcut: vi.fn(),
+      on: vi.fn(),
+      sendUserMessage: vi.fn(),
+    };
+    const ctx = {
+      hasUI: true,
+      cwd: "/repo",
+      isIdle: () => true,
+      ui: {
+        notify: vi.fn(),
+        setWidget: vi.fn(),
+        setEditorText: vi.fn(),
+      },
+    };
+
+    codeDiffExtension(pi as never);
+    const result = await tools.get("open_code_diff").execute("tool-call", { args: "" }, new AbortController().signal, vi.fn(), ctx);
+
+    const reviewOptions = mocks.runReviewApp.mock.calls.at(-1)![1];
+    expect(reviewOptions.allowEmptySubmit).toBe(true);
+    expect(pi.sendUserMessage).toHaveBeenCalledWith("PR approved");
+    expect(mocks.composeReviewPrompt).not.toHaveBeenCalled();
+    expect(ctx.ui.setEditorText).not.toHaveBeenCalled();
+    expect(ctx.ui.notify).toHaveBeenCalledWith("Sent 'PR approved' to the agent.", "info");
+    expect(result.details).toMatchObject({ started: true, prompt: "PR approved" });
   });
 
   it("dispatches exact and fallback submodule reviews through the correct loaders", async () => {
@@ -690,7 +736,7 @@ describe("code diff extension", () => {
       allFiles: null,
     }];
     mocks.getReviewWindowData.mockResolvedValue({ repoRoot: "/repo", files, branchBaseRevision: null, modifiedRevision: undefined, visibleScopes: ["git-diff"] });
-    mocks.runReviewApp.mockResolvedValue({ type: "submit", allComment: "", allIntent: "discuss", comments: [] });
+    mocks.runReviewApp.mockResolvedValue({ type: "submit", allComment: "Overall note", allIntent: "discuss", comments: [] });
     mocks.composeReviewPrompt.mockReturnValue("generated review prompt");
     const pi = {
       registerCommand: vi.fn(),
@@ -797,7 +843,7 @@ describe("code diff extension", () => {
       allFiles: { status: "modified", oldPath: "src/app.ts", newPath: "src/app.ts", displayPath: "src/app.ts", hasOriginal: true, hasModified: true },
     }];
     mocks.getReviewWindowDataForRevisionRange.mockResolvedValue({ repoRoot: "/repo", files, branchBaseRevision: "base", modifiedRevision: "head", visibleScopes: ["all-files"] });
-    mocks.runReviewApp.mockResolvedValue({ type: "submit", allComment: "", allIntent: "discuss", comments: [] });
+    mocks.runReviewApp.mockResolvedValue({ type: "submit", allComment: "Overall note", allIntent: "discuss", comments: [] });
     mocks.composeReviewPrompt.mockReturnValue("generated review prompt");
     const pi = {
       registerCommand: vi.fn(),
@@ -848,7 +894,7 @@ describe("code diff extension", () => {
       allFiles: null,
     }];
     mocks.getReviewWindowData.mockResolvedValue({ repoRoot: "/repo", files, branchBaseRevision: null, modifiedRevision: undefined, visibleScopes: ["git-diff"] });
-    mocks.runReviewApp.mockResolvedValue({ type: "submit", allComment: "", allIntent: "discuss", comments: [] });
+    mocks.runReviewApp.mockResolvedValue({ type: "submit", allComment: "Overall note", allIntent: "discuss", comments: [] });
     mocks.composeReviewPrompt.mockReturnValue("generated review prompt");
     const pi = {
       registerCommand: vi.fn((name: string, command) => commands.set(name, command)),
@@ -889,7 +935,7 @@ describe("code diff extension", () => {
       allFiles: null,
     }];
     mocks.getReviewWindowData.mockResolvedValue({ repoRoot: expandedCwd, files, branchBaseRevision: null, modifiedRevision: undefined, visibleScopes: ["git-diff"] });
-    mocks.runReviewApp.mockResolvedValue({ type: "submit", allComment: "", allIntent: "discuss", comments: [] });
+    mocks.runReviewApp.mockResolvedValue({ type: "submit", allComment: "Overall note", allIntent: "discuss", comments: [] });
     mocks.composeReviewPrompt.mockReturnValue("generated review prompt");
     const pi = {
       registerCommand: vi.fn((name: string, command) => commands.set(name, command)),
@@ -942,7 +988,7 @@ describe("code diff extension", () => {
       allFiles: null,
     }];
     mocks.getReviewWindowData.mockResolvedValue({ repoRoot: localRepo, files, branchBaseRevision: null, modifiedRevision: undefined, visibleScopes: ["git-diff"] });
-    mocks.runReviewApp.mockResolvedValue({ type: "submit", allComment: "", allIntent: "discuss", comments: [] });
+    mocks.runReviewApp.mockResolvedValue({ type: "submit", allComment: "Overall note", allIntent: "discuss", comments: [] });
     mocks.composeReviewPrompt.mockReturnValue("generated review prompt");
     const pi = {
       registerCommand: vi.fn((name: string, command) => commands.set(name, command)),

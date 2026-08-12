@@ -432,6 +432,8 @@ Each shortcut has:
 
 When you submit, `/diff` builds a prompt that matches the kind of review you created.
 
+Submitting a local review with `s` and no comments or notes sends `PR approved` directly to the agent, so an empty submit works as a quick sign-off.
+
 It groups feedback naturally into sections like:
 
 - file/all-lines comments

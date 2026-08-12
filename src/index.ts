@@ -509,7 +509,7 @@ export default function codeDiffExtension(pi: ExtensionAPI) {
           ? getReviewWindowDataForRevisionRange(pi, submodule.repoRoot, submodule.oldSha, submodule.newSha, { wholeRepo: true })
           : getReviewWindowData(pi, submodule.repoRoot, { wholeRepo: true }),
         commentShortcuts: shortcutConfig.shortcuts,
-        allowEmptySubmit: remoteTarget?.pullRequest != null,
+        allowEmptySubmit: remoteTarget == null || remoteTarget.pullRequest != null,
         visibleScopes,
         seedComments: partitionedSeed.applicable,
         contextPanelSource: createRemotePullRequestSummarySource(pi, ctx, remoteTarget),
@@ -540,6 +540,12 @@ export default function codeDiffExtension(pi: ExtensionAPI) {
       }
 
       deleteReviewSession(sessionIdentity, sessionId);
+      if (remoteTarget == null && result.allComment.trim().length === 0 && result.comments.length === 0) {
+        const approvalMessage = "PR approved";
+        sendReviewFollowUp(pi, ctx, approvalMessage);
+        ctx.ui.notify("Sent 'PR approved' to the agent.", "info");
+        return { started: true, prompt: approvalMessage };
+      }
       const reviewPrompt = composeReviewPrompt(files, result);
       const prompt = remoteTarget == null ? reviewPrompt : composeRemoteReviewPrompt(remoteTarget, reviewPrompt);
       ctx.ui.setEditorText(prompt);

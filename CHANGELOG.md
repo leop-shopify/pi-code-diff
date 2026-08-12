@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.6 - 2026-08-12
+
+### Added
+
+- Submitting a local review with `s` and no comments now sends `PR approved` straight to the agent instead of blocking the submit.
+
 ## 0.3.4 - 2026-08-10
 
 ### Added
