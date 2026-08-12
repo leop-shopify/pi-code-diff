@@ -439,9 +439,24 @@ async function fetchPlainRemoteBranch(pi: ExtensionAPI, gitRoot: string, branch:
   return { baseRef: originShortRef(baseBranch), headRef: originShortRef(branch) };
 }
 
+const REMOTE_TARGET_CACHE_TTL_MS = 10 * 60 * 1000;
+const remoteTargetCache = new Map<string, { target: RemoteReviewTarget; expiresAt: number }>();
+
+export function clearRemoteReviewTargetCache(): void {
+  remoteTargetCache.clear();
+}
+
 export async function resolveRemoteReviewTarget(pi: ExtensionAPI, fallbackCwd: string, remote: string, explicitCwd?: string, onProgress?: RemoteProgress): Promise<RemoteReviewTarget> {
   const parsed = extractBranchFromRemote(remote);
   if (parsed == null) throw new Error(`Could not extract branch name from: ${remote}`);
+
+  const cacheKey = JSON.stringify([remote.trim(), explicitCwd ?? "", parsed.repo == null ? fallbackCwd : ""]);
+  const cached = remoteTargetCache.get(cacheKey);
+  if (cached != null && cached.expiresAt > Date.now()) {
+    onProgress?.(`Using cached remote review for ${remote}…`);
+    return cached.target;
+  }
+  remoteTargetCache.delete(cacheKey);
 
   onProgress?.(`Preparing remote review for ${remote}…`);
   const { gitRoot, fetchRemote, workspacePath, pathspecs, importAliases } = await resolveRepoRoot(pi, fallbackCwd, parsed.repo, explicitCwd, onProgress);
@@ -456,7 +471,7 @@ export async function resolveRemoteReviewTarget(pi: ExtensionAPI, fallbackCwd: s
         pullRequest.stackParent = closestStackParent.stackParent;
       }
     }
-    return {
+    const target: RemoteReviewTarget = {
       gitRoot,
       baseRef: refs.baseRef,
       headRef: refs.headRef,
@@ -468,10 +483,12 @@ export async function resolveRemoteReviewTarget(pi: ExtensionAPI, fallbackCwd: s
       pathspecs,
       importAliases,
     };
+    remoteTargetCache.set(cacheKey, { target, expiresAt: Date.now() + REMOTE_TARGET_CACHE_TTL_MS });
+    return target;
   }
 
   const refs = await fetchPlainRemoteBranch(pi, gitRoot, parsed.branch, onProgress);
-  return {
+  const target: RemoteReviewTarget = {
     gitRoot,
     baseRef: refs.baseRef,
     headRef: refs.headRef,
@@ -482,6 +499,8 @@ export async function resolveRemoteReviewTarget(pi: ExtensionAPI, fallbackCwd: s
     pathspecs,
     importAliases,
   };
+  remoteTargetCache.set(cacheKey, { target, expiresAt: Date.now() + REMOTE_TARGET_CACHE_TTL_MS });
+  return target;
 }
 
 export function formatPullRequestContext(metadata: PullRequestMetadata): string {
