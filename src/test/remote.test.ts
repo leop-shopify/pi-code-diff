@@ -1,10 +1,14 @@
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, it, vi } from "vitest";
-import { extractBranchFromRemote, formatPullRequestContext, resolveRemoteReviewTarget } from "../remote.js";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { clearRemoteReviewTargetCache, extractBranchFromRemote, formatPullRequestContext, resolveRemoteReviewTarget } from "../remote.js";
 
 describe("remote review helpers", () => {
+  beforeEach(() => {
+    clearRemoteReviewTargetCache();
+  });
+
   it("parses GitHub, stack-host, short PR, and branch remote inputs", () => {
     expect(extractBranchFromRemote("https://github.com/example/widgets/pull/123")).toEqual({ branch: "__pr__123", repo: "example/widgets", prNumber: "123" });
     expect(extractBranchFromRemote("https://app.stack-host.dev/github/pr/example/widgets/456")).toEqual({ branch: "__pr__456", repo: "example/widgets", prNumber: "456" });
@@ -477,5 +481,30 @@ describe("remote review helpers", () => {
       headRef: "origin/feature/review",
       branch: "feature/review",
     });
+  });
+
+  it("reuses the cached remote review target within the TTL and refreshes after expiry", async () => {
+    vi.useFakeTimers();
+    try {
+      const exec = vi.fn(async (command: string, args: string[]) => {
+        if (command === "git" && args[0] === "symbolic-ref") return { code: 0, stdout: "origin/main\n", stderr: "", killed: false };
+        if (command === "git" && args[1] === "fetch") return { code: 0, stdout: "", stderr: "", killed: false };
+        return { code: 1, stdout: "", stderr: `unexpected ${command} ${args.join(" ")}`, killed: false };
+      });
+
+      await resolveRemoteReviewTarget({ exec } as never, "/repo", "feature/review", "/repo");
+      const callsAfterFirst = exec.mock.calls.length;
+
+      const progress: string[] = [];
+      await resolveRemoteReviewTarget({ exec } as never, "/repo", "feature/review", "/repo", (message) => progress.push(message));
+      expect(exec.mock.calls.length).toBe(callsAfterFirst);
+      expect(progress).toContain("Using cached remote review for feature/review\u2026");
+
+      vi.advanceTimersByTime(10 * 60 * 1000 + 1);
+      await resolveRemoteReviewTarget({ exec } as never, "/repo", "feature/review", "/repo");
+      expect(exec.mock.calls.length).toBeGreaterThan(callsAfterFirst);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
