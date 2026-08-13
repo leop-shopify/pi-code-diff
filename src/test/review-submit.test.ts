@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
-import { buildInlineComments, buildReviewBody, buildReviewPayload, submitPullRequestReview } from "../review-submit.js";
+import { buildGitstreamComments, buildInlineComments, buildReviewBody, buildReviewPayload, submitPullRequestReview } from "../review-submit.js";
 import type { DiffReviewComment, ReviewFile } from "../types.js";
 
 function makeFile(id: string, path: string): ReviewFile {
@@ -79,6 +79,26 @@ describe("buildInlineComments", () => {
   });
 });
 
+describe("buildGitstreamComments", () => {
+  it("maps line and file comments to GitStream's atomic review shape", () => {
+    const files = [makeFile("src/a.ts", "src/a.ts")];
+    expect(buildGitstreamComments(files, [
+      comment({ id: "1", fileId: "src/a.ts", side: "added", intent: "comment", startLine: 10, endLine: 12, body: "range" }),
+      comment({ id: "2", fileId: "src/a.ts", side: "file", intent: "comment", body: "file note" }),
+    ])).toEqual([
+      { path: "src/a.ts", line: 12, side: "RIGHT", body: "range", start_line: 10, start_side: "RIGHT" },
+      { path: "src/a.ts", subject_type: "file", body: "file note" },
+    ]);
+  });
+
+  it("fails closed instead of dropping unsupported GitStream comment locations", () => {
+    const files = [{ ...makeFile("src/a.ts", "src/a.ts"), pathPrefix: "packages/app" }];
+    expect(() => buildGitstreamComments(files, [
+      comment({ id: "1", fileId: "src/a.ts", side: "added", intent: "comment", startLine: 10, endLine: 10, body: "note" }),
+    ])).toThrow(/cannot safely map/i);
+  });
+});
+
 describe("buildReviewBody", () => {
   it("keeps GitHub review body to comment-intent review-wide and file comments", () => {
     const files = [makeFile("src/a.ts", "src/a.ts")];
@@ -96,7 +116,7 @@ describe("buildReviewBody", () => {
 });
 
 describe("buildReviewPayload", () => {
-  it("maps verdicts to GitHub events and includes commit_id only with inline comments", () => {
+  it("maps verdicts to provider events without changing GitHub payloads", () => {
     expect(buildReviewPayload({ repo: "o/r", prNumber: "1", commitId: "sha", verdict: "approve", body: "lgtm" }))
       .toEqual({ event: "APPROVE", body: "lgtm" });
 
@@ -111,6 +131,16 @@ describe("buildReviewPayload", () => {
       commit_id: "sha",
       comments: [{ path: "a.ts", line: 3, side: "RIGHT", body: "x" }],
     });
+
+    expect(buildReviewPayload({
+      provider: "gitstream",
+      repo: "shop/world",
+      prNumber: "1",
+      commitId: "sha",
+      baseCommitId: "base",
+      verdict: "approve",
+      body: "lgtm",
+    })).toEqual({ event: "APPROVE", body: "lgtm", commit_id: "sha" });
   });
 });
 
@@ -195,6 +225,112 @@ describe("submitPullRequestReview", () => {
       { event: "COMMENT", commit_id: "sha", comments: [{ path: "src/app.ts", line: 12, side: "RIGHT", body: "Inline note" }] },
       { event: "APPROVE", body: "looks good" },
     ]);
+  });
+
+  it("submits a GitStream verdict and bundled comments atomically after target validation", async () => {
+    const calls: Array<{ command: string; args: string[] }> = [];
+    let payload: unknown;
+    const pi = {
+      exec: async (command: string, args: string[]) => {
+        calls.push({ command, args });
+        if (command === "gs" && args[1] === "/user") {
+          return { stdout: JSON.stringify({ login: "reviewer@shopify.com" }), stderr: "", code: 0, killed: false };
+        }
+        if (command === "gs" && args[1] === "repos/shop/world/pulls/42") {
+          return { stdout: JSON.stringify({ state: "open", head: { sha: "head" }, base: { sha: "base" } }), stderr: "", code: 0, killed: false };
+        }
+        const inputIndex = args.indexOf("--input");
+        if (command === "gs" && inputIndex >= 0) {
+          payload = JSON.parse(readFileSync(args[inputIndex + 1]!, "utf8"));
+          return { stdout: JSON.stringify({ id: 9, state: "APPROVED" }), stderr: "", code: 0, killed: false };
+        }
+        return { stdout: "", stderr: "unexpected", code: 1, killed: false };
+      },
+    };
+
+    const result = await submitPullRequestReview(pi as never, {
+      provider: "gitstream",
+      repo: "shop/world",
+      prNumber: "42",
+      commitId: "head",
+      baseCommitId: "base",
+      verdict: "approve",
+      prAuthorLogin: "author@shopify.com",
+      body: "looks good",
+      comments: [
+        { path: "src/app.ts", line: 12, side: "RIGHT", body: "Inline note" },
+        { path: "src/file.ts", subject_type: "file", body: "File note" },
+      ],
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.message).toContain("https://meteorite.shopify.io/repos/shop/world/pulls/42");
+    expect(payload).toEqual({
+      event: "APPROVE",
+      body: "looks good",
+      commit_id: "head",
+      comments: [
+        { path: "src/app.ts", line: 12, side: "RIGHT", body: "Inline note" },
+        { path: "src/file.ts", subject_type: "file", body: "File note" },
+      ],
+    });
+    expect(calls.filter(({ args }) => args.includes("--input"))).toHaveLength(1);
+    expect(calls.some(({ command }) => command === "gh")).toBe(false);
+  });
+
+  it("fails closed on GitStream target drift before submission", async () => {
+    const calls: string[][] = [];
+    const pi = {
+      exec: async (_command: string, args: string[]) => {
+        calls.push(args);
+        if (args[1] === "/user") return { stdout: JSON.stringify({ login: "reviewer@shopify.com" }), stderr: "", code: 0, killed: false };
+        return { stdout: JSON.stringify({ state: "open", head: { sha: "new-head" }, base: { sha: "base" } }), stderr: "", code: 0, killed: false };
+      },
+    };
+
+    const result = await submitPullRequestReview(pi as never, {
+      provider: "gitstream",
+      repo: "shop/world",
+      prNumber: "42",
+      commitId: "old-head",
+      baseCommitId: "base",
+      verdict: "approve",
+      prAuthorLogin: "author@shopify.com",
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.message).toMatch(/head changed/i);
+    expect(calls.some((args) => args.includes("--input"))).toBe(false);
+  });
+
+  it("fails closed on malformed or failed GitStream commands", async () => {
+    const malformed = await submitPullRequestReview({
+      exec: async () => ({ stdout: "not-json", stderr: "", code: 0, killed: false }),
+    } as never, {
+      provider: "gitstream",
+      repo: "shop/world",
+      prNumber: "42",
+      commitId: "head",
+      baseCommitId: "base",
+      verdict: "approve",
+      prAuthorLogin: "author@shopify.com",
+    });
+    expect(malformed.ok).toBe(false);
+    expect(malformed.message).toMatch(/malformed GitStream response/i);
+
+    const failed = await submitPullRequestReview({
+      exec: async () => ({ stdout: "", stderr: "authentication required", code: 4, killed: false }),
+    } as never, {
+      provider: "gitstream",
+      repo: "shop/world",
+      prNumber: "42",
+      commitId: "head",
+      baseCommitId: "base",
+      verdict: "comment",
+      body: "note",
+    });
+    expect(failed.ok).toBe(false);
+    expect(failed.message).toContain("authentication required");
   });
 
   it("rejects request_changes with no body or comments before calling gh", async () => {

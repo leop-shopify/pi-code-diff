@@ -9,11 +9,22 @@ describe("remote review helpers", () => {
     clearRemoteReviewTargetCache();
   });
 
-  it("parses GitHub, Graphite, short PR, and branch remote inputs", () => {
-    expect(extractBranchFromRemote("https://github.com/example/widgets/pull/123")).toEqual({ branch: "__pr__123", repo: "example/widgets", prNumber: "123" });
-    expect(extractBranchFromRemote("https://app.graphite.dev/github/pr/example/widgets/456")).toEqual({ branch: "__pr__456", repo: "example/widgets", prNumber: "456" });
-    expect(extractBranchFromRemote("example/widgets#789")).toEqual({ branch: "__pr__789", repo: "example/widgets", prNumber: "789" });
+  it("parses GitHub, Graphite, Meteorite, short PR, and branch remote inputs", () => {
+    expect(extractBranchFromRemote("https://github.com/example/widgets/pull/123")).toEqual({ branch: "__pr__123", repo: "example/widgets", prNumber: "123", provider: "github" });
+    expect(extractBranchFromRemote("https://app.graphite.dev/github/pr/example/widgets/456")).toEqual({ branch: "__pr__456", repo: "example/widgets", prNumber: "456", provider: "github" });
+    expect(extractBranchFromRemote("https://meteorite.shopify.io/repos/shop/world/pulls/2002491")).toEqual({ branch: "__pr__2002491", repo: "shop/world", prNumber: "2002491", provider: "gitstream" });
+    expect(extractBranchFromRemote("https://meteorite.shopify.io/repos/shop/world/pulls/2002491/files")).toEqual({ branch: "__pr__2002491", repo: "shop/world", prNumber: "2002491", provider: "gitstream" });
+    expect(extractBranchFromRemote("example/widgets#789")).toEqual({ branch: "__pr__789", repo: "example/widgets", prNumber: "789", provider: "github" });
     expect(extractBranchFromRemote("feature/stack-branch")).toEqual({ branch: "feature/stack-branch" });
+  });
+
+  it("rejects attacker-shaped and malformed Meteorite URLs", () => {
+    expect(extractBranchFromRemote("https://evil.example/https://meteorite.shopify.io/repos/shop/world/pulls/1")).toBeNull();
+    expect(extractBranchFromRemote("https://meteorite.shopify.io.evil.example/repos/shop/world/pulls/1")).toBeNull();
+    expect(extractBranchFromRemote("https://user@meteorite.shopify.io/repos/shop/world/pulls/1")).toBeNull();
+    expect(extractBranchFromRemote("http://meteorite.shopify.io/repos/shop/world/pulls/1")).toBeNull();
+    expect(extractBranchFromRemote("https://meteorite.shopify.io/repos/shop/world/pulls/1?redirect=https://evil.example")).toBeNull();
+    expect(extractBranchFromRemote("https://meteorite.shopify.io/repos/shop/world/pulls/1/commits")).toBeNull();
   });
 
   it("formats pull request context with deduplicated latest reviewer state", () => {
@@ -198,6 +209,115 @@ describe("remote review helpers", () => {
     expect(formatPullRequestContext(target.pullRequest!)).toContain("Stack parent: PR #6 Parent change (parent/review, merged)");
     if (previousScan == null) delete process.env.PI_CODE_DIFF_SCAN_STACK_PARENTS;
     else process.env.PI_CODE_DIFF_SCAN_STACK_PARENTS = previousScan;
+  });
+
+  it("resolves Meteorite PR metadata and pins the fetched base and head SHAs", async () => {
+    const fetchCalls: string[][] = [];
+    const exec = vi.fn(async (command: string, args: string[]) => {
+      if (command === "gs" && args[0] === "api" && args[1] === "repos/shop/world/pulls/2002491") {
+        return {
+          code: 0,
+          stdout: JSON.stringify({
+            number: 2002491,
+            title: "Refresh schema",
+            body: "Body",
+            additions: 428,
+            deletions: 1,
+            changed_files: 6,
+            user: { login: "author@shopify.com" },
+            state: "open",
+            draft: false,
+            head: { ref: "feature/schema", sha: "head-sha" },
+            base: { ref: "main", sha: "base-sha" },
+          }),
+          stderr: "",
+          killed: false,
+        };
+      }
+      if (command === "gs" && args[0] === "api" && args[1] === "repos/shop/world/pulls/2002491/reviews") {
+        return { code: 0, stdout: JSON.stringify([{ user: { login: "reviewer@shopify.com" }, state: "APPROVED" }]), stderr: "", killed: false };
+      }
+      if (command === "git" && args[1] === "fetch") {
+        fetchCalls.push(args);
+        return { code: 0, stdout: "", stderr: "", killed: false };
+      }
+      if (command === "git" && args.join(" ") === "rev-parse refs/remotes/origin/gitstream/2002491/base") return { code: 0, stdout: "base-sha\n", stderr: "", killed: false };
+      if (command === "git" && args.join(" ") === "rev-parse refs/remotes/origin/gitstream/2002491/head") return { code: 0, stdout: "head-sha\n", stderr: "", killed: false };
+      if (command === "git" && args[0] === "merge-base") return { code: 0, stdout: "merge-base-sha\n", stderr: "", killed: false };
+      return { code: 1, stdout: "", stderr: `unexpected ${command} ${args.join(" ")}`, killed: false };
+    });
+
+    await expect(resolveRemoteReviewTarget(
+      { exec } as never,
+      "/repo",
+      "https://meteorite.shopify.io/repos/shop/world/pulls/2002491/files",
+      "/repo",
+    )).resolves.toMatchObject({
+      provider: "gitstream",
+      gitRoot: "/repo",
+      baseRef: "merge-base-sha",
+      headRef: "origin/gitstream/2002491/head",
+      branch: "feature/schema",
+      repo: "shop/world",
+      pullRequest: {
+        number: "2002491",
+        headRefOid: "head-sha",
+        baseRefOid: "base-sha",
+        reviews: [{ author: { login: "reviewer@shopify.com" }, state: "APPROVED" }],
+      },
+    });
+    expect(fetchCalls[0]).toContain("+refs/heads/main:refs/remotes/origin/gitstream/2002491/base");
+    expect(fetchCalls[0]).toContain("+refs/heads/feature/schema:refs/remotes/origin/gitstream/2002491/head");
+  });
+
+  it("fails closed when a fetched Meteorite target no longer matches its metadata", async () => {
+    const exec = vi.fn(async (command: string, args: string[]) => {
+      if (command === "gs" && args[0] === "api" && args[1].endsWith("/reviews")) {
+        return { code: 0, stdout: "[]", stderr: "", killed: false };
+      }
+      if (command === "gs") {
+        return {
+          code: 0,
+          stdout: JSON.stringify({
+            number: 8,
+            title: "Drifting PR",
+            body: "",
+            additions: 1,
+            deletions: 0,
+            changed_files: 1,
+            user: { login: "author@shopify.com" },
+            state: "open",
+            head: { ref: "feature/drift", sha: "expected-head" },
+            base: { ref: "main", sha: "expected-base" },
+          }),
+          stderr: "",
+          killed: false,
+        };
+      }
+      if (command === "git" && args[1] === "fetch") return { code: 0, stdout: "", stderr: "", killed: false };
+      if (command === "git" && args[0] === "rev-parse") return { code: 0, stdout: "different-head\n", stderr: "", killed: false };
+      return { code: 1, stdout: "", stderr: "unexpected", killed: false };
+    });
+
+    await expect(resolveRemoteReviewTarget(
+      { exec } as never,
+      "/repo",
+      "https://meteorite.shopify.io/repos/shop/world/pulls/8",
+      "/repo",
+    )).rejects.toThrow(/changed while preparing the review/i);
+  });
+
+  it("fails closed on malformed GitStream metadata", async () => {
+    const exec = vi.fn(async (command: string) => command === "gs"
+      ? { code: 0, stdout: "{not json", stderr: "", killed: false }
+      : { code: 1, stdout: "", stderr: "unexpected", killed: false });
+
+    await expect(resolveRemoteReviewTarget(
+      { exec } as never,
+      "/repo",
+      "https://meteorite.shopify.io/repos/shop/world/pulls/8",
+      "/repo",
+    )).rejects.toThrow(/malformed GitStream response/i);
   });
 
   it("resolves same-repo GitHub PRs to fetched base and head refs", async () => {

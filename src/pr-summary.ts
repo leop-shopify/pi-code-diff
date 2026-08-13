@@ -35,6 +35,7 @@ interface PullRequestCheck {
 interface PullRequestDetails {
   url?: string;
   isDraft?: boolean;
+  checksUnavailable?: boolean;
   mergeStateStatus?: string;
   reviewDecision?: string;
   comments?: PullRequestComment[];
@@ -80,6 +81,12 @@ query PullRequestOpenThreads($owner: String!, $name: String!, $number: Int!) {
 
 function ghArgs(args: string[], repo: string | undefined): string[] {
   return repo == null ? args : [...args, "--repo", repo];
+}
+
+function pullRequestUrl(target: RemoteReviewTarget): string {
+  const pr = target.pullRequest!;
+  if (target.provider === "gitstream") return `https://meteorite.shopify.io/repos/${target.repo}/pulls/${pr.number}`;
+  return target.repo == null ? target.remote : `https://github.com/${target.repo}/pull/${pr.number}`;
 }
 
 function normalizePlainText(value: string): string {
@@ -209,6 +216,7 @@ function extractBodySignal(body: string): string {
 }
 
 function formatChecks(details: PullRequestDetails): string {
+  if (details.checksUnavailable) return "Check details unavailable from GitStream context.";
   const failed = failingChecks(details).slice(0, 4).map(checkName);
   if (failed.length > 0) return `Failing: ${failed.join(", ")}`;
   const pending = pendingChecks(details).slice(0, 4).map(checkName);
@@ -270,7 +278,7 @@ function formatAuthor(authorLogin: string, body: string): string {
 
 function enforceIdentityFields(summary: string, target: RemoteReviewTarget, details: PullRequestDetails): string {
   const pr = target.pullRequest!;
-  const url = details.url ?? (target.repo == null ? target.remote : `https://github.com/${target.repo}/pull/${pr.number}`);
+  const url = details.url ?? pullRequestUrl(target);
   return [
     ["Diff", formatDiffStats(target)],
     ["Author", formatAuthor(pr.authorLogin, pr.body)],
@@ -291,7 +299,7 @@ function fallbackSummary(target: RemoteReviewTarget, details: PullRequestDetails
 
   return [
     `Title: ${pr.title}`,
-    `URL: ${details.url ?? (target.repo == null ? target.remote : `https://github.com/${target.repo}/pull/${pr.number}`)}`,
+    `URL: ${details.url ?? pullRequestUrl(target)}`,
     `Author: ${formatAuthor(pr.authorLogin, pr.body)}`,
     `Diff: ${formatDiffStats(target)}`,
     `Status: ${status.status} - ${status.reason}`,
@@ -318,7 +326,7 @@ function formatSummaryInput(target: RemoteReviewTarget, details: PullRequestDeta
 
   return [
     `Title: ${pr.title}`,
-    `URL: ${details.url ?? (target.repo == null ? "" : `https://github.com/${target.repo}/pull/${pr.number}`)}`,
+    `URL: ${details.url ?? pullRequestUrl(target)}`,
     `Author: ${formatAuthor(pr.authorLogin, pr.body)}`,
     `Diff: ${formatDiffStats(target)}`,
     `State: ${pr.state}`,
@@ -394,7 +402,93 @@ async function fetchOpenReviewThreads(pi: ExtensionAPI, target: RemoteReviewTarg
   }));
 }
 
+function parseGitstreamJson(value: string, label: string): unknown {
+  try {
+    return JSON.parse(value);
+  } catch {
+    throw new Error(`Malformed GitStream response for ${label}.`);
+  }
+}
+
+function gitstreamRecord(value: unknown, label: string): Record<string, unknown> {
+  if (value == null || typeof value !== "object" || Array.isArray(value)) throw new Error(`Malformed GitStream response for ${label}.`);
+  return value as Record<string, unknown>;
+}
+
+async function fetchGitstreamApi(pi: ExtensionAPI, target: RemoteReviewTarget, endpoint: string, label: string, paginate = false): Promise<unknown> {
+  const result = await pi.exec("gs", ["api", endpoint, ...(paginate ? ["--paginate"] : [])], { cwd: target.gitRoot, timeout: 45000 });
+  if (result.code !== 0 || result.stdout.trim().length === 0) throw new Error(result.stderr || result.stdout || `Could not fetch GitStream ${label}.`);
+  return parseGitstreamJson(result.stdout.trim(), label);
+}
+
+function gitstreamComments(value: unknown, label: string): PullRequestComment[] {
+  if (!Array.isArray(value)) throw new Error(`Malformed GitStream response for ${label}.`);
+  return value.map((item, index) => {
+    const row = gitstreamRecord(item, `${label}[${index}]`);
+    const user = gitstreamRecord(row.user ?? row.author, `${label}[${index}].user`);
+    if (typeof user.login !== "string" || typeof row.body !== "string") throw new Error(`Malformed GitStream response for ${label}[${index}].`);
+    return {
+      author: { login: user.login },
+      body: row.body,
+      createdAt: typeof row.created_at === "string" ? row.created_at : undefined,
+      submittedAt: typeof row.submitted_at === "string" ? row.submitted_at : undefined,
+      state: typeof row.state === "string" ? row.state : undefined,
+      url: typeof row.html_url === "string" ? row.html_url : undefined,
+      path: typeof row.path === "string" ? row.path : undefined,
+      line: typeof row.line === "number" ? row.line : null,
+    };
+  });
+}
+
+async function fetchGitstreamPullRequestDetails(pi: ExtensionAPI, target: RemoteReviewTarget): Promise<PullRequestDetails> {
+  const pr = target.pullRequest!;
+  const repo = target.repo;
+  if (repo == null) throw new Error(`Could not fetch GitStream PR #${pr.number} context without a repository.`);
+  const prefix = `repos/${repo}`;
+  const [rawPr, rawComments, rawReviews, rawReviewComments] = await Promise.all([
+    fetchGitstreamApi(pi, target, `${prefix}/pulls/${pr.number}`, `PR #${pr.number}`),
+    fetchGitstreamApi(pi, target, `${prefix}/issues/${pr.number}/comments`, `PR #${pr.number} comments`, true),
+    fetchGitstreamApi(pi, target, `${prefix}/pulls/${pr.number}/reviews`, `PR #${pr.number} reviews`, true),
+    fetchGitstreamApi(pi, target, `${prefix}/pulls/${pr.number}/comments`, `PR #${pr.number} review comments`, true),
+  ]);
+  const row = gitstreamRecord(rawPr, `PR #${pr.number}`);
+  const comments = gitstreamComments(rawComments, `PR #${pr.number} comments`);
+  const reviews = gitstreamComments(rawReviews, `PR #${pr.number} reviews`);
+  const reviewComments = gitstreamComments(rawReviewComments, `PR #${pr.number} review comments`);
+  const rawReviewRows = rawReviewComments as unknown[];
+  const openReviewThreads = reviewComments.map((comment, index) => {
+    const reviewRow = gitstreamRecord(rawReviewRows[index], `PR #${pr.number} review comments[${index}]`);
+    const extension = reviewRow.x_gitstream == null ? {} : gitstreamRecord(reviewRow.x_gitstream, `PR #${pr.number} review comments[${index}].x_gitstream`);
+    return {
+      path: comment.path,
+      line: comment.line,
+      isResolved: extension.is_resolved === true,
+      isOutdated: false,
+      comments: [comment],
+    };
+  });
+  const extension = row.x_gitstream == null ? {} : gitstreamRecord(row.x_gitstream, `PR #${pr.number}.x_gitstream`);
+  const mergeability = extension.mergeability == null ? {} : gitstreamRecord(extension.mergeability, `PR #${pr.number}.x_gitstream.mergeability`);
+  const reviewDecision = mergeability.has_changes_requested_review === true
+    ? "CHANGES_REQUESTED"
+    : mergeability.has_approved_review === true ? "APPROVED" : undefined;
+  return {
+    url: pullRequestUrl(target),
+    isDraft: row.draft === true,
+    mergeStateStatus: typeof row.mergeable_state === "string" ? row.mergeable_state.toUpperCase() : undefined,
+    reviewDecision,
+    comments,
+    reviews,
+    openReviewThreads,
+    statusCheckRollup: [],
+    checksUnavailable: true,
+    createdAt: typeof row.created_at === "string" ? row.created_at : undefined,
+    updatedAt: typeof row.updated_at === "string" ? row.updated_at : undefined,
+  };
+}
+
 async function fetchPullRequestDetails(pi: ExtensionAPI, target: RemoteReviewTarget): Promise<PullRequestDetails> {
+  if (target.provider === "gitstream") return fetchGitstreamPullRequestDetails(pi, target);
   const pr = target.pullRequest!;
   const fields = "url,isDraft,mergeStateStatus,reviewDecision,statusCheckRollup,comments,reviews,createdAt,updatedAt";
   const result = await pi.exec("gh", ghArgs(["pr", "view", pr.number, "--json", fields], target.repo), { cwd: target.gitRoot, timeout: 45000 });

@@ -6,10 +6,13 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { getDefaultBranchRef } from "./git.js";
 import { getShortcutConfigPath } from "./shortcuts.js";
 
+export type PullRequestProvider = "github" | "gitstream";
+
 export interface RemoteParseResult {
   branch: string;
   repo?: string;
   prNumber?: string;
+  provider?: PullRequestProvider;
 }
 
 export interface StackParentMetadata {
@@ -34,6 +37,7 @@ export interface PullRequestMetadata {
   headRefName: string;
   headRefOid: string;
   baseRefName: string;
+  baseRefOid?: string;
   stackParent?: StackParentMetadata;
 }
 
@@ -48,6 +52,7 @@ export interface RemoteReviewTarget {
   workspacePath?: string;
   pathspecs?: string[];
   importAliases?: Record<string, string>;
+  provider?: PullRequestProvider;
 }
 
 export type RemoteProgress = (message: string) => void;
@@ -70,14 +75,26 @@ function stripOriginPrefix(ref: string): string {
 
 export function extractBranchFromRemote(input: string): RemoteParseResult | null {
   const trimmed = input.trim();
+  try {
+    const url = new URL(trimmed);
+    if (url.protocol === "https:" && url.hostname === "meteorite.shopify.io" && url.port === "" && url.username === "" && url.password === "" && url.search === "" && url.hash === "") {
+      const match = url.pathname.match(/^\/repos\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\/pulls\/([1-9]\d*)(?:\/files)?$/);
+      if (match != null) {
+        const repo = `${match[1]}/${match[2]}`;
+        return { branch: `__pr__${match[3]}`, repo, prNumber: match[3], provider: "gitstream" };
+      }
+      return null;
+    }
+  } catch {}
+
   const ghMatch = trimmed.match(/github\.com\/([^/\s]+\/[^/\s]+)\/pull\/(\d+)/);
-  if (ghMatch != null) return { branch: `__pr__${ghMatch[2]}`, repo: ghMatch[1], prNumber: ghMatch[2] };
+  if (ghMatch != null) return { branch: `__pr__${ghMatch[2]}`, repo: ghMatch[1], prNumber: ghMatch[2], provider: "github" };
 
   const graphiteMatch = trimmed.match(/graphite\.dev\/github\/pr\/([^/\s]+\/[^/\s]+)\/(\d+)/);
-  if (graphiteMatch != null) return { branch: `__pr__${graphiteMatch[2]}`, repo: graphiteMatch[1], prNumber: graphiteMatch[2] };
+  if (graphiteMatch != null) return { branch: `__pr__${graphiteMatch[2]}`, repo: graphiteMatch[1], prNumber: graphiteMatch[2], provider: "github" };
 
   const shortMatch = trimmed.match(/^([^/\s]+\/[^#\s]+)#(\d+)$/);
-  if (shortMatch != null) return { branch: `__pr__${shortMatch[2]}`, repo: shortMatch[1], prNumber: shortMatch[2] };
+  if (shortMatch != null) return { branch: `__pr__${shortMatch[2]}`, repo: shortMatch[1], prNumber: shortMatch[2], provider: "github" };
 
   if (/^[\w./-]+$/.test(trimmed)) return { branch: trimmed };
   return null;
@@ -349,7 +366,90 @@ async function findClosestStackParent(pi: ExtensionAPI, gitRoot: string, metadat
   return best == null ? undefined : { baseRef: await getMergeBase(pi, gitRoot, best.ref, headRef), stackParent: best.candidate };
 }
 
-export async function getPullRequestMetadata(pi: ExtensionAPI, gitRoot: string, prNumber: string, repo?: string, onProgress?: RemoteProgress): Promise<PullRequestMetadata> {
+function parseJsonObject(value: string, label: string): Record<string, unknown> {
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    if (parsed == null || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error();
+    return parsed as Record<string, unknown>;
+  } catch {
+    throw new Error(`Malformed GitStream response for ${label}.`);
+  }
+}
+
+function requiredObject(value: unknown, label: string): Record<string, unknown> {
+  if (value == null || typeof value !== "object" || Array.isArray(value)) throw new Error(`Malformed GitStream response: ${label} is missing.`);
+  return value as Record<string, unknown>;
+}
+
+function requiredString(value: unknown, label: string): string {
+  if (typeof value !== "string" || value.length === 0) throw new Error(`Malformed GitStream response: ${label} is missing.`);
+  return value;
+}
+
+function numericValue(value: unknown, label: string): number {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) throw new Error(`Malformed GitStream response: ${label} is invalid.`);
+  return value;
+}
+
+async function getGitstreamReviews(pi: ExtensionAPI, gitRoot: string, repo: string, prNumber: string): Promise<PullRequestMetadata["reviews"]> {
+  const endpoint = `repos/${repo}/pulls/${prNumber}/reviews`;
+  const result = await pi.exec("gs", ["api", endpoint, "--paginate"], { cwd: gitRoot, timeout: 30000 });
+  if (result.code !== 0) throw new Error(`Could not resolve GitStream reviews for PR #${prNumber}: ${result.stderr || result.stdout || "command failed"}`);
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(result.stdout.trim());
+  } catch {
+    throw new Error(`Malformed GitStream response for PR #${prNumber} reviews.`);
+  }
+  if (!Array.isArray(parsed)) throw new Error(`Malformed GitStream response for PR #${prNumber} reviews.`);
+  return parsed.map((review, index) => {
+    const row = requiredObject(review, `reviews[${index}]`);
+    const author = requiredObject(row.user ?? row.author, `reviews[${index}].user`);
+    return {
+      author: { login: requiredString(author.login, `reviews[${index}].user.login`) },
+      state: requiredString(row.state, `reviews[${index}].state`),
+    };
+  });
+}
+
+async function getGitstreamPullRequestMetadata(pi: ExtensionAPI, gitRoot: string, prNumber: string, repo: string, onProgress?: RemoteProgress): Promise<PullRequestMetadata> {
+  onProgress?.(`Fetching GitStream PR #${prNumber} metadata from ${repo}…`);
+  const endpoint = `repos/${repo}/pulls/${prNumber}`;
+  const result = await pi.exec("gs", ["api", endpoint], { cwd: gitRoot, timeout: 30000 });
+  if (result.code !== 0 || result.stdout.trim().length === 0) {
+    throw new Error(`Could not resolve GitStream PR #${prNumber}: ${result.stderr || result.stdout || "empty response"}`);
+  }
+  const parsed = parseJsonObject(result.stdout.trim(), `PR #${prNumber}`);
+  if (String(parsed.number) !== prNumber) throw new Error(`Malformed GitStream response: PR number does not match #${prNumber}.`);
+  const head = requiredObject(parsed.head, "head");
+  const base = requiredObject(parsed.base, "base");
+  const author = requiredObject(parsed.user, "user");
+  const reviews = await getGitstreamReviews(pi, gitRoot, repo, prNumber);
+
+  return {
+    number: prNumber,
+    repo,
+    title: requiredString(parsed.title, "title"),
+    body: typeof parsed.body === "string" ? parsed.body : "",
+    additions: numericValue(parsed.additions, "additions"),
+    deletions: numericValue(parsed.deletions, "deletions"),
+    changedFiles: numericValue(parsed.changed_files, "changed_files"),
+    authorLogin: requiredString(author.login, "user.login"),
+    state: requiredString(parsed.state, "state").toUpperCase(),
+    reviews,
+    headRefName: requiredString(head.ref, "head.ref"),
+    headRefOid: requiredString(head.sha, "head.sha"),
+    baseRefName: requiredString(base.ref, "base.ref"),
+    baseRefOid: requiredString(base.sha, "base.sha"),
+  };
+}
+
+export async function getPullRequestMetadata(pi: ExtensionAPI, gitRoot: string, prNumber: string, repo?: string, onProgress?: RemoteProgress, provider: PullRequestProvider = "github"): Promise<PullRequestMetadata> {
+  if (provider === "gitstream") {
+    if (repo == null) throw new Error(`Could not resolve GitStream PR #${prNumber}: repository is unknown.`);
+    return getGitstreamPullRequestMetadata(pi, gitRoot, prNumber, repo, onProgress);
+  }
+
   onProgress?.(`Fetching PR #${prNumber} metadata${repo == null ? "" : ` from ${repo}`}…`);
   const result = await pi.exec("gh", ghArgs(["pr", "view", prNumber, "--json", "title,body,additions,deletions,changedFiles,author,reviews,state,headRefName,headRefOid,baseRefName"], repo), { cwd: gitRoot, timeout: 15000 });
   if (result.code !== 0 || result.stdout.trim().length === 0) {
@@ -429,6 +529,28 @@ async function fetchPullRequestRefs(pi: ExtensionAPI, gitRoot: string, metadata:
   }
 }
 
+async function fetchGitstreamPullRequestRefs(pi: ExtensionAPI, gitRoot: string, metadata: PullRequestMetadata, remote = "origin", onProgress?: RemoteProgress): Promise<{ baseRef: string; headRef: string }> {
+  if (metadata.baseRefOid == null) throw new Error(`GitStream PR #${metadata.number} metadata is missing base SHA.`);
+  const baseBranch = `gitstream/${metadata.number}/base`;
+  const headBranch = `gitstream/${metadata.number}/head`;
+  await fetchRemoteRefs(pi, gitRoot, [
+    `+${sourceBranchRef(metadata.baseRefName)}:${originRef(baseBranch)}`,
+    `+${sourceBranchRef(metadata.headRefName)}:${originRef(headBranch)}`,
+  ], remote, onProgress);
+
+  const baseResult = await pi.exec("git", ["rev-parse", originRef(baseBranch)], { cwd: gitRoot, timeout: 10000 });
+  const headResult = await pi.exec("git", ["rev-parse", originRef(headBranch)], { cwd: gitRoot, timeout: 10000 });
+  const fetchedBase = baseResult.code === 0 ? baseResult.stdout.trim() : "";
+  const fetchedHead = headResult.code === 0 ? headResult.stdout.trim() : "";
+  if (fetchedBase !== metadata.baseRefOid || fetchedHead !== metadata.headRefOid) {
+    throw new Error(`GitStream PR #${metadata.number} changed while preparing the review. Reopen it to review the latest base and head.`);
+  }
+
+  const baseRef = originShortRef(baseBranch);
+  const headRef = originShortRef(headBranch);
+  return { baseRef: await getMergeBase(pi, gitRoot, baseRef, headRef), headRef };
+}
+
 async function fetchPlainRemoteBranch(pi: ExtensionAPI, gitRoot: string, branch: string, onProgress?: RemoteProgress): Promise<{ baseRef: string; headRef: string }> {
   const defaultBranchRef = await getDefaultBranchRef(pi, gitRoot);
   const baseBranch = stripOriginPrefix(defaultBranchRef ?? "origin/main");
@@ -450,7 +572,10 @@ export async function resolveRemoteReviewTarget(pi: ExtensionAPI, fallbackCwd: s
   const parsed = extractBranchFromRemote(remote);
   if (parsed == null) throw new Error(`Could not extract branch name from: ${remote}`);
 
-  const cacheKey = JSON.stringify([remote.trim(), explicitCwd ?? "", parsed.repo == null ? fallbackCwd : ""]);
+  const normalizedRemote = parsed.provider === "gitstream" && parsed.repo != null && parsed.prNumber != null
+    ? `https://meteorite.shopify.io/repos/${parsed.repo}/pulls/${parsed.prNumber}`
+    : remote.trim();
+  const cacheKey = JSON.stringify([normalizedRemote, explicitCwd ?? "", parsed.repo == null ? fallbackCwd : ""]);
   const cached = remoteTargetCache.get(cacheKey);
   if (cached != null && cached.expiresAt > Date.now()) {
     onProgress?.(`Using cached remote review for ${remote}…`);
@@ -462,9 +587,12 @@ export async function resolveRemoteReviewTarget(pi: ExtensionAPI, fallbackCwd: s
   const { gitRoot, fetchRemote, workspacePath, pathspecs, importAliases } = await resolveRepoRoot(pi, fallbackCwd, parsed.repo, explicitCwd, onProgress);
 
   if (parsed.prNumber != null) {
-    const pullRequest = await getPullRequestMetadata(pi, gitRoot, parsed.prNumber, parsed.repo, onProgress);
-    const refs = await fetchPullRequestRefs(pi, gitRoot, pullRequest, fetchRemote, onProgress);
-    if (shouldScanStackParentCandidates()) {
+    const provider = parsed.provider ?? "github";
+    const pullRequest = await getPullRequestMetadata(pi, gitRoot, parsed.prNumber, parsed.repo, onProgress, provider);
+    const refs = provider === "gitstream"
+      ? await fetchGitstreamPullRequestRefs(pi, gitRoot, pullRequest, fetchRemote, onProgress)
+      : await fetchPullRequestRefs(pi, gitRoot, pullRequest, fetchRemote, onProgress);
+    if (provider === "github" && shouldScanStackParentCandidates()) {
       const closestStackParent = await findClosestStackParent(pi, gitRoot, pullRequest, refs.baseRef, refs.headRef, fetchRemote, parsed.repo, onProgress);
       if (closestStackParent != null) {
         refs.baseRef = closestStackParent.baseRef;
@@ -475,13 +603,14 @@ export async function resolveRemoteReviewTarget(pi: ExtensionAPI, fallbackCwd: s
       gitRoot,
       baseRef: refs.baseRef,
       headRef: refs.headRef,
-      remote,
+      remote: normalizedRemote,
       branch: pullRequest.headRefName,
       repo: parsed.repo,
       pullRequest,
       workspacePath,
       pathspecs,
       importAliases,
+      provider,
     };
     remoteTargetCache.set(cacheKey, { target, expiresAt: Date.now() + REMOTE_TARGET_CACHE_TTL_MS });
     return target;
