@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.4.0 - 2026-08-13
+
+### Added
+
+- Review Meteorite and GitStream pull requests through the existing `/diff remote` workflow.
+
 ## 0.3.6 - 2026-08-12
 
 ### Added
