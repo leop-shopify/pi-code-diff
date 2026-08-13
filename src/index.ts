@@ -10,7 +10,7 @@ import { createRemotePullRequestSummarySource } from "./pr-summary.js";
 import { reviewGrammar, type GrammarReviewResult, type GrammarTextChange, type ReviewTextSet } from "./review-grammar.js";
 import { createReviewSessionId, deleteReviewSession, loadReviewSession, saveReviewSession, type ReviewSessionData } from "./review-session.js";
 import { formatPullRequestContext, resolveRemoteReviewTarget, type RemoteReviewTarget } from "./remote.js";
-import { buildInlineComments, buildReviewBody, submitPullRequestReview, type ReviewInlineComment, type ReviewVerdict } from "./review-submit.js";
+import { buildproviderComments, buildInlineComments, buildReviewBody, submitPullRequestReview, type ReviewInlineComment, type ReviewVerdict } from "./review-submit.js";
 import { partitionResolvedSeedComments, resolveSeedComments, type SeedReviewComment } from "./seed-comments.js";
 import { sanitizeTerminalText } from "./sanitize.js";
 import { loadCommentShortcuts } from "./shortcuts.js";
@@ -140,12 +140,24 @@ export function mergeReviewBodies(...bodies: Array<string | undefined>): string 
   return parts.length > 0 ? parts.join("\n\n") : undefined;
 }
 
+function pullRequestProviderName(target: RemoteReviewTarget): string {
+  return target.provider === "provider" ? "provider" : "GitHub";
+}
+
+function pullRequestUrl(target: RemoteReviewTarget): string {
+  const pr = target.pullRequest!;
+  if (target.provider === "provider") return `https://review-host.example.io/repos/${target.repo}/pulls/${pr.number}`;
+  return target.repo == null ? target.remote : `https://github.com/${target.repo}/pull/${pr.number}`;
+}
+
 export function composeReviewSubmissionPrompt(target: RemoteReviewTarget, verdict: ReviewVerdict, body: string | undefined, comments: ReviewInlineComment[]): string {
   const pr = target.pullRequest!;
   const args = {
+    provider: target.provider,
     repo: target.repo,
     prNumber: pr.number,
     commitId: pr.headRefOid,
+    baseCommitId: pr.baseRefOid,
     verdict,
     prAuthorLogin: pr.authorLogin,
     cwd: target.gitRoot,
@@ -153,9 +165,10 @@ export function composeReviewSubmissionPrompt(target: RemoteReviewTarget, verdic
     comments: comments.length > 0 ? comments : undefined,
   };
   const verdictLabel = verdict === "request_changes" ? "REQUEST CHANGES" : verdict.toUpperCase();
-  const prUrl = target.repo == null ? target.remote : `https://github.com/${target.repo}/pull/${pr.number}`;
+  const prUrl = pullRequestUrl(target);
+  const provider = pullRequestProviderName(target);
   return [
-    `Prepare a GitHub PR review submission for PR #${pr.number} (${target.repo ?? "this repo"}): ${pr.title}.`,
+    `Prepare a ${provider} PR review submission for PR #${pr.number} (${target.repo ?? "this repo"}): ${pr.title}.`,
     "",
     `Verdict: ${verdictLabel}`,
     "",
@@ -180,7 +193,7 @@ export function composeReviewSubmissionPrompt(target: RemoteReviewTarget, verdic
     "5. Ask for decisions using the available local confirmation/asking tooling. If the current ask tool can queue multiple questions, batch the uncertain text items in one ask call with one separate question per item. If batching is unavailable, ask one item at a time. Do not collapse all decisions into one combined prompt.",
     "6. Apply grammar-only corrections automatically. For approved uncertain items, use the fixed text. For edited items, use the user's replacement text. For skipped items, remove that body/comment from the submission.",
     "7. The user's Approve choice is the confirmation to submit an uncertain item. After the last uncertain item is approved, edited, or skipped, call submit_pr_review immediately with the arguments below, applying automatic grammar-only corrections and replacing only uncertain body/comment text with the approved or edited text. Do not ask for a second/final submission confirmation.",
-    `8. Do not approve this PR if the current GitHub user (${pr.authorLogin}) authored it; the tool refuses self-approval.`,
+    `8. Do not approve this PR if the current ${provider} user (${pr.authorLogin}) authored it; the tool refuses self-approval.`,
     `9. After submit_pr_review succeeds, reply with the PR link and the short action summary returned by the tool. PR link: ${prUrl}`,
     "",
     "submit_pr_review arguments:",
@@ -206,6 +219,7 @@ function getGrammarChangeLocation(change: GrammarTextChange, comments: ReviewInl
   const index = Number.parseInt(change.key.slice("comment:".length), 10);
   const comment = comments[index];
   if (comment == null) return `Comment ${index + 1}`;
+  if (comment.subject_type === "file") return `Comment ${index + 1}: ${comment.path} (file)`;
   const range = comment.start_line == null || comment.start_line === comment.line
     ? String(comment.line)
     : `${comment.start_line}-${comment.line}`;
@@ -321,14 +335,16 @@ export async function submitUiConfirmedReview(
 
   const repo = target.repo ?? pr.repo;
   if (repo == null) {
-    const message = "Could not submit the review because the GitHub repository is unknown.";
+    const message = `Could not submit the review because the ${pullRequestProviderName(target)} repository is unknown.`;
     ctx.ui.notify(message, "warning");
     return { started: true, message, context: formatPullRequestContext(pr) };
   }
   const submission = await submitPullRequestReview(pi, {
+    provider: target.provider,
     repo,
     prNumber: pr.number,
     commitId: pr.headRefOid,
+    baseCommitId: pr.baseRefOid,
     verdict,
     body: resolved.body,
     comments: resolved.comments,
@@ -338,9 +354,9 @@ export async function submitUiConfirmedReview(
   ctx.ui.notify(submission.message, submission.ok ? "info" : "warning");
   if (!submission.ok) return { started: true, message: submission.message, context: formatPullRequestContext(pr) };
 
-  const prUrl = `https://github.com/${repo}/pull/${pr.number}`;
+  const prUrl = pullRequestUrl(target);
   sendReviewFollowUp(pi, ctx, [
-    "pi-code-diff already submitted this GitHub review after its grammar safety pass.",
+    `pi-code-diff already submitted this ${pullRequestProviderName(target)} review after its grammar safety pass.`,
     "Do not ask for confirmation and do not submit the review again.",
     "Run any configured post-review completion callback, then report the result briefly.",
     `PR: ${prUrl}`,
@@ -354,22 +370,23 @@ export function composeRemoteReviewPrompt(target: RemoteReviewTarget, reviewProm
 
   if (target.pullRequest != null) {
     const context = formatPullRequestContext(target.pullRequest);
-    lines.push("GitHub PR review feedback.");
+    const provider = pullRequestProviderName(target);
+    lines.push(`${provider} PR review feedback.`);
     lines.push("");
     lines.push(context);
-    if (target.repo != null) lines.push(`URL: https://github.com/${target.repo}/pull/${target.pullRequest.number}`);
+    if (target.repo != null) lines.push(`URL: ${pullRequestUrl(target)}`);
     lines.push(`Head commit: ${target.pullRequest.headRefOid}`);
   } else {
     lines.push(`Remote branch review feedback for ${target.branch}.`);
   }
   lines.push("");
   lines.push("Remote review agent-only flow:");
-  lines.push("- This handoff is for the agent only. Do not post comments, approve, request changes, or take any public GitHub action from this prompt.");
+  lines.push("- This handoff is for the agent only. Do not post comments, approve, request changes, or take any public pull-request action from this prompt.");
   lines.push("- DISCUSS items are agent-only questions. Answer them in prose; do not edit files or post to GitHub to satisfy DISCUSS items unless the user explicitly asks for a separate change.");
   lines.push("");
-  lines.push("Rules for GitHub actions:");
+  lines.push("Rules for pull-request actions:");
   lines.push("- Do not post comments, approve, or request changes until the user explicitly confirms the exact public action.");
-  lines.push("- For line-specific GitHub comments, verify the path, side, line, and head commit before constructing the review request.");
+  lines.push("- For line-specific comments, verify the path, side, line, and head commit before constructing the review request.");
   lines.push("- Deleted-side comments may need to be posted as general review body comments if exact LEFT-side mapping is uncertain.");
   lines.push("");
   lines.push(reviewPrompt);
@@ -381,10 +398,10 @@ export function composeRemoteDiscussionPrompt(target: RemoteReviewTarget, discus
   const context = formatPullRequestContext(pr);
   const reopenArguments = { args: `remote ${target.remote}`, cwd: target.gitRoot };
   const lines = [
-    "GitHub PR review discussion.",
+    `${pullRequestProviderName(target)} PR review discussion.`,
     "",
     context,
-    ...(target.repo == null ? [] : [`URL: https://github.com/${target.repo}/pull/${pr.number}`]),
+    ...(target.repo == null ? [] : [`URL: ${pullRequestUrl(target)}`]),
     `Head commit: ${pr.headRefOid}`,
     "",
     "Saved review state:",
@@ -392,7 +409,7 @@ export function composeRemoteDiscussionPrompt(target: RemoteReviewTarget, discus
     "- Existing COMMENT and MODIFY items remain in the saved review for the PR author. They are not instructions for you and must not be acted on during this discussion.",
     "",
     "Discussion rules:",
-    "- Discuss the user's questions in prose. Read code or gather evidence when needed, but do not edit files or post anything to GitHub.",
+    "- Discuss the user's questions in prose. Read code or gather evidence when needed, but do not edit files or post anything to the pull request.",
     "- Keep the conversation open until the questions are resolved or the user decides to stop.",
     "",
     "Completion flow:",
@@ -562,7 +579,9 @@ export default function codeDiffExtension(pi: ExtensionAPI) {
 
   async function finishRemotePrReview(ctx: ExtensionContext, files: Parameters<typeof composeReviewPrompt>[0], result: ReviewSubmitPayload, target: RemoteReviewTarget): Promise<RemotePrFinishResult> {
     const pr = target.pullRequest!;
-    const inlineComments = buildInlineComments(files, result.comments);
+    const inlineComments = target.provider === "provider"
+      ? buildproviderComments(files, result.comments)
+      : buildInlineComments(files, result.comments);
     const discussionPrompt = composeDiscussionPrompt(files, result);
 
     const approveChoice = "Approve";
@@ -585,7 +604,7 @@ export default function codeDiffExtension(pi: ExtensionAPI) {
     }
 
     const verdict: ReviewVerdict = choice === approveChoice ? "approve" : choice === requestChoice ? "request_changes" : "comment";
-    const reviewBody = buildReviewBody(files, result);
+    const reviewBody = buildReviewBody(files, result, target.provider !== "provider");
     const optionalBody = await ctx.ui.editor(`${choice}: optional review body comment`, "");
     const body = mergeReviewBodies(optionalBody, reviewBody);
     return { status: await submitUiConfirmedReview(pi, ctx, target, verdict, body, inlineComments), sessionAction: "delete" };
@@ -804,8 +823,8 @@ export default function codeDiffExtension(pi: ExtensionAPI) {
   pi.registerTool({
     name: "submit_pr_review",
     label: "submit-pr-review",
-    description: "Submit a GitHub pull request review (approve, request changes, or comment) via provider-cli api. Refuses to approve a PR authored by the current user. Approvals with inline comments post the comments first, then approve.",
-    promptSnippet: "Submit a GitHub PR review verdict via provider-cli api after the user confirms.",
+    description: "Submit a GitHub or provider pull request review after confirmation. Refuses self-approval and validates immutable provider targets before one atomic submission.",
+    promptSnippet: "Submit a confirmed GitHub or provider PR review verdict through the matching provider.",
     promptGuidelines: [
       "Only call submit_pr_review after the user explicitly confirms the verdict and review text. The review UI confirmation also authorizes grammar, spelling, capitalization, punctuation, and meaning-preserving syntax corrections without another confirmation.",
       "Fix only grammar and English in the body and comment text; never change meaning, intent, tone, technical substance, or requested scope. Only changes that may cross those boundaries require exact approval before submission.",
@@ -813,12 +832,15 @@ export default function codeDiffExtension(pi: ExtensionAPI) {
       "Keep existing inline comments in the comments array for approve, request_changes, and comment verdicts.",
       "After a successful submission, report the PR link and short summary returned by the tool.",
       "Pass repo as owner/repo, the prNumber, the commitId (PR head SHA), and prAuthorLogin so self-approval can be blocked.",
-      "Pass cwd to the local checkout of the repository so provider-cli runs in the right place.",
+      "For provider, pass provider=provider and baseCommitId so target drift can be rejected before submission.",
+      "Pass cwd to the local checkout of the repository so the provider CLI runs in the right place.",
     ],
     parameters: Type.Object({
+      provider: Type.Optional(Type.Union([Type.Literal("github"), Type.Literal("provider")], { description: "Pull request provider; defaults to github" })),
       repo: Type.String({ description: "Repository as owner/repo" }),
       prNumber: Type.String({ description: "Pull request number" }),
       commitId: Type.String({ description: "PR head commit SHA (headRefOid)" }),
+      baseCommitId: Type.Optional(Type.String({ description: "Immutable PR base SHA, required for provider" })),
       verdict: Type.Union([
         Type.Literal("approve"),
         Type.Literal("request_changes"),
@@ -827,20 +849,23 @@ export default function codeDiffExtension(pi: ExtensionAPI) {
       body: Type.Optional(Type.String({ description: "Overall review body text" })),
       comments: Type.Optional(Type.Array(Type.Object({
         path: Type.String(),
-        line: Type.Number(),
-        side: Type.Union([Type.Literal("LEFT"), Type.Literal("RIGHT")]),
+        line: Type.Optional(Type.Number()),
+        side: Type.Optional(Type.Union([Type.Literal("LEFT"), Type.Literal("RIGHT")])),
         body: Type.String(),
         start_line: Type.Optional(Type.Number()),
         start_side: Type.Optional(Type.Union([Type.Literal("LEFT"), Type.Literal("RIGHT")])),
-      }), { description: "Inline review comments mirroring GitHub (path, line, side, body)" })),
+        subject_type: Type.Optional(Type.Literal("file")),
+      }), { description: "Line review comments, or provider file comments with subject_type=file" })),
       prAuthorLogin: Type.Optional(Type.String({ description: "PR author login, used to block self-approval" })),
       cwd: Type.Optional(Type.String({ description: "Local checkout directory to run provider-cli in" })),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const input = params as {
+        provider?: "github" | "provider";
         repo: string;
         prNumber: string;
         commitId: string;
+        baseCommitId?: string;
         verdict: ReviewVerdict;
         body?: string;
         comments?: ReviewInlineComment[];
@@ -848,9 +873,11 @@ export default function codeDiffExtension(pi: ExtensionAPI) {
         cwd?: string;
       };
       const result = await submitPullRequestReview(pi, {
+        provider: input.provider,
         repo: input.repo,
         prNumber: input.prNumber,
         commitId: input.commitId,
+        baseCommitId: input.baseCommitId,
         verdict: input.verdict,
         body: input.body,
         comments: input.comments,

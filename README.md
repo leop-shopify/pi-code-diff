@@ -1,10 +1,10 @@
 # pi-code-diff
 
-`/diff`, `/code`, and `/code-diff` open an interactive code diff editor for Pi with comments, editable line suggestions, AI-assisted review handoff, GitHub PR submission support, and local or remote diff review.
+`/diff`, `/code`, and `/code-diff` open an interactive code diff editor for Pi with comments, editable line suggestions, AI-assisted review handoff, GitHub and provider PR submission support, and local or remote diff review.
 
 It is inspired by Mario Zechner's [pi-diff-review](https://github.com/badlogic/pi-diff-review).
 
-It lets you stop after an agent turn, walk a local diff or remote PR inside Pi, add fast line/file/all-lines annotations, and route the result either back to the agent or into a GitHub PR review.
+It lets you stop after an agent turn, walk a local diff or remote PR inside Pi, add fast line/file/all-lines annotations, and route the result either back to the agent or into a GitHub or provider PR review.
 
 The goal is simple: keep terminal-based code review inside Pi, keep annotations precise, and make it easy to separate edits you want applied from comments you want posted and things you want explained.
 
@@ -19,7 +19,7 @@ It supports local and remote review modes:
 - `all files`
 - custom `base..head` / `base...head` ranges
 - remote branches
-- GitHub or stack-host PR URLs
+- GitHub, stack-host, or review-host PR URLs
 
 Inside the review UI you can:
 
@@ -30,12 +30,12 @@ Inside the review UI you can:
 - leave an **all-lines note** for the current file
 - mark feedback as either:
   - `DISCUSS` — the agent explains, justifies, or proposes; it never edits code or touches GitHub to satisfy the note
-  - `COMMENT` — a real GitHub PR comment when the review is remote; for a local review it becomes a local comment to the agent about the change
+  - `COMMENT` — a real pull-request comment when the review is a GitHub or provider PR; for a local review it becomes a local comment to the agent about the change
   - `MODIFY` — an exact edit you make in place on the line; the agent applies it locally
 - insert the resulting local review prompt into Pi’s editor
-- for GitHub PR reviews, run a grammar and semantic-safety pass with the active Pi model, automatically apply safe corrections, and submit the confirmed verdict directly
+- for GitHub and provider PR reviews, run a grammar and semantic-safety pass with the active Pi model, automatically apply safe corrections, and submit the confirmed verdict directly
 
-For local reviews, the UI stages the next message for you. For GitHub PR verdicts, the UI grammar-checks the confirmed text and submits automatically when every correction preserves meaning, intent, tone, and technical substance.
+For local reviews, the UI stages the next message for you. For remote PR verdicts, the UI grammar-checks the confirmed text and submits automatically when every correction preserves meaning, intent, tone, and technical substance.
 
 ## Quickstart
 
@@ -93,7 +93,7 @@ Configure the shortcut with `globalShortcut` in `~/.pi/agent/extensions/code-dif
 - `/diff` with no arguments reviews local working-tree/uncommitted changes, including untracked files. When Pi is inside a recognized monorepo workspace such as `packages/app`, review is scoped to that workspace; add `--whole-repo` to include the entire checkout.
 - `/diff --include-generated` includes generated text such as `.rbi`, source maps, and minified JavaScript/CSS while still rejecting binary files.
 - Review state is saved locally while the UI is open and restored for the same repository/range. `/diff --resume <session-id>` selects an explicit session; `/diff --discard-resume` discards the matching saved session before opening.
-- `/diff remote <url | branch>` reviews a remote branch or GitHub PR. It accepts a remote branch, a GitHub or stack-host PR URL, or `owner/repo#123`.
+- `/diff remote <url | branch>` reviews a remote branch or PR. It accepts a remote branch, a GitHub or stack-host PR URL, a review-host URL, or `owner/repo#123`.
 - `/diff <base>..<head>` compares the two endpoints directly. `/diff <base>...<head>` compares the merge base with `head`.
 
 Local changes open the in-UI scope switcher described below.
@@ -127,11 +127,12 @@ Local changes open the in-UI scope switcher described below.
 
 Use `/diff` directly, or have an agent call `open_code_diff` with the same target syntax:
 
-- `/diff remote <branch | url>` or `open_code_diff({ args: "remote <branch | url>" })` accepts a plain remote branch, a GitHub PR URL, a stack-host PR URL, or `owner/repo#number`
+- `/diff remote <branch | url>` or `open_code_diff({ args: "remote <branch | url>" })` accepts a plain remote branch, a GitHub PR URL, a stack-host PR URL, a review-host URL, or `owner/repo#number`
+- review-host accepts both `https://review-host.example.io/repos/owner/repo/pulls/123` and the same URL ending in `/files`; both forms share the same saved-review identity
 - `/diff` with no args or `open_code_diff({ args: "" })` reviews local working-tree/uncommitted changes, including untracked files, against the configured or detected checkout
 - `/diff base..head` or `open_code_diff({ args: "base..head" })` reviews a `base..head` or `base...head` custom range
 
-Remote branch and GitHub PR reviews fetch with `--no-tags` and a 60 second timeout, then review the fetched base/head range in the `/diff` UI. GitHub PR reviews also show a `PR context` column with the exact title, URL, author, review status, problem summary, validation, open comments, files touched, and a compact `+added/-removed` line count. PR URLs and `owner/repo#number` do not require a checkout; if no matching local checkout is configured or detected, pi-code-diff uses a lightweight git cache under `~/.pi/agent/cache/pi-code-diff/remotes/`.
+Remote branch and PR reviews fetch with `--no-tags` and a 60 second timeout, then review the fetched base/head range in the `/diff` UI. GitHub and provider PR reviews also show a `PR context` column with the exact title, URL, author, review status, problem summary, available validation context, open comments, files touched, and a compact `+added/-removed` line count. PR URLs and `owner/repo#number` do not require a checkout; if no matching local checkout is configured or detected, pi-code-diff uses a lightweight git cache under `~/.pi/agent/cache/pi-code-diff/remotes/`.
 
 For monorepos or repos that should resolve to a specific local checkout, add a `repositories` mapping to `~/.pi/agent/extensions/code-diff.json`:
 
@@ -150,24 +151,25 @@ For monorepos or repos that should resolve to a specific local checkout, add a `
 
 ### Approving and commenting on a PR
 
-When the review is a GitHub PR, finishing the review opens an end-action menu:
+When the review is a GitHub or provider PR, finishing the review opens an end-action menu:
 
 - `Approve`
 - `Request changes`
 - `Post Comments`
 - `Start discussion with agents` when at least one `DISCUSS` item exists
 
-All three GitHub verdicts open an optional review-body editor, so `Post Comments` can publish inline comments and a general comment together.
+All three verdicts open an optional review-body editor, so `Post Comments` can publish inline comments and a general comment together.
 
-The three GitHub verdicts use an extension-owned submission flow:
+The verdicts use an extension-owned submission flow:
 
 1. You pick a verdict in the review UI, confirming the review locations, verdict, and original text.
 2. pi-code-diff asks the active Pi model to correct grammar, spelling, capitalization, punctuation, and awkward syntax without changing meaning.
 3. A separate semantic-safety pass classifies every correction. Meaning-preserving grammar and clarity corrections are applied and submitted automatically without another approval screen.
 4. Only corrections that may alter meaning, intent, tone, technical substance, or requested scope are shown for an exact use/edit/keep/remove decision. Safe corrections in the same review remain automatic, and there is no final confirmation after uncertain items are resolved.
 5. Invalid model output fails closed and falls back to the agent-mediated submission prompt instead of posting unverified text.
-6. `COMMENT` line items are posted as GitHub inline comments. `MODIFY` line edits are posted as inline comments containing a suggested diff. `COMMENT` file/all-lines items become the review body. `DISCUSS` items are never sent to GitHub.
-7. Approval refuses self-approval with a clear message, and `request changes` requires a body or at least one inline comment.
+6. `COMMENT` line items are posted as inline review comments. `MODIFY` line edits are posted as inline comments containing a suggested diff. On GitHub, `COMMENT` file/all-lines items become the review body. On provider, they use the native file-comment anchor. `DISCUSS` items are never submitted.
+7. Approval refuses self-approval with a clear message. GitHub `request changes` requires a body or at least one inline comment; provider requires a review body.
+8. provider metadata, identity, and submission use `provider-cli api`. Immediately before posting, pi-code-diff verifies that the live base and head SHAs still match the reviewed target. The verdict, body, line comments, and file comments are then sent in one atomic review request. Malformed output, authentication errors, target drift, unsupported comment locations, and command failures stop without a fallback post.
 
 `Start discussion with agents` skips GitHub entirely and stages only the `DISCUSS` items as the prompt for an agent conversation. When an agent opened the review with `open_code_diff`, that prompt returns to the waiting agent; after a direct `/diff remote`, it stays in Pi's editor for you to submit. The `DISCUSS` items are consumed when the discussion starts, while existing `COMMENT` and `MODIFY` items stay in the saved review for the PR author.
 

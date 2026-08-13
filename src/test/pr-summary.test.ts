@@ -109,6 +109,63 @@ describe("remote PR summary source", () => {
     expect(exec).toHaveBeenCalledWith("pi", expect.arrayContaining(["--model", "openai/gpt-5"]), expect.objectContaining({ cwd: "/repo" }));
   });
 
+  it("loads review-host PR context through provider without invoking provider-cli", async () => {
+    const providerTarget = {
+      ...target({ repo: "example/widgets", baseRefOid: "base-sha" }),
+      provider: "provider" as const,
+      repo: "example/widgets",
+      remote: "https://review-host.example.io/repos/example/widgets/pulls/12/files",
+    };
+    const exec = vi.fn(async (command: string, args: string[]) => {
+      if (command === "provider-cli" && args[1] === "repos/example/widgets/pulls/12") {
+        return {
+          code: 0,
+          stdout: JSON.stringify({
+            html_url: "https://review-host.example.io/repos/example/widgets/pulls/12",
+            draft: false,
+            mergeable_state: "blocked",
+            created_at: "2026-06-25T09:00:00Z",
+            updated_at: "2026-06-25T10:00:00Z",
+            x_provider: { mergeability: { has_changes_requested_review: false, has_approved_review: false } },
+          }),
+          stderr: "",
+          killed: false,
+        };
+      }
+      if (command === "provider-cli" && args[1] === "repos/example/widgets/issues/12/comments") {
+        return { code: 0, stdout: JSON.stringify([{ user: { login: "bob@example.com" }, body: "Top-level context", created_at: "2026-06-25T10:00:00Z" }]), stderr: "", killed: false };
+      }
+      if (command === "provider-cli" && args[1] === "repos/example/widgets/pulls/12/reviews") {
+        return { code: 0, stdout: "[]", stderr: "", killed: false };
+      }
+      if (command === "provider-cli" && args[1] === "repos/example/widgets/pulls/12/comments") {
+        return {
+          code: 0,
+          stdout: JSON.stringify([{ user: { login: "carol@example.com" }, body: "Can this preserve compatibility?", created_at: "2026-06-25T10:02:00Z", path: "src/app.ts", line: 42, x_provider: { is_resolved: false } }]),
+          stderr: "",
+          killed: false,
+        };
+      }
+      if (command === "pi") {
+        expect(args.join("\n")).toContain("Can this preserve compatibility?");
+        return {
+          code: 0,
+          stdout: "Title: Remove old checkout path\nURL: https://review-host.example.io/repos/example/widgets/pulls/12\nAuthor: alice\nDiff: 2 files touched | +3/-9\nStatus: pending - open review comments\nProblem: Remove the old path.\nChanges: Deletes old checkout code.\nValidation: No failing checks found.\nOpen comments: carol asked about compatibility.",
+          stderr: "",
+          killed: false,
+        };
+      }
+      return { code: 1, stdout: "", stderr: `unexpected ${command} ${args.join(" ")}`, killed: false };
+    });
+
+    const source = createRemotePullRequestSummarySource({ exec } as never, {} as never, providerTarget)!;
+    const summary = await source.load();
+
+    expect(summary).toContain("URL:\nhttps://review-host.example.io/repos/example/widgets/pulls/12");
+    expect(summary).toContain("Open comments:\ncarol asked about compatibility.");
+    expect(exec.mock.calls.some(([command]) => command === "provider-cli")).toBe(false);
+  });
+
   it("shows the example River requester as the visible author", async () => {
     const exec = vi.fn(async (command: string, args: string[]) => {
       if (command === "provider-cli" && args[0] === "pr") {

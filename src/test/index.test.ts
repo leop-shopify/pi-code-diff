@@ -520,6 +520,106 @@ describe("code diff extension", () => {
     expect(mocks.deleteReviewSession).toHaveBeenCalled();
   });
 
+  it("runs a literal review-host /diff remote target through the normal confirmed review flow", async () => {
+    const commands = new Map<string, { handler: (args: string, ctx: any) => Promise<void> }>();
+    const file = remoteReviewFile();
+    const review-hostUrl = "https://review-host.example.io/repos/example/widgets/pulls/2002491/files";
+    mocks.resolveRemoteReviewTarget.mockResolvedValue({
+      ...remoteTarget(),
+      provider: "provider",
+      repo: "example/widgets",
+      remote: review-hostUrl,
+      pullRequest: {
+        ...remoteTarget().pullRequest,
+        repo: "example/widgets",
+        number: "2002491",
+        baseRefOid: "base-sha",
+        headRefOid: "head-sha",
+      },
+    });
+    mocks.getReviewWindowDataForRevisionRange.mockResolvedValue({
+      repoRoot: "/repo",
+      files: [file],
+      branchBaseRevision: "origin/main",
+      modifiedRevision: "origin/provider/2002491/head",
+      visibleScopes: ["all-files"],
+    });
+    mocks.runReviewApp.mockResolvedValue({
+      type: "submit",
+      allComment: "Overall note",
+      allIntent: "comment",
+      comments: [
+        {
+          id: "line",
+          fileId: file.id,
+          scope: "all-files",
+          side: "added",
+          intent: "comment",
+          startLine: 4,
+          endLine: 4,
+          body: "Line note",
+        },
+        {
+          id: "file",
+          fileId: file.id,
+          scope: "all-files",
+          side: "file",
+          intent: "comment",
+          startLine: null,
+          endLine: null,
+          body: "File note",
+        },
+      ],
+    });
+    const pi = {
+      registerCommand: vi.fn((name: string, command) => commands.set(name, command)),
+      registerTool: vi.fn(),
+      registerShortcut: vi.fn(),
+      on: vi.fn(),
+      sendUserMessage: vi.fn(),
+    };
+    const ctx = {
+      hasUI: true,
+      cwd: "/repo",
+      model: { id: "test-model" },
+      modelRegistry: {},
+      isIdle: vi.fn(() => true),
+      ui: {
+        notify: vi.fn(),
+        setWidget: vi.fn(),
+        setEditorText: vi.fn(),
+        setStatus: vi.fn(),
+        select: vi.fn(async () => "Post Comments"),
+        editor: vi.fn(async () => "Optional body"),
+      },
+    };
+
+    codeDiffExtension(pi as never);
+    await commands.get("diff")!.handler(`remote ${review-hostUrl}`, ctx);
+    await vi.waitFor(() => expect(mocks.submitPullRequestReview).toHaveBeenCalled());
+
+    expect(mocks.resolveRemoteReviewTarget).toHaveBeenCalledWith(pi, "/repo", review-hostUrl, undefined, expect.any(Function));
+    expect(ctx.ui.select).toHaveBeenCalledWith("PR #2002491: Add review mode", ["Approve", "Request changes", "Post Comments"]);
+    expect(mocks.submitPullRequestReview).toHaveBeenCalledWith(pi, expect.objectContaining({
+      provider: "provider",
+      repo: "example/widgets",
+      prNumber: "2002491",
+      commitId: "head-sha",
+      baseCommitId: "base-sha",
+      verdict: "comment",
+      body: "Optional body\n\nOverall note",
+      comments: [
+        { path: "src/app.ts", line: 4, side: "RIGHT", body: "Line note" },
+        { path: "src/app.ts", subject_type: "file", body: "File note" },
+      ],
+    }));
+
+    const prUrl = "https://review-host.example.io/repos/example/widgets/pulls/2002491";
+    await commands.get("diff")!.handler(`remote ${prUrl}`, ctx);
+    await vi.waitFor(() => expect(mocks.submitPullRequestReview).toHaveBeenCalledTimes(2));
+    expect(mocks.resolveRemoteReviewTarget).toHaveBeenCalledWith(pi, "/repo", prUrl, undefined, expect.any(Function));
+  });
+
   it("does not offer an agent discussion when no DISCUSS items exist and keeps the draft on dismissal", async () => {
     const tools = new Map<string, any>();
     const file = remoteReviewFile();

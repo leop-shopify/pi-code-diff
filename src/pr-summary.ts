@@ -35,6 +35,7 @@ interface PullRequestCheck {
 interface PullRequestDetails {
   url?: string;
   isDraft?: boolean;
+  checksUnavailable?: boolean;
   mergeStateStatus?: string;
   reviewDecision?: string;
   comments?: PullRequestComment[];
@@ -80,6 +81,12 @@ query PullRequestOpenThreads($owner: String!, $name: String!, $number: Int!) {
 
 function ghArgs(args: string[], repo: string | undefined): string[] {
   return repo == null ? args : [...args, "--repo", repo];
+}
+
+function pullRequestUrl(target: RemoteReviewTarget): string {
+  const pr = target.pullRequest!;
+  if (target.provider === "provider") return `https://review-host.example.io/repos/${target.repo}/pulls/${pr.number}`;
+  return target.repo == null ? target.remote : `https://github.com/${target.repo}/pull/${pr.number}`;
 }
 
 function normalizePlainText(value: string): string {
@@ -209,6 +216,7 @@ function extractBodySignal(body: string): string {
 }
 
 function formatChecks(details: PullRequestDetails): string {
+  if (details.checksUnavailable) return "Check details unavailable from provider context.";
   const failed = failingChecks(details).slice(0, 4).map(checkName);
   if (failed.length > 0) return `Failing: ${failed.join(", ")}`;
   const pending = pendingChecks(details).slice(0, 4).map(checkName);
@@ -270,7 +278,7 @@ function formatAuthor(authorLogin: string, body: string): string {
 
 function enforceIdentityFields(summary: string, target: RemoteReviewTarget, details: PullRequestDetails): string {
   const pr = target.pullRequest!;
-  const url = details.url ?? (target.repo == null ? target.remote : `https://github.com/${target.repo}/pull/${pr.number}`);
+  const url = details.url ?? pullRequestUrl(target);
   return [
     ["Diff", formatDiffStats(target)],
     ["Author", formatAuthor(pr.authorLogin, pr.body)],
@@ -291,7 +299,7 @@ function fallbackSummary(target: RemoteReviewTarget, details: PullRequestDetails
 
   return [
     `Title: ${pr.title}`,
-    `URL: ${details.url ?? (target.repo == null ? target.remote : `https://github.com/${target.repo}/pull/${pr.number}`)}`,
+    `URL: ${details.url ?? pullRequestUrl(target)}`,
     `Author: ${formatAuthor(pr.authorLogin, pr.body)}`,
     `Diff: ${formatDiffStats(target)}`,
     `Status: ${status.status} - ${status.reason}`,
@@ -318,7 +326,7 @@ function formatSummaryInput(target: RemoteReviewTarget, details: PullRequestDeta
 
   return [
     `Title: ${pr.title}`,
-    `URL: ${details.url ?? (target.repo == null ? "" : `https://github.com/${target.repo}/pull/${pr.number}`)}`,
+    `URL: ${details.url ?? pullRequestUrl(target)}`,
     `Author: ${formatAuthor(pr.authorLogin, pr.body)}`,
     `Diff: ${formatDiffStats(target)}`,
     `State: ${pr.state}`,
@@ -394,7 +402,93 @@ async function fetchOpenReviewThreads(pi: ExtensionAPI, target: RemoteReviewTarg
   }));
 }
 
+function parseproviderJson(value: string, label: string): unknown {
+  try {
+    return JSON.parse(value);
+  } catch {
+    throw new Error(`Malformed provider response for ${label}.`);
+  }
+}
+
+function providerRecord(value: unknown, label: string): Record<string, unknown> {
+  if (value == null || typeof value !== "object" || Array.isArray(value)) throw new Error(`Malformed provider response for ${label}.`);
+  return value as Record<string, unknown>;
+}
+
+async function fetchproviderApi(pi: ExtensionAPI, target: RemoteReviewTarget, endpoint: string, label: string, paginate = false): Promise<unknown> {
+  const result = await pi.exec("provider-cli", ["api", endpoint, ...(paginate ? ["--paginate"] : [])], { cwd: target.gitRoot, timeout: 45000 });
+  if (result.code !== 0 || result.stdout.trim().length === 0) throw new Error(result.stderr || result.stdout || `Could not fetch provider ${label}.`);
+  return parseproviderJson(result.stdout.trim(), label);
+}
+
+function providerComments(value: unknown, label: string): PullRequestComment[] {
+  if (!Array.isArray(value)) throw new Error(`Malformed provider response for ${label}.`);
+  return value.map((item, index) => {
+    const row = providerRecord(item, `${label}[${index}]`);
+    const user = providerRecord(row.user ?? row.author, `${label}[${index}].user`);
+    if (typeof user.login !== "string" || typeof row.body !== "string") throw new Error(`Malformed provider response for ${label}[${index}].`);
+    return {
+      author: { login: user.login },
+      body: row.body,
+      createdAt: typeof row.created_at === "string" ? row.created_at : undefined,
+      submittedAt: typeof row.submitted_at === "string" ? row.submitted_at : undefined,
+      state: typeof row.state === "string" ? row.state : undefined,
+      url: typeof row.html_url === "string" ? row.html_url : undefined,
+      path: typeof row.path === "string" ? row.path : undefined,
+      line: typeof row.line === "number" ? row.line : null,
+    };
+  });
+}
+
+async function fetchproviderPullRequestDetails(pi: ExtensionAPI, target: RemoteReviewTarget): Promise<PullRequestDetails> {
+  const pr = target.pullRequest!;
+  const repo = target.repo;
+  if (repo == null) throw new Error(`Could not fetch provider PR #${pr.number} context without a repository.`);
+  const prefix = `repos/${repo}`;
+  const [rawPr, rawComments, rawReviews, rawReviewComments] = await Promise.all([
+    fetchproviderApi(pi, target, `${prefix}/pulls/${pr.number}`, `PR #${pr.number}`),
+    fetchproviderApi(pi, target, `${prefix}/issues/${pr.number}/comments`, `PR #${pr.number} comments`, true),
+    fetchproviderApi(pi, target, `${prefix}/pulls/${pr.number}/reviews`, `PR #${pr.number} reviews`, true),
+    fetchproviderApi(pi, target, `${prefix}/pulls/${pr.number}/comments`, `PR #${pr.number} review comments`, true),
+  ]);
+  const row = providerRecord(rawPr, `PR #${pr.number}`);
+  const comments = providerComments(rawComments, `PR #${pr.number} comments`);
+  const reviews = providerComments(rawReviews, `PR #${pr.number} reviews`);
+  const reviewComments = providerComments(rawReviewComments, `PR #${pr.number} review comments`);
+  const rawReviewRows = rawReviewComments as unknown[];
+  const openReviewThreads = reviewComments.map((comment, index) => {
+    const reviewRow = providerRecord(rawReviewRows[index], `PR #${pr.number} review comments[${index}]`);
+    const extension = reviewRow.x_provider == null ? {} : providerRecord(reviewRow.x_provider, `PR #${pr.number} review comments[${index}].x_provider`);
+    return {
+      path: comment.path,
+      line: comment.line,
+      isResolved: extension.is_resolved === true,
+      isOutdated: false,
+      comments: [comment],
+    };
+  });
+  const extension = row.x_provider == null ? {} : providerRecord(row.x_provider, `PR #${pr.number}.x_provider`);
+  const mergeability = extension.mergeability == null ? {} : providerRecord(extension.mergeability, `PR #${pr.number}.x_provider.mergeability`);
+  const reviewDecision = mergeability.has_changes_requested_review === true
+    ? "CHANGES_REQUESTED"
+    : mergeability.has_approved_review === true ? "APPROVED" : undefined;
+  return {
+    url: pullRequestUrl(target),
+    isDraft: row.draft === true,
+    mergeStateStatus: typeof row.mergeable_state === "string" ? row.mergeable_state.toUpperCase() : undefined,
+    reviewDecision,
+    comments,
+    reviews,
+    openReviewThreads,
+    statusCheckRollup: [],
+    checksUnavailable: true,
+    createdAt: typeof row.created_at === "string" ? row.created_at : undefined,
+    updatedAt: typeof row.updated_at === "string" ? row.updated_at : undefined,
+  };
+}
+
 async function fetchPullRequestDetails(pi: ExtensionAPI, target: RemoteReviewTarget): Promise<PullRequestDetails> {
+  if (target.provider === "provider") return fetchproviderPullRequestDetails(pi, target);
   const pr = target.pullRequest!;
   const fields = "url,isDraft,mergeStateStatus,reviewDecision,statusCheckRollup,comments,reviews,createdAt,updatedAt";
   const result = await pi.exec("provider-cli", ghArgs(["pr", "view", pr.number, "--json", fields], target.repo), { cwd: target.gitRoot, timeout: 45000 });

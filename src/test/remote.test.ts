@@ -9,11 +9,22 @@ describe("remote review helpers", () => {
     clearRemoteReviewTargetCache();
   });
 
-  it("parses GitHub, stack-host, short PR, and branch remote inputs", () => {
-    expect(extractBranchFromRemote("https://github.com/example/widgets/pull/123")).toEqual({ branch: "__pr__123", repo: "example/widgets", prNumber: "123" });
-    expect(extractBranchFromRemote("https://app.stack-host.dev/github/pr/example/widgets/456")).toEqual({ branch: "__pr__456", repo: "example/widgets", prNumber: "456" });
-    expect(extractBranchFromRemote("example/widgets#789")).toEqual({ branch: "__pr__789", repo: "example/widgets", prNumber: "789" });
+  it("parses GitHub, stack-host, review-host, short PR, and branch remote inputs", () => {
+    expect(extractBranchFromRemote("https://github.com/example/widgets/pull/123")).toEqual({ branch: "__pr__123", repo: "example/widgets", prNumber: "123", provider: "github" });
+    expect(extractBranchFromRemote("https://app.stack-host.dev/github/pr/example/widgets/456")).toEqual({ branch: "__pr__456", repo: "example/widgets", prNumber: "456", provider: "github" });
+    expect(extractBranchFromRemote("https://review-host.example.io/repos/example/widgets/pulls/2002491")).toEqual({ branch: "__pr__2002491", repo: "example/widgets", prNumber: "2002491", provider: "provider" });
+    expect(extractBranchFromRemote("https://review-host.example.io/repos/example/widgets/pulls/2002491/files")).toEqual({ branch: "__pr__2002491", repo: "example/widgets", prNumber: "2002491", provider: "provider" });
+    expect(extractBranchFromRemote("example/widgets#789")).toEqual({ branch: "__pr__789", repo: "example/widgets", prNumber: "789", provider: "github" });
     expect(extractBranchFromRemote("feature/stack-branch")).toEqual({ branch: "feature/stack-branch" });
+  });
+
+  it("rejects attacker-shaped and malformed review-host URLs", () => {
+    expect(extractBranchFromRemote("https://evil.example/https://review-host.example.io/repos/example/widgets/pulls/1")).toBeNull();
+    expect(extractBranchFromRemote("https://review-host.example.io.evil.example/repos/example/widgets/pulls/1")).toBeNull();
+    expect(extractBranchFromRemote("https://user@review-host.example.io/repos/example/widgets/pulls/1")).toBeNull();
+    expect(extractBranchFromRemote("http://review-host.example.io/repos/example/widgets/pulls/1")).toBeNull();
+    expect(extractBranchFromRemote("https://review-host.example.io/repos/example/widgets/pulls/1?redirect=https://evil.example")).toBeNull();
+    expect(extractBranchFromRemote("https://review-host.example.io/repos/example/widgets/pulls/1/commits")).toBeNull();
   });
 
   it("formats pull request context with deduplicated latest reviewer state", () => {
@@ -198,6 +209,115 @@ describe("remote review helpers", () => {
     expect(formatPullRequestContext(target.pullRequest!)).toContain("Stack parent: PR #6 Parent change (parent/review, merged)");
     if (previousScan == null) delete process.env.PI_CODE_DIFF_SCAN_STACK_PARENTS;
     else process.env.PI_CODE_DIFF_SCAN_STACK_PARENTS = previousScan;
+  });
+
+  it("resolves review-host PR metadata and pins the fetched base and head SHAs", async () => {
+    const fetchCalls: string[][] = [];
+    const exec = vi.fn(async (command: string, args: string[]) => {
+      if (command === "provider-cli" && args[0] === "api" && args[1] === "repos/example/widgets/pulls/2002491") {
+        return {
+          code: 0,
+          stdout: JSON.stringify({
+            number: 2002491,
+            title: "Refresh schema",
+            body: "Body",
+            additions: 428,
+            deletions: 1,
+            changed_files: 6,
+            user: { login: "author@example.com" },
+            state: "open",
+            draft: false,
+            head: { ref: "feature/schema", sha: "head-sha" },
+            base: { ref: "main", sha: "base-sha" },
+          }),
+          stderr: "",
+          killed: false,
+        };
+      }
+      if (command === "provider-cli" && args[0] === "api" && args[1] === "repos/example/widgets/pulls/2002491/reviews") {
+        return { code: 0, stdout: JSON.stringify([{ user: { login: "reviewer@example.com" }, state: "APPROVED" }]), stderr: "", killed: false };
+      }
+      if (command === "git" && args[1] === "fetch") {
+        fetchCalls.push(args);
+        return { code: 0, stdout: "", stderr: "", killed: false };
+      }
+      if (command === "git" && args.join(" ") === "rev-parse refs/remotes/origin/provider/2002491/base") return { code: 0, stdout: "base-sha\n", stderr: "", killed: false };
+      if (command === "git" && args.join(" ") === "rev-parse refs/remotes/origin/provider/2002491/head") return { code: 0, stdout: "head-sha\n", stderr: "", killed: false };
+      if (command === "git" && args[0] === "merge-base") return { code: 0, stdout: "merge-base-sha\n", stderr: "", killed: false };
+      return { code: 1, stdout: "", stderr: `unexpected ${command} ${args.join(" ")}`, killed: false };
+    });
+
+    await expect(resolveRemoteReviewTarget(
+      { exec } as never,
+      "/repo",
+      "https://review-host.example.io/repos/example/widgets/pulls/2002491/files",
+      "/repo",
+    )).resolves.toMatchObject({
+      provider: "provider",
+      gitRoot: "/repo",
+      baseRef: "merge-base-sha",
+      headRef: "origin/provider/2002491/head",
+      branch: "feature/schema",
+      repo: "example/widgets",
+      pullRequest: {
+        number: "2002491",
+        headRefOid: "head-sha",
+        baseRefOid: "base-sha",
+        reviews: [{ author: { login: "reviewer@example.com" }, state: "APPROVED" }],
+      },
+    });
+    expect(fetchCalls[0]).toContain("+refs/heads/main:refs/remotes/origin/provider/2002491/base");
+    expect(fetchCalls[0]).toContain("+refs/heads/feature/schema:refs/remotes/origin/provider/2002491/head");
+  });
+
+  it("fails closed when a fetched review-host target no longer matches its metadata", async () => {
+    const exec = vi.fn(async (command: string, args: string[]) => {
+      if (command === "provider-cli" && args[0] === "api" && args[1].endsWith("/reviews")) {
+        return { code: 0, stdout: "[]", stderr: "", killed: false };
+      }
+      if (command === "provider-cli") {
+        return {
+          code: 0,
+          stdout: JSON.stringify({
+            number: 8,
+            title: "Drifting PR",
+            body: "",
+            additions: 1,
+            deletions: 0,
+            changed_files: 1,
+            user: { login: "author@example.com" },
+            state: "open",
+            head: { ref: "feature/drift", sha: "expected-head" },
+            base: { ref: "main", sha: "expected-base" },
+          }),
+          stderr: "",
+          killed: false,
+        };
+      }
+      if (command === "git" && args[1] === "fetch") return { code: 0, stdout: "", stderr: "", killed: false };
+      if (command === "git" && args[0] === "rev-parse") return { code: 0, stdout: "different-head\n", stderr: "", killed: false };
+      return { code: 1, stdout: "", stderr: "unexpected", killed: false };
+    });
+
+    await expect(resolveRemoteReviewTarget(
+      { exec } as never,
+      "/repo",
+      "https://review-host.example.io/repos/example/widgets/pulls/8",
+      "/repo",
+    )).rejects.toThrow(/changed while preparing the review/i);
+  });
+
+  it("fails closed on malformed provider metadata", async () => {
+    const exec = vi.fn(async (command: string) => command === "provider-cli"
+      ? { code: 0, stdout: "{not json", stderr: "", killed: false }
+      : { code: 1, stdout: "", stderr: "unexpected", killed: false });
+
+    await expect(resolveRemoteReviewTarget(
+      { exec } as never,
+      "/repo",
+      "https://review-host.example.io/repos/example/widgets/pulls/8",
+      "/repo",
+    )).rejects.toThrow(/malformed provider response/i);
   });
 
   it("resolves same-repo GitHub PRs to fetched base and head refs", async () => {
