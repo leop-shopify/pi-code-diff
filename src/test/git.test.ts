@@ -285,7 +285,36 @@ describe("git helpers", () => {
         modifiedRevision: "def5678",
       },
     }, "all-files");
-    expect(contents).toEqual({ originalContent: "old\n", modifiedContent: "new\n" });
+    expect(contents).toEqual({
+      originalContent: "old\n",
+      modifiedContent: "new\n",
+      originalAvailable: true,
+      modifiedAvailable: true,
+    });
+  });
+
+  it("distinguishes unavailable revision bytes from a valid empty file", async () => {
+    const exec = vi.fn(async (_command: string, args: string[]) => {
+      const objectSpec = args[args.length - 1];
+      if (args[0] === "cat-file" && objectSpec === "base:src/app.ts") return { code: 0, stdout: "0\n", stderr: "" };
+      if (args[0] === "show" && objectSpec === "base:src/app.ts") return { code: 0, stdout: "", stderr: "" };
+      return { code: 1, stdout: "", stderr: "missing revision" };
+    });
+    const file = {
+      id: "range", path: "src/app.ts", worktreeStatus: null, hasWorkingTreeFile: false,
+      inGitDiff: false, inLastCommit: false, inAllFiles: true, gitDiff: null, lastCommit: null,
+      allFiles: {
+        status: "modified" as const, oldPath: "src/app.ts", newPath: "src/app.ts", displayPath: "src/app.ts",
+        hasOriginal: true, hasModified: true, originalRevision: "base", modifiedRevision: "missing",
+      },
+    };
+
+    expect(await loadReviewFileContents({ exec } as never, "/repo", file, "all-files")).toEqual({
+      originalContent: "",
+      modifiedContent: "",
+      originalAvailable: true,
+      modifiedAvailable: false,
+    });
   });
 
   it("counts changed files referenced by other changed files", () => {

@@ -2,7 +2,7 @@ import { visibleWidth } from "@earendil-works/pi-tui";
 import { describe, expect, it } from "vitest";
 import { buildStructuredDiff } from "../diff.js";
 import type { DiffReviewComment, ReviewFile, ReviewState } from "../types.js";
-import { buildCommentPanelEmptyStateLines, buildCommentPanelTextLines, buildContextPanelLines, buildDiffActionHintLine, buildDisplayRows, buildEditorLaunchCommand, buildFooterLines, buildHelpPanelLines, buildModifyPreviewLines, buildSelectionClipboardText, buildSideBySideDisplayRows, diffTextMatchesSearch, fitFooterLines, formatFocusStatus, formatPaneTitle, formatSelectedLineTargetLabel, getCancelAction, getChangedLineTargets, getDraftCommentCount, getEditorLineForTarget, getHalfPageStep, getMatchingDiffLineTargets, getMeasuredPageRange, getNavigatorGroup, getNavigatorMoveIndex, getNextSearchIndex, getPaneLayout, getPaneLayoutForVisibility, getPaneLayoutWithContext, getRelatedFileMarker, getRelatedFilePanelSections, getRelatedFilePaths, getReviewVerticalLayout, getSideBySideColumnTarget, getSideBySideLineTargets, getSideBySidePairedLineTarget, getSourceLineRangeText, getStableDiffScroll, getStackedPaneLayout, getStackedPaneLayoutForVisibility, getStackedPaneLayoutWithContext, getVirtualRowRange, groupNavigatorFiles, isUnchangedModify, parseMouseWheelInput, renderCenteredOverlay, setBoundedMapEntry, shouldStackPanes, shouldStackPanesWithContext } from "../ui/review-app.js";
+import { buildCommentPanelEmptyStateLines, buildCommentPanelTextLines, buildContextPanelLines, buildDiffActionHintLine, buildDisplayRows, buildEditorLaunchArgs, buildFooterLines, buildHelpPanelLines, buildModifyPreviewLines, buildSelectionClipboardText, buildSideBySideDisplayRows, diffTextMatchesSearch, fitFooterLines, formatFocusStatus, formatPaneTitle, formatSelectedLineTargetLabel, getCancelAction, getChangedLineTargets, getDraftCommentCount, getEditorLineForTarget, getHalfPageStep, getMatchingDiffLineTargets, getMeasuredPageRange, getNavigatorGroup, getNavigatorMoveIndex, getNextSearchIndex, getPaneLayout, getPaneLayoutForVisibility, getPaneLayoutWithContext, getRelatedFileMarker, getRelatedFilePanelSections, getRelatedFilePaths, getReviewVerticalLayout, getSideBySideColumnTarget, getSideBySideLineTargets, getSideBySidePairedLineTarget, getSourceLineRangeText, getStableDiffScroll, getStackedPaneLayout, getStackedPaneLayoutForVisibility, getStackedPaneLayoutWithContext, getVirtualRowRange, groupNavigatorFiles, isUnchangedModify, parseMouseWheelInput, renderCenteredOverlay, setBoundedMapEntry, shouldStackPanes, shouldStackPanesWithContext } from "../ui/review-app.js";
 
 function makeFile(path: string, flags?: Partial<ReviewFile>): ReviewFile {
   return {
@@ -435,13 +435,32 @@ describe("renderCenteredOverlay", () => {
   });
 });
 
-describe("buildEditorLaunchCommand", () => {
-  it("opens the requested file and line with shell-safe quoting", () => {
-    expect(buildEditorLaunchCommand("nvim", "/tmp/a b's.ts", 12)).toBe("nvim +12 -- '/tmp/a b'\\''s.ts'");
+describe("buildEditorLaunchArgs", () => {
+  it("returns process argv without shell command assembly", () => {
+    expect(buildEditorLaunchArgs("nvim", "/tmp/a b's.ts", 12)).toEqual({ command: "nvim", args: ["+12", "--", "/tmp/a b's.ts"] });
+  });
+
+  it("parses quoted executable paths and arguments with quote/backslash escapes", () => {
+    const editor = String.raw`'/Applications/Visual Studio Code.app/Contents/MacOS/Electron' --wait --title "a \"quote\" \\path"`;
+    expect(buildEditorLaunchArgs(editor, "/tmp/file.ts", 9)).toEqual({
+      command: "/Applications/Visual Studio Code.app/Contents/MacOS/Electron",
+      args: ["--wait", "--title", 'a "quote" \\path', "+9", "--", "/tmp/file.ts"],
+    });
+  });
+
+  it("does not expand environment variables, home paths, globs, or commands", () => {
+    expect(buildEditorLaunchArgs("$EDITOR ~/src/*.ts", "/tmp/file.ts", 2)).toEqual({
+      command: "$EDITOR",
+      args: ["~/src/*.ts", "+2", "--", "/tmp/file.ts"],
+    });
+  });
+
+  it.each(["'unterminated", '"unterminated', "nvim trailing\\"])("rejects malformed editor command %s", (editor) => {
+    expect(() => buildEditorLaunchArgs(editor, "/tmp/file.ts", 1)).toThrow(/unterminated|backslash/i);
   });
 
   it("falls back to vi and clamps invalid line numbers", () => {
-    expect(buildEditorLaunchCommand(" ", "/tmp/file.ts", 0)).toBe("vi +1 -- '/tmp/file.ts'");
+    expect(buildEditorLaunchArgs(" ", "/tmp/file.ts", 0)).toEqual({ command: "vi", args: ["+1", "--", "/tmp/file.ts"] });
   });
 });
 

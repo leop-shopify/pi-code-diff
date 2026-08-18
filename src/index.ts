@@ -1,3 +1,4 @@
+import { spawn } from "node:child_process";
 import { statSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, resolve as resolvePath } from "node:path";
@@ -5,17 +6,24 @@ import type { ExtensionAPI, ExtensionContext, Theme } from "@earendil-works/pi-c
 import { truncateToWidth, type Component, type TUI } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { getReviewWindowData, getReviewWindowDataForRevisionRange, loadReviewFileContents, type ReviewWindowData, type ReviewWindowOptions } from "./git.js";
+import { RepositoryChangeStatusController } from "./git-change-status.js";
 import { composeDiscussionPrompt, composeReviewPrompt } from "./prompt.js";
 import { createRemotePullRequestSummarySource } from "./pr-summary.js";
 import { reviewGrammar, type GrammarReviewResult, type GrammarTextChange, type ReviewTextSet } from "./review-grammar.js";
-import { createReviewSessionId, deleteReviewSession, loadReviewSession, saveReviewSession, type ReviewSessionData } from "./review-session.js";
-import { formatPullRequestContext, resolveRemoteReviewTarget, type RemoteReviewTarget } from "./remote.js";
+import { createReviewSessionId, deleteReviewSession, loadReviewSession, saveReviewSessionWithStatus, type ReviewSessionData } from "./review-session.js";
+import { formatPullRequestContext, resolveRemoteReviewTarget, type RemoteDiscussContinuation, type RemoteReviewTarget } from "./remote.js";
 import { buildGitstreamComments, buildInlineComments, buildReviewBody, submitPullRequestReview, type ReviewInlineComment, type ReviewVerdict } from "./review-submit.js";
 import { partitionResolvedSeedComments, resolveSeedComments, type SeedReviewComment } from "./seed-comments.js";
 import { sanitizeTerminalText } from "./sanitize.js";
 import { loadCommentShortcuts } from "./shortcuts.js";
 import { runReviewApp } from "./ui/review-app.js";
-import { hasExactSubmoduleRange, type ReviewSubmitPayload } from "./types.js";
+import { runPiWorkbench } from "./adapters/pi/index.js";
+import { composeCodeDiscussionPrompt, parseDirectCodeArgs, runGuardedPiWorkbench } from "./adapters/pi/coordinator.js";
+import { createReviewScopeFingerprint, resolveReviewResume, revalidateReviewDraftAnchors } from "./adapters/pi/review-bridge.js";
+import { ReviewInvocationCoordinator } from "./adapters/pi/review-invocation.js";
+import { normalizeWorkbenchLaunch } from "./workbench/target.js";
+import type { CodeStory, CodeTarget, WorkbenchCompletionResult, WorkbenchLaunch } from "./workbench/contracts.js";
+import { hasExactSubmoduleRange, type ReviewFile, type ReviewScope, type ReviewSubmitPayload } from "./types.js";
 
 type InteractiveReviewMode = "working" | "staged" | "branch" | "custom";
 
@@ -31,6 +39,7 @@ interface InteractiveReviewParams {
   includeGenerated?: boolean;
   wholeRepo?: boolean;
   discardResume?: boolean;
+  continuation?: RemoteDiscussContinuation;
 }
 
 interface ReviewRunStatus {
@@ -38,6 +47,33 @@ interface ReviewRunStatus {
   message?: string;
   prompt?: string;
   context?: string;
+}
+
+export type ExternalEditorOutcome =
+  | { kind: "exit"; code: number }
+  | { kind: "signal"; signal: NodeJS.Signals | string };
+
+export type ExternalEditorLauncher = (command: string, args: string[], cwd: string) => Promise<ExternalEditorOutcome>;
+
+export function runExternalEditor(command: string, args: string[], cwd: string): Promise<ExternalEditorOutcome> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, {
+      cwd,
+      env: process.env,
+      shell: false,
+      stdio: "inherit",
+    });
+    child.once("error", reject);
+    child.once("close", (code, signal) => {
+      if (signal != null) {
+        resolve({ kind: "signal", signal });
+      } else if (code != null) {
+        resolve({ kind: "exit", code });
+      } else {
+        reject(new Error("$EDITOR closed without an exit code or signal"));
+      }
+    });
+  });
 }
 
 const MODE_VALUES = new Set(["working", "staged", "branch", "custom"]);
@@ -104,15 +140,18 @@ function unsupported(message: string, ctx: ExtensionContext): ReviewRunStatus {
   return { started: false, message };
 }
 
-const REMOTE_PROGRESS_FRAMES = ["-", "\\", "|", "/"];
+const REVIEW_PROGRESS_FRAMES = ["-", "\\", "|", "/"];
+const LOCAL_PROGRESS_DELAY_MS = 5_000;
+const LOCAL_PROGRESS_MESSAGE = "Loading local changes…";
+const LOCAL_PROGRESS_SLOW_MESSAGE = "Still loading local changes… Large repositories can take a little longer.";
 
-class RemoteProgressWidget implements Component {
+class ReviewProgressWidget implements Component {
   private frame = 0;
   private timer: ReturnType<typeof setInterval>;
 
   constructor(private tui: TUI, private theme: Theme, private message: string) {
     this.timer = setInterval(() => {
-      this.frame = (this.frame + 1) % REMOTE_PROGRESS_FRAMES.length;
+      this.frame = (this.frame + 1) % REVIEW_PROGRESS_FRAMES.length;
       this.tui.requestRender?.();
     }, 120);
   }
@@ -120,7 +159,7 @@ class RemoteProgressWidget implements Component {
   render(width: number): string[] {
     const safeWidth = Math.max(1, width);
     const border = this.theme.fg("borderMuted", "─".repeat(safeWidth));
-    const text = `${REMOTE_PROGRESS_FRAMES[this.frame]} ${this.message}`;
+    const text = `${REVIEW_PROGRESS_FRAMES[this.frame]} ${this.message}`;
     return [border, truncateToWidth(this.theme.fg("muted", text), safeWidth, "…", false)];
   }
 
@@ -131,8 +170,16 @@ class RemoteProgressWidget implements Component {
   }
 }
 
+function setReviewProgress(ctx: ExtensionContext, key: string, message: string | undefined): void {
+  ctx.ui.setWidget(key, message == null ? undefined : (tui, theme) => new ReviewProgressWidget(tui, theme, message));
+}
+
 function setRemoteProgress(ctx: ExtensionContext, message: string | undefined): void {
-  ctx.ui.setWidget("pi-code-diff-remote", message == null ? undefined : (tui, theme) => new RemoteProgressWidget(tui, theme, message));
+  setReviewProgress(ctx, "pi-code-diff-remote", message);
+}
+
+function setLocalProgress(ctx: ExtensionContext, message: string | undefined): void {
+  setReviewProgress(ctx, "pi-code-diff-local", message);
 }
 
 export function mergeReviewBodies(...bodies: Array<string | undefined>): string | undefined {
@@ -239,11 +286,17 @@ function setResolvedGrammarText(
   resolved.commentBodies[index] = value;
 }
 
+interface ResolvedReviewText {
+  body?: string;
+  comments: ReviewInlineComment[];
+  commentIndexes: number[];
+}
+
 async function resolveUncertainGrammarChanges(
   ctx: ExtensionContext,
   result: Extract<GrammarReviewResult, { status: "review" }>,
   comments: ReviewInlineComment[],
-): Promise<{ body?: string; comments: ReviewInlineComment[] } | null> {
+): Promise<ResolvedReviewText | null> {
   const resolved: { body?: string; commentBodies: Array<string | undefined> } = {
     body: result.corrected.body,
     commentBodies: [...result.corrected.comments],
@@ -279,25 +332,36 @@ async function resolveUncertainGrammarChanges(
     setResolvedGrammarText(change, edited, resolved);
   }
 
+  const retained = comments.flatMap((comment, index) => {
+    const body = resolved.commentBodies[index];
+    return body == null ? [] : [{ comment: { ...comment, body }, index }];
+  });
   return {
     body: resolved.body,
-    comments: comments
-      .map((comment, index) => {
-        const body = resolved.commentBodies[index];
-        return body == null ? null : { ...comment, body };
-      })
-      .filter((comment): comment is ReviewInlineComment => comment != null),
+    comments: retained.map((item) => item.comment),
+    commentIndexes: retained.map((item) => item.index),
   };
 }
 
-export async function submitUiConfirmedReview(
+interface UiConfirmedReviewOutcome {
+  status: ReviewRunStatus;
+  submitted: boolean;
+  bodySubmitted: boolean;
+  submittedCommentIndexes: number[];
+}
+
+function unsubmittedReviewOutcome(status: ReviewRunStatus): UiConfirmedReviewOutcome {
+  return { status, submitted: false, bodySubmitted: false, submittedCommentIndexes: [] };
+}
+
+async function submitUiConfirmedReviewWithOutcome(
   pi: ExtensionAPI,
   ctx: ExtensionContext,
   target: RemoteReviewTarget,
   verdict: ReviewVerdict,
   body: string | undefined,
   comments: ReviewInlineComment[],
-): Promise<ReviewRunStatus> {
+): Promise<UiConfirmedReviewOutcome> {
   const pr = target.pullRequest!;
   const original: ReviewTextSet = {
     body,
@@ -318,26 +382,27 @@ export async function submitUiConfirmedReview(
     const prompt = composeReviewSubmissionPrompt(target, verdict, body, comments);
     sendReviewFollowUp(pi, ctx, prompt);
     ctx.ui.notify(`Could not verify grammar automatically: ${grammarResult.error} Sent the review to the agent instead.`, "warning");
-    return { started: true, prompt, context: formatPullRequestContext(pr) };
+    return unsubmittedReviewOutcome({ started: true, prompt, context: formatPullRequestContext(pr) });
   }
 
-  const resolved = grammarResult.status === "review"
+  const resolved: ResolvedReviewText | null = grammarResult.status === "review"
     ? await resolveUncertainGrammarChanges(ctx, grammarResult, comments)
     : {
         body: grammarResult.corrected.body,
         comments: comments.map((comment, index) => ({ ...comment, body: grammarResult.corrected.comments[index]! })),
+        commentIndexes: comments.map((_comment, index) => index),
       };
   if (resolved == null) {
     const message = "Review submission cancelled; nothing was posted.";
     ctx.ui.notify(message, "info");
-    return { started: true, message, context: formatPullRequestContext(pr) };
+    return unsubmittedReviewOutcome({ started: true, message, context: formatPullRequestContext(pr) });
   }
 
   const repo = target.repo ?? pr.repo;
   if (repo == null) {
     const message = `Could not submit the review because the ${pullRequestProviderName(target)} repository is unknown.`;
     ctx.ui.notify(message, "warning");
-    return { started: true, message, context: formatPullRequestContext(pr) };
+    return unsubmittedReviewOutcome({ started: true, message, context: formatPullRequestContext(pr) });
   }
   const submission = await submitPullRequestReview(pi, {
     provider: target.provider,
@@ -352,7 +417,9 @@ export async function submitUiConfirmedReview(
     gitRoot: target.gitRoot,
   });
   ctx.ui.notify(submission.message, submission.ok ? "info" : "warning");
-  if (!submission.ok) return { started: true, message: submission.message, context: formatPullRequestContext(pr) };
+  if (!submission.ok) {
+    return unsubmittedReviewOutcome({ started: true, message: submission.message, context: formatPullRequestContext(pr) });
+  }
 
   const prUrl = pullRequestUrl(target);
   sendReviewFollowUp(pi, ctx, [
@@ -362,7 +429,23 @@ export async function submitUiConfirmedReview(
     `PR: ${prUrl}`,
     submission.message,
   ].join("\n"));
-  return { started: true, message: submission.message, context: formatPullRequestContext(pr) };
+  return {
+    status: { started: true, message: submission.message, context: formatPullRequestContext(pr) },
+    submitted: true,
+    bodySubmitted: resolved.body != null && resolved.body.trim().length > 0,
+    submittedCommentIndexes: resolved.commentIndexes,
+  };
+}
+
+export async function submitUiConfirmedReview(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  target: RemoteReviewTarget,
+  verdict: ReviewVerdict,
+  body: string | undefined,
+  comments: ReviewInlineComment[],
+): Promise<ReviewRunStatus> {
+  return (await submitUiConfirmedReviewWithOutcome(pi, ctx, target, verdict, body, comments)).status;
 }
 
 export function composeRemoteReviewPrompt(target: RemoteReviewTarget, reviewPrompt: string): string {
@@ -396,7 +479,16 @@ export function composeRemoteReviewPrompt(target: RemoteReviewTarget, reviewProm
 export function composeRemoteDiscussionPrompt(target: RemoteReviewTarget, discussionPrompt: string): string {
   const pr = target.pullRequest!;
   const context = formatPullRequestContext(pr);
-  const reopenArguments = { args: `remote ${target.remote}`, cwd: target.gitRoot };
+  const reopenArguments = {
+    args: `remote ${target.remote}`,
+    cwd: target.gitRoot,
+    continuation: {
+      kind: "remote-discuss" as const,
+      priorSessionId: createReviewSessionId([target.gitRoot, target.baseRef, pr.headRefOid, target.remote].join("|")),
+      priorBaseRevision: target.baseRef,
+      priorHeadRevision: pr.headRefOid,
+    },
+  };
   const lines = [
     `${pullRequestProviderName(target)} PR review discussion.`,
     "",
@@ -431,31 +523,95 @@ export function composeRemoteDiscussionPrompt(target: RemoteReviewTarget, discus
   return lines.join("\n").trim();
 }
 
-type RemotePrSessionAction = "delete" | "keep" | "consume-discussion";
+interface DraftConsumption {
+  commentIds: readonly string[];
+  consumeAllComment: boolean;
+}
 
 interface RemotePrFinishResult {
   status: ReviewRunStatus;
-  sessionAction: RemotePrSessionAction;
+  consumption?: DraftConsumption;
 }
 
-function consumeDiscussionItems(session: ReviewSessionData, result: ReviewSubmitPayload): ReviewSessionData {
+function consumeDraftItems(session: ReviewSessionData, consumption: DraftConsumption): ReviewSessionData {
+  const consumedIds = new Set(consumption.commentIds);
   return {
     ...session,
     state: {
       ...session.state,
       draft: {
-        allComment: result.allIntent === "discuss" ? "" : result.allComment,
-        allIntent: result.allIntent,
-        comments: result.comments.filter((comment) => comment.intent !== "discuss"),
+        ...session.state.draft,
+        allComment: consumption.consumeAllComment ? "" : session.state.draft.allComment,
+        comments: session.state.draft.comments.filter((comment) => !consumedIds.has(comment.id)),
       },
     },
   };
 }
 
-export default function codeDiffExtension(pi: ExtensionAPI) {
+function countDraftItems(session: ReviewSessionData): number {
+  return session.state.draft.comments.length + (session.state.draft.allComment.trim().length > 0 ? 1 : 0);
+}
+
+function hasSubmitPayloadContent(result: ReviewSubmitPayload): boolean {
+  return result.allComment.trim().length > 0 || result.comments.length > 0;
+}
+
+function getRemoteInlineCommentIds(files: ReviewFile[], result: ReviewSubmitPayload, target: RemoteReviewTarget): string[] {
+  if (target.provider === "gitstream") {
+    return result.comments
+      .filter((comment) => comment.intent === "comment" || comment.intent === "modify")
+      .map((comment) => comment.id);
+  }
+
+  return result.comments
+    .filter((comment) => {
+      if (comment.intent !== "comment" && comment.intent !== "modify") return false;
+      if (comment.side === "file" || comment.startLine == null) return false;
+      return files.find((file) => file.id === comment.fileId)?.pathPrefix == null;
+    })
+    .map((comment) => comment.id);
+}
+
+function getRemoteBodyConsumption(result: ReviewSubmitPayload, includeFileComments: boolean): DraftConsumption {
+  return {
+    consumeAllComment: result.allIntent === "comment" && result.allComment.trim().length > 0,
+    commentIds: includeFileComments
+      ? result.comments
+          .filter((comment) => comment.intent === "comment" && comment.side === "file" && comment.body.trim().length > 0)
+          .map((comment) => comment.id)
+      : [],
+  };
+}
+
+export default function codeDiffExtension(pi: ExtensionAPI, options: { runExternalEditor?: ExternalEditorLauncher } = {}) {
   const initialShortcutConfig = loadCommentShortcuts();
+  const launchExternalEditor = options.runExternalEditor ?? runExternalEditor;
+  const repositoryChangeStatus = new RepositoryChangeStatusController();
   let activeReview = false;
-  let reviewRunInFlight = false;
+  let localProgressGeneration = 0;
+  let localProgressTimer: ReturnType<typeof setTimeout> | null = null;
+  let localProgressContext: ExtensionContext | null = null;
+
+  function clearLocalProgress(expectedGeneration?: number): void {
+    if (expectedGeneration != null && expectedGeneration !== localProgressGeneration) return;
+    if (localProgressTimer != null) clearTimeout(localProgressTimer);
+    localProgressTimer = null;
+    const progressContext = localProgressContext;
+    localProgressContext = null;
+    if (progressContext != null) setLocalProgress(progressContext, undefined);
+  }
+
+  function beginLocalProgress(ctx: ExtensionContext): () => void {
+    clearLocalProgress();
+    const generation = ++localProgressGeneration;
+    localProgressContext = ctx;
+    setLocalProgress(ctx, LOCAL_PROGRESS_MESSAGE);
+    localProgressTimer = setTimeout(() => {
+      if (generation !== localProgressGeneration || localProgressContext !== ctx) return;
+      setLocalProgress(ctx, LOCAL_PROGRESS_SLOW_MESSAGE);
+    }, LOCAL_PROGRESS_DELAY_MS);
+    return () => clearLocalProgress(generation);
+  }
 
   function notifyShortcutWarnings(ctx: ExtensionContext, warnings: string[]): void {
     if (warnings.length === 0 || !ctx.hasUI) return;
@@ -468,6 +624,7 @@ export default function codeDiffExtension(pi: ExtensionAPI) {
     remoteTarget?: RemoteReviewTarget,
     seedComments?: SeedReviewComment[],
     sessionOptions?: { resumeId?: string; discard?: boolean },
+    localReview?: { scopeFingerprint: string; refresh: () => Promise<ReviewWindowData> },
   ): Promise<ReviewRunStatus> {
     if (activeReview) {
       const message = "A review session is already open.";
@@ -477,7 +634,11 @@ export default function codeDiffExtension(pi: ExtensionAPI) {
 
     activeReview = true;
     try {
-      const { repoRoot, files, branchBaseRevision, modifiedRevision, visibleScopes } = data;
+      const repoRoot = data.repoRoot;
+      let files = data.files;
+      let branchBaseRevision = data.branchBaseRevision;
+      let modifiedRevision = data.modifiedRevision;
+      let visibleScopes = data.visibleScopes;
       const shortcutConfig = loadCommentShortcuts();
       if (files.length === 0) {
         const message = "No reviewable files found for this diff.";
@@ -492,8 +653,38 @@ export default function codeDiffExtension(pi: ExtensionAPI) {
         ? sessionOptions.resumeId
         : createReviewSessionId(sessionIdentity);
       if (sessionOptions?.discard) deleteReviewSession(sessionIdentity, sessionId);
-      const initialSession = sessionOptions?.discard ? null : loadReviewSession(sessionIdentity, sessionId);
+      let initialSession: ReviewSessionData | null = sessionOptions?.discard ? null : loadReviewSession(sessionIdentity, sessionId);
       let latestSession: ReviewSessionData | null = initialSession;
+      let latestSessionDurable = initialSession != null;
+      const persistDraftConsumption = (
+        consumption: DraftConsumption,
+        failureItemLabel = "submitted items",
+      ): { remainingItems: number; message?: string } => {
+        const currentSession = latestSession ?? loadReviewSession(sessionIdentity, sessionId);
+        if (currentSession == null) {
+          deleteReviewSession(sessionIdentity, sessionId);
+          return { remainingItems: 0 };
+        }
+
+        const retainedSession = consumeDraftItems(currentSession, consumption);
+        const remainingItems = countDraftItems(retainedSession);
+        const save = saveReviewSessionWithStatus(sessionIdentity, retainedSession, sessionId);
+        if (!save.saved) {
+          const message = `Could not save consumed review state; the previous full snapshot was retained, so ${failureItemLabel} may appear again on resume.`;
+          ctx.ui.notify(message, "warning");
+          return { remainingItems, message };
+        }
+
+        latestSession = retainedSession;
+        if (remainingItems === 0) {
+          deleteReviewSession(sessionIdentity, sessionId);
+          return { remainingItems };
+        }
+
+        const message = `${remainingItems} unresolved draft ${remainingItems === 1 ? "item remains" : "items remain"} saved in review session ${sessionId}.`;
+        ctx.ui.notify(message, "warning");
+        return { remainingItems, message };
+      };
       if (initialSession != null) ctx.ui.notify(`Resumed review session ${sessionId}.`, "info");
 
       if (remoteTarget?.pullRequest != null) {
@@ -515,29 +706,160 @@ export default function codeDiffExtension(pi: ExtensionAPI) {
         ctx.ui.notify(`code-diff: kept ${partitionedSeed.conflicts.length} existing review ${existingLabel}; skipped conflicting prepopulated ${seedLabel}.`, "warning");
       }
 
-      let sessionActive = true;
-      const result = await runReviewApp(ctx, {
-        files,
-        repoRoot,
-        loadFileContents: (activeRepoRoot, file, scope) => activeRepoRoot === repoRoot
-          ? loadReviewFileContents(pi, activeRepoRoot, file, scope, branchBaseRevision, modifiedRevision)
-          : loadReviewFileContents(pi, activeRepoRoot, file, scope),
-        loadSubmoduleReviewData: (submodule) => hasExactSubmoduleRange(submodule)
-          ? getReviewWindowDataForRevisionRange(pi, submodule.repoRoot, submodule.oldSha, submodule.newSha, { wholeRepo: true })
-          : getReviewWindowData(pi, submodule.repoRoot, { wholeRepo: true }),
-        commentShortcuts: shortcutConfig.shortcuts,
-        allowEmptySubmit: remoteTarget == null || remoteTarget.pullRequest != null,
-        visibleScopes,
-        seedComments: partitionedSeed.applicable,
-        contextPanelSource: createRemotePullRequestSummarySource(pi, ctx, remoteTarget),
-        initialSession: initialSession ?? undefined,
-        onSessionChange: (session) => {
-          latestSession = session;
-          if (sessionActive) saveReviewSession(sessionIdentity, session, sessionId);
-        },
-      });
-      sessionActive = false;
+      let result: Awaited<ReturnType<typeof runReviewApp>>;
+      let firstReview = true;
+      let resumeBanner: string | undefined;
+      const loadFileContentsForReview = (activeRepoRoot: string, file: ReviewFile, scope: ReviewScope) => activeRepoRoot === repoRoot
+        ? loadReviewFileContents(pi, activeRepoRoot, file, scope, branchBaseRevision, modifiedRevision)
+        : loadReviewFileContents(pi, activeRepoRoot, file, scope);
+      while (true) {
+        if (initialSession != null) {
+          const validatedState = await revalidateReviewDraftAnchors(
+            initialSession.state,
+            files,
+            (file, scope) => loadFileContentsForReview(repoRoot, file, scope),
+          );
+          initialSession = { ...initialSession, state: validatedState };
+          latestSession = initialSession;
+          const validationSave = saveReviewSessionWithStatus(sessionIdentity, initialSession, sessionId);
+          latestSessionDurable = validationSave.saved;
+          if (!validationSave.saved) {
+            ctx.ui.notify("Draft anchor validation could not be saved; this mount is using the validated in-memory snapshot while the previous full durable snapshot remains intact.", "warning");
+          }
+        }
+        result = await runReviewApp(ctx, {
+          files,
+          repoRoot,
+          loadFileContents: loadFileContentsForReview,
+          loadSubmoduleReviewData: (submodule) => hasExactSubmoduleRange(submodule)
+            ? getReviewWindowDataForRevisionRange(pi, submodule.repoRoot, submodule.oldSha, submodule.newSha, { wholeRepo: true })
+            : getReviewWindowData(pi, submodule.repoRoot, { wholeRepo: true }),
+          commentShortcuts: shortcutConfig.shortcuts,
+          allowEmptySubmit: remoteTarget == null || remoteTarget.pullRequest != null,
+          visibleScopes,
+          seedComments: firstReview ? partitionedSeed.applicable : [],
+          contextPanelSource: createRemotePullRequestSummarySource(pi, ctx, remoteTarget),
+          initialSession: initialSession ?? undefined,
+          reviewIdentity: sessionIdentity,
+          reviewSessionId: sessionId,
+          reviewScopeFingerprint: localReview?.scopeFingerprint,
+          initialBanner: resumeBanner,
+          onSessionChange: (session) => {
+            latestSession = session;
+            // Keep the in-memory frame authoritative, while recording whether it is safe to leave this invocation.
+            latestSessionDurable = saveReviewSessionWithStatus(sessionIdentity, session, sessionId).saved;
+            return true;
+          },
+        });
+        firstReview = false;
+        if (result.type === "open-editor") {
+          let editorBanner: string;
+          try {
+            const outcome = await launchExternalEditor(result.command, result.args, repoRoot);
+            editorBanner = outcome.kind === "signal"
+              ? `$EDITOR was terminated by ${sanitizeTerminalText(outcome.signal)}.`
+              : outcome.code === 0
+                ? `Returned from $EDITOR at ${result.filePath}:${result.line}.`
+                : `$EDITOR exited with code ${outcome.code}.`;
+          } catch (error) {
+            const message = sanitizeTerminalText(error instanceof Error ? error.message : String(error));
+            editorBanner = `Could not open $EDITOR: ${message}`;
+          }
 
+          if (localReview == null) {
+            initialSession = latestSession ?? loadReviewSession(sessionIdentity, sessionId);
+            resumeBanner = editorBanner;
+            continue;
+          }
+
+          const refreshed = await localReview.refresh();
+          if (refreshed.repoRoot !== repoRoot) {
+            initialSession = latestSession;
+            resumeBanner = `${editorBanner} Review location is stale because its canonical repository changed.`;
+            continue;
+          }
+          files = refreshed.files;
+          branchBaseRevision = refreshed.branchBaseRevision;
+          modifiedRevision = refreshed.modifiedRevision;
+          visibleScopes = refreshed.visibleScopes;
+          const persisted = latestSession ?? loadReviewSession(sessionIdentity, sessionId);
+          if (persisted != null && result.resume != null) {
+            const resolution = await resolveReviewResume(
+              result.resume,
+              persisted.state,
+              files,
+              repoRoot,
+              (file) => loadFileContentsForReview(repoRoot, file, "git-diff"),
+              { repository: repoRoot, identity: sessionIdentity, sessionId, scopeFingerprint: localReview.scopeFingerprint },
+            );
+            initialSession = { ...persisted, state: resolution.state };
+            resumeBanner = [editorBanner, resolution.banner].filter((part): part is string => part != null && part.length > 0).join(" ");
+          } else {
+            initialSession = persisted;
+            resumeBanner = editorBanner;
+          }
+          continue;
+        }
+        if (result.type !== "open-code") break;
+        const resumeReference = result.resume;
+
+        if (remoteTarget != null || result.resume.repository !== repoRoot || result.resume.identity !== sessionIdentity) {
+          ctx.ui.notify("This review location cannot open /code because it is not the current local working-tree frame.", "warning");
+          initialSession = latestSession ?? loadReviewSession(sessionIdentity, sessionId);
+          continue;
+        }
+
+        const outcome = await runCodeWorkbench("review-bridge", ctx, repoRoot, normalizeWorkbenchLaunch({
+          initialTarget: result.target,
+          capabilities: { discuss: true },
+        }));
+        if ((outcome.status === "discuss" || outcome.status === "failed") && latestSession != null && !latestSessionDurable) {
+          initialSession = latestSession;
+          resumeBanner = "Could not durably save the full review draft. The review remains open with its in-memory snapshot; retry before leaving it.";
+          continue;
+        }
+        if (outcome.status === "discuss") {
+          const prompt = [
+            composeCodeDiscussionPrompt(repoRoot, outcome),
+            "",
+            "The suspended local review draft remains saved. When the discussion is complete, ask exactly: Good to continue the review? Reopen /diff only after the user explicitly confirms.",
+          ].join("\n");
+          return { started: true, prompt };
+        }
+        if (outcome.status === "failed") {
+          const message = `Code workbench failed: ${outcome.message} The review draft remains resumable as session ${sessionId}.`;
+          ctx.ui.notify(message, "error");
+          return { started: true, message };
+        }
+
+        // Replay the original local discovery closure exactly; an empty changed-path result is still a refresh.
+        const refreshed = localReview == null ? await getReviewWindowData(pi, repoRoot) : await localReview.refresh();
+        if (refreshed.repoRoot !== repoRoot) {
+          initialSession = latestSession;
+          resumeBanner = "Review location is stale because its canonical repository changed.";
+          continue;
+        }
+        files = refreshed.files;
+        branchBaseRevision = refreshed.branchBaseRevision;
+        modifiedRevision = refreshed.modifiedRevision;
+        visibleScopes = refreshed.visibleScopes;
+        const persisted = latestSession ?? loadReviewSession(sessionIdentity, sessionId);
+        if (persisted != null) {
+          const resolution = await resolveReviewResume(
+            resumeReference,
+            persisted.state,
+            files,
+            repoRoot,
+            (file) => loadReviewFileContents(pi, repoRoot, file, "git-diff", branchBaseRevision, modifiedRevision),
+            localReview == null ? undefined : { repository: repoRoot, identity: sessionIdentity, sessionId, scopeFingerprint: localReview.scopeFingerprint },
+          );
+          initialSession = { ...persisted, state: resolution.state };
+          resumeBanner = resolution.banner;
+        } else {
+          initialSession = null;
+          resumeBanner = "Review location is stale because the saved review frame could not be restored.";
+        }
+      }
       if (result.type === "cancel") {
         deleteReviewSession(sessionIdentity, sessionId);
         const message = "Review cancelled.";
@@ -545,29 +867,35 @@ export default function codeDiffExtension(pi: ExtensionAPI) {
         return { started: true, message };
       }
 
-      if (remoteTarget?.pullRequest != null) {
-        const finished = await finishRemotePrReview(ctx, files, result, remoteTarget);
-        if (finished.sessionAction === "delete") {
-          deleteReviewSession(sessionIdentity, sessionId);
-        } else if (finished.sessionAction === "consume-discussion") {
-          const session = latestSession ?? loadReviewSession(sessionIdentity, sessionId);
-          if (session != null) saveReviewSession(sessionIdentity, consumeDiscussionItems(session, result), sessionId);
-        }
-        return finished.status;
+      const fullSession = latestSession ?? loadReviewSession(sessionIdentity, sessionId);
+      if (!hasSubmitPayloadContent(result) && fullSession != null && countDraftItems(fullSession) > 0) {
+        const message = `Review not submitted because unresolved drafts remain in session ${sessionId}. Reanchor or remove them before submitting.`;
+        ctx.ui.notify(message, "warning");
+        return { started: true, message };
       }
 
-      deleteReviewSession(sessionIdentity, sessionId);
-      if (remoteTarget == null && result.allComment.trim().length === 0 && result.comments.length === 0) {
-        const approvalMessage = "PR approved";
-        sendReviewFollowUp(pi, ctx, approvalMessage);
-        ctx.ui.notify("Sent 'PR approved' to the agent.", "info");
-        return { started: true, prompt: approvalMessage };
+      if (remoteTarget?.pullRequest != null) {
+        const finished = await finishRemotePrReview(ctx, files, result, remoteTarget);
+        if (finished.consumption == null) return finished.status;
+        const retained = persistDraftConsumption(finished.consumption);
+        if (retained.message == null) return finished.status;
+        return {
+          ...finished.status,
+          message: finished.status.message == null ? retained.message : `${finished.status.message}\n${retained.message}`,
+        };
+      }
+
+      if (remoteTarget == null && !hasSubmitPayloadContent(result)) {
+        const retained = persistDraftConsumption({ commentIds: [], consumeAllComment: false }, "old draft items");
+        return { started: true, prompt: "PR approved", ...(retained.message == null ? {} : { message: retained.message }) };
       }
       const reviewPrompt = composeReviewPrompt(files, result);
       const prompt = remoteTarget == null ? reviewPrompt : composeRemoteReviewPrompt(remoteTarget, reviewPrompt);
-      ctx.ui.setEditorText(prompt);
-      ctx.ui.notify("Inserted review feedback into the editor.", "info");
-      return { started: true, prompt };
+      const retained = persistDraftConsumption({
+        commentIds: result.comments.map((comment) => comment.id),
+        consumeAllComment: result.allComment.trim().length > 0,
+      });
+      return { started: true, prompt, ...(retained.message == null ? {} : { message: retained.message }) };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       ctx.ui.notify(`Could not open review UI: ${message}`, "error");
@@ -582,6 +910,7 @@ export default function codeDiffExtension(pi: ExtensionAPI) {
     const inlineComments = target.provider === "gitstream"
       ? buildGitstreamComments(files, result.comments)
       : buildInlineComments(files, result.comments);
+    const inlineCommentIds = getRemoteInlineCommentIds(files, result, target);
     const discussionPrompt = composeDiscussionPrompt(files, result);
 
     const approveChoice = "Approve";
@@ -593,21 +922,42 @@ export default function codeDiffExtension(pi: ExtensionAPI) {
     const choice = await ctx.ui.select(`PR #${pr.number}: ${pr.title}`, choices);
     if (choice == null) {
       ctx.ui.notify("Review kept as a draft; nothing was submitted.", "info");
-      return { status: { started: true, message: "No end action selected." }, sessionAction: "keep" };
+      return { status: { started: true, message: "No end action selected." } };
     }
 
     if (choice === discussionChoice) {
       const prompt = composeRemoteDiscussionPrompt(target, discussionPrompt);
-      ctx.ui.setEditorText(prompt);
-      ctx.ui.notify("Inserted review discussion into the editor.", "info");
-      return { status: { started: true, prompt }, sessionAction: "consume-discussion" };
+      return {
+        status: { started: true, prompt },
+        consumption: {
+          consumeAllComment: result.allIntent === "discuss" && result.allComment.trim().length > 0,
+          commentIds: result.comments.filter((comment) => comment.intent === "discuss").map((comment) => comment.id),
+        },
+      };
     }
 
     const verdict: ReviewVerdict = choice === approveChoice ? "approve" : choice === requestChoice ? "request_changes" : "comment";
-    const reviewBody = buildReviewBody(files, result, target.provider !== "gitstream");
+    const includeFileComments = target.provider !== "gitstream";
+    const reviewBody = buildReviewBody(files, result, includeFileComments);
+    const bodyConsumption = getRemoteBodyConsumption(result, includeFileComments);
     const optionalBody = await ctx.ui.editor(`${choice}: optional review body comment`, "");
     const body = mergeReviewBodies(optionalBody, reviewBody);
-    return { status: await submitUiConfirmedReview(pi, ctx, target, verdict, body, inlineComments), sessionAction: "delete" };
+    const submitted = await submitUiConfirmedReviewWithOutcome(pi, ctx, target, verdict, body, inlineComments);
+    if (!submitted.submitted) return { status: submitted.status };
+
+    const submittedInlineIds = submitted.submittedCommentIndexes
+      .map((index) => inlineCommentIds[index])
+      .filter((id): id is string => id != null);
+    return {
+      status: submitted.status,
+      consumption: {
+        consumeAllComment: submitted.bodySubmitted && bodyConsumption.consumeAllComment,
+        commentIds: [
+          ...submittedInlineIds,
+          ...(submitted.bodySubmitted ? bodyConsumption.commentIds : []),
+        ],
+      },
+    };
   }
 
   async function openReview(
@@ -618,10 +968,26 @@ export default function codeDiffExtension(pi: ExtensionAPI) {
     sessionOptions?: { resumeId?: string; discard?: boolean },
   ): Promise<ReviewRunStatus> {
     const reviewCwd = normalizeReviewCwd(cwd, ctx.cwd);
-    const data = options == null
-      ? await getReviewWindowData(pi, reviewCwd)
-      : await getReviewWindowData(pi, reviewCwd, options);
-    return openReviewData(ctx, data, undefined, comments, sessionOptions);
+    const refresh = () => options == null
+      ? getReviewWindowData(pi, reviewCwd)
+      : getReviewWindowData(pi, reviewCwd, options);
+    const finishProgress = beginLocalProgress(ctx);
+    let data: ReviewWindowData;
+    try {
+      data = await refresh();
+    } finally {
+      finishProgress();
+    }
+    const scopeFingerprint = createReviewScopeFingerprint(data.repoRoot, reviewCwd, options as Record<string, unknown> | undefined);
+    return openReviewData(ctx, data, undefined, comments, sessionOptions, { scopeFingerprint, refresh });
+  }
+
+  function validateRemoteDiscussContinuation(target: RemoteReviewTarget, continuation: RemoteDiscussContinuation): string | undefined {
+    const priorIdentity = [target.gitRoot, continuation.priorBaseRevision, continuation.priorHeadRevision, target.remote].join("|");
+    if (target.pullRequest == null || continuation.priorSessionId !== createReviewSessionId(priorIdentity)) {
+      return "Remote DISCUSS continuation does not belong to the requested remote review identity.";
+    }
+    return undefined;
   }
 
   async function runInteractiveReview(params: InteractiveReviewParams, ctx: ExtensionContext, fallbackCwd = ctx.cwd, comments?: SeedReviewComment[]): Promise<ReviewRunStatus> {
@@ -638,7 +1004,11 @@ export default function codeDiffExtension(pi: ExtensionAPI) {
     if (params.remote != null) {
       try {
         const reportProgress = (message: string) => setRemoteProgress(ctx, message);
-        const target = await resolveRemoteReviewTarget(pi, fallbackCwd, params.remote, reviewCwd, reportProgress);
+        const target = params.continuation == null
+          ? await resolveRemoteReviewTarget(pi, fallbackCwd, params.remote, reviewCwd, reportProgress)
+          : await resolveRemoteReviewTarget(pi, fallbackCwd, params.remote, reviewCwd, reportProgress, { cacheMode: "bypass" });
+        const continuationError = params.continuation == null ? undefined : validateRemoteDiscussContinuation(target, params.continuation);
+        if (continuationError != null) throw new Error(continuationError);
         reportProgress(`Preparing diff for ${target.repo ?? target.branch}…`);
         const rangeOptions = {
           ...reviewOptions,
@@ -668,10 +1038,13 @@ export default function codeDiffExtension(pi: ExtensionAPI) {
         ...reviewOptions,
         ...(range.includes("...") ? { mergeBase: true } : {}),
       };
-      const data = Object.keys(rangeOptions).length === 0
-        ? await getReviewWindowDataForRevisionRange(pi, reviewCwd ?? fallbackCwd, baseRef, headRef)
-        : await getReviewWindowDataForRevisionRange(pi, reviewCwd ?? fallbackCwd, baseRef, headRef, rangeOptions);
-      return openReviewData(ctx, data, undefined, comments, { resumeId: params.resume, discard: params.discardResume });
+      const customCwd = reviewCwd ?? fallbackCwd;
+      const refresh = () => Object.keys(rangeOptions).length === 0
+        ? getReviewWindowDataForRevisionRange(pi, customCwd, baseRef, headRef)
+        : getReviewWindowDataForRevisionRange(pi, customCwd, baseRef, headRef, rangeOptions);
+      const data = await refresh();
+      const scopeFingerprint = createReviewScopeFingerprint(data.repoRoot, customCwd, rangeOptions);
+      return openReviewData(ctx, data, undefined, comments, { resumeId: params.resume, discard: params.discardResume }, { scopeFingerprint, refresh });
     }
 
     return openReview(
@@ -683,7 +1056,7 @@ export default function codeDiffExtension(pi: ExtensionAPI) {
     );
   }
 
-  async function runDiff(args: string, ctx: ExtensionContext, cwd = ctx.cwd, comments?: SeedReviewComment[]): Promise<ReviewRunStatus> {
+  async function runDiff(args: string, ctx: ExtensionContext, cwd = ctx.cwd, comments?: SeedReviewComment[], continuation?: RemoteDiscussContinuation): Promise<ReviewRunStatus> {
     if (!ctx.hasUI) return { started: false, message: "Interactive review requires a TUI session." };
 
     const fallbackCwd = normalizeReviewCwd(cwd, ctx.cwd);
@@ -696,7 +1069,7 @@ export default function codeDiffExtension(pi: ExtensionAPI) {
     if (firstToken.toLowerCase() === "remote") {
       const target = trimmed.slice(firstToken.length).trim();
       if (target.length === 0) return unsupported("Usage: /diff remote <url | branch>", ctx);
-      return runInteractiveReview({ remote: target }, ctx, fallbackCwd, comments);
+      return runInteractiveReview({ remote: target, continuation }, ctx, fallbackCwd, comments);
     }
 
     if (trimmed.startsWith("-") || MODE_VALUES.has(firstToken)) {
@@ -709,7 +1082,7 @@ export default function codeDiffExtension(pi: ExtensionAPI) {
     if (trimmed.includes("..")) {
       return runInteractiveReview({ mode: "custom", ref: trimmed }, ctx, fallbackCwd, comments);
     }
-    return runInteractiveReview({ remote: trimmed }, ctx, fallbackCwd, comments);
+    return runInteractiveReview({ remote: trimmed, continuation }, ctx, fallbackCwd, comments);
   }
 
   function formatOpenCodeDiffToolText(status: ReviewRunStatus, args: string, cwd: string): string {
@@ -725,22 +1098,35 @@ export default function codeDiffExtension(pi: ExtensionAPI) {
     return lines.join("\n");
   }
 
-  function startDiff(args: string, ctx: ExtensionContext): ReviewRunStatus {
-    if (reviewRunInFlight || activeReview) {
+  function stageDirectReviewPrompt(status: ReviewRunStatus, ctx: ExtensionContext): void {
+    if (status.prompt == null) return;
+    ctx.ui.setEditorText(status.prompt);
+    ctx.ui.notify("Inserted review feedback into the editor.", "info");
+  }
+
+  const reviewInvocations = new ReviewInvocationCoordinator<ExtensionContext, ReviewRunStatus>({
+    active: (ctx) => {
       const message = "A review session is already open.";
-      ctx.ui.notify(message, "warning");
+      if (ctx.hasUI) ctx.ui.notify(message, "warning");
       return { started: false, message };
-    }
-
-    reviewRunInFlight = true;
-    void runDiff(args, ctx).catch((error: unknown) => {
+    },
+    failed: (ctx, error) => {
       const message = error instanceof Error ? error.message : String(error);
-      ctx.ui.notify(`Could not start review: ${message}`, "error");
-    }).finally(() => {
-      reviewRunInFlight = false;
-    });
+      if (ctx.hasUI) ctx.ui.notify(`Could not start review: ${message}`, "error");
+      return { started: false, message };
+    },
+    completed: (ctx) => {
+      void repositoryChangeStatus.refresh(ctx);
+    },
+    starting: () => ({ started: true, message: "Review is starting." }),
+  });
 
-    return { started: true, message: "Review is starting." };
+  function startDiff(args: string, ctx: ExtensionContext): ReviewRunStatus {
+    return reviewInvocations.runDetached(
+      ctx,
+      () => runDiff(args, ctx),
+      (status) => stageDirectReviewPrompt(status, ctx),
+    );
   }
 
   const reviewCommand = {
@@ -749,10 +1135,102 @@ export default function codeDiffExtension(pi: ExtensionAPI) {
       startDiff(args, ctx);
     },
   };
+  async function runCodeWorkbench(
+    origin: "direct-code" | "open-code" | "review-bridge",
+    ctx: ExtensionContext,
+    cwd: string,
+    launch: WorkbenchLaunch,
+  ): Promise<WorkbenchCompletionResult> {
+    try {
+      return await runGuardedPiWorkbench(origin, () => runPiWorkbench(ctx, { cwd, launch }));
+    } finally {
+      void repositoryChangeStatus.refresh(ctx);
+    }
+  }
 
-  pi.registerCommand("code", reviewCommand);
-  pi.registerCommand("code-diff", reviewCommand);
+  const codeCommand = {
+    description: "Browse repository files in the code workbench. Optional: --path, --line, --end-line, --anchor-sha256, --story-json.",
+    handler: async (args: string, ctx: ExtensionContext) => {
+      let launch: WorkbenchLaunch;
+      try { launch = parseDirectCodeArgs(args); }
+      catch (error) {
+        ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+        return;
+      }
+      const outcome = await runCodeWorkbench("direct-code", ctx, ctx.cwd, launch);
+      if (outcome.status === "failed") {
+        ctx.ui.notify(`Could not open code workbench: ${outcome.message}`, "error");
+      } else if (outcome.status === "discuss") {
+        ctx.ui.setEditorText(composeCodeDiscussionPrompt(ctx.cwd, outcome));
+        ctx.ui.notify("Inserted code discussion into the editor.", "info");
+      }
+    },
+  };
+
+  pi.registerCommand("code", codeCommand);
   pi.registerCommand("diff", reviewCommand);
+
+  pi.registerTool({
+    name: "open_code",
+    label: "open-code",
+    description: "Open the Pi code workbench at an optional structured target with optional ordered code stories, then wait for cleanup and return its typed outcome.",
+    promptSnippet: "Open the interactive code workbench at a structured file/range target and wait for close or DISCUSS.",
+    promptGuidelines: [
+      "Call open_code only when the user directly asks to open or browse code in the interactive workbench.",
+      "Use open_code for code browsing/editing; open_code_diff remains review-only.",
+      "Wait for open_code to return. A DISCUSS result requests prose discussion, not file edits.",
+    ],
+    parameters: Type.Object({
+      cwd: Type.Optional(Type.String({ description: "Repository directory. Defaults to Pi's current cwd." })),
+      target: Type.Optional(Type.Object({
+        path: Type.String({ description: "Normalized repository-relative file path." }),
+        range: Type.Object({
+          startLine: Type.Number({ description: "One-based range start." }),
+          endLine: Type.Number({ description: "One-based inclusive range end." }),
+        }),
+        anchor: Type.Optional(Type.Object({
+          algorithm: Type.Literal("sha256"),
+          value: Type.String({ description: "Lowercase 64-character SHA-256 anchor." }),
+        })),
+      })),
+      stories: Type.Optional(Type.Array(Type.Object({
+        id: Type.String(),
+        target: Type.Object({
+          path: Type.String(),
+          range: Type.Object({ startLine: Type.Number(), endLine: Type.Number() }),
+          anchor: Type.Optional(Type.Object({ algorithm: Type.Literal("sha256"), value: Type.String() })),
+        }),
+        prose: Type.String(),
+      }))),
+    }),
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const input = params as { cwd?: string; target?: CodeTarget; stories?: CodeStory[] };
+      const cwd = normalizeReviewCwd(input.cwd ?? ctx.cwd, ctx.cwd);
+      let launch: WorkbenchLaunch;
+      try {
+        launch = normalizeWorkbenchLaunch({
+          ...(input.target == null ? {} : { initialTarget: input.target }),
+          ...(input.stories == null ? {} : { stories: input.stories }),
+          capabilities: { discuss: true },
+        });
+      } catch (error) {
+        const outcome: WorkbenchCompletionResult = { status: "failed", message: error instanceof Error ? error.message : String(error) };
+        return { content: [{ type: "text" as const, text: `Code workbench did not start: ${outcome.message}` }], details: { outcome, cwd } };
+      }
+      const outcome = await runCodeWorkbench("open-code", ctx, cwd, launch);
+      if (outcome.status === "discuss") {
+        const prompt = composeCodeDiscussionPrompt(cwd, outcome);
+        return {
+          content: [{ type: "text" as const, text: prompt }],
+          details: { outcome, cwd, target: outcome.target },
+        };
+      }
+      const text = outcome.status === "closed"
+        ? `Code workbench closed. Changed paths: ${outcome.changedPaths.length === 0 ? "none" : outcome.changedPaths.join(", ")}`
+        : `Code workbench failed: ${outcome.message}`;
+      return { content: [{ type: "text" as const, text }], details: { outcome, cwd } };
+    },
+  });
 
   pi.registerTool({
     name: "open_code_diff",
@@ -774,6 +1252,12 @@ export default function codeDiffExtension(pi: ExtensionAPI) {
     parameters: Type.Object({
       args: Type.Optional(Type.String({ description: "Same target syntax as /diff, for example empty string, 'remote <url | branch>', or 'base..head'." })),
       cwd: Type.Optional(Type.String({ description: "Directory to run the review from. Defaults to Pi's current cwd." })),
+      continuation: Type.Optional(Type.Object({
+        kind: Type.Literal("remote-discuss"),
+        priorSessionId: Type.String(),
+        priorBaseRevision: Type.String(),
+        priorHeadRevision: Type.String(),
+      }, { description: "Remote DISCUSS continuation marker emitted by pi-code-diff. It forces a fresh remote resolution and cannot be reused for a different review identity." })),
       comments: Type.Optional(Type.Array(Type.Object({
         path: Type.String({ description: "File path as shown in the diff (repo-relative displayPath). Required to attach the comment." }),
         body: Type.String({ description: "Comment text the reviewer sees. Becomes an editable draft comment." }),
@@ -785,12 +1269,16 @@ export default function codeDiffExtension(pi: ExtensionAPI) {
       }), { description: "Optional review comments to prepopulate into the diff UI. Each becomes an editable, deletable draft comment attached to the matching file/line and flows through the same review prompt as hand-written comments. Comments whose path does not match a reviewed file are surfaced as a warning, never silently dropped." })),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      const input = params as { args?: string; cwd?: string; comments?: SeedReviewComment[] };
+      const input = params as { args?: string; cwd?: string; continuation?: RemoteDiscussContinuation; comments?: SeedReviewComment[] };
       const args = input.args ?? "";
       const cwd = normalizeReviewCwd(input.cwd ?? ctx.cwd, ctx.cwd);
-
-      if (reviewRunInFlight || activeReview) {
-        const message = "A review session is already open.";
+      const continuation = input.continuation;
+      if (continuation != null && (
+        continuation.kind !== "remote-discuss"
+        || ![continuation.priorSessionId, continuation.priorBaseRevision, continuation.priorHeadRevision].every((value) => typeof value === "string" && value.length > 0)
+        || !/^remote\s+\S[\s\S]*$/.test(args.trim())
+      )) {
+        const message = "Invalid remote DISCUSS continuation marker.";
         if (ctx.hasUI) ctx.ui.notify(message, "warning");
         const status: ReviewRunStatus = { started: false, message };
         return {
@@ -799,24 +1287,14 @@ export default function codeDiffExtension(pi: ExtensionAPI) {
         };
       }
 
-      reviewRunInFlight = true;
-      try {
-        const status = await runDiff(args, ctx, cwd, input.comments);
-        return {
-          content: [{ type: "text" as const, text: formatOpenCodeDiffToolText(status, args, cwd) }],
-          details: { ...status, args, cwd },
-        };
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        if (ctx.hasUI) ctx.ui.notify(`Could not start review: ${message}`, "error");
-        const status: ReviewRunStatus = { started: false, message };
-        return {
-          content: [{ type: "text" as const, text: formatOpenCodeDiffToolText(status, args, cwd) }],
-          details: { ...status, args, cwd },
-        };
-      } finally {
-        reviewRunInFlight = false;
-      }
+      const status = await reviewInvocations.runAwaited(
+        ctx,
+        () => runDiff(args, ctx, cwd, input.comments, continuation),
+      );
+      return {
+        content: [{ type: "text" as const, text: formatOpenCodeDiffToolText(status, args, cwd) }],
+        details: { ...status, args, cwd },
+      };
     },
   });
 
@@ -895,7 +1373,11 @@ export default function codeDiffExtension(pi: ExtensionAPI) {
   pi.registerShortcut(initialShortcutConfig.globalShortcut, {
     description: "Open review UI",
     handler: async (ctx) => {
-      await openReview(ctx);
+      await reviewInvocations.runAwaited(
+        ctx,
+        () => openReview(ctx),
+        (status) => stageDirectReviewPrompt(status, ctx),
+      );
     },
   });
 
@@ -903,9 +1385,16 @@ export default function codeDiffExtension(pi: ExtensionAPI) {
     if (event.reason === "startup" || event.reason === "reload") {
       notifyShortcutWarnings(ctx, initialShortcutConfig.warnings);
     }
+    void repositoryChangeStatus.refresh(ctx, { clear: true });
   });
 
-  pi.on("session_shutdown", async () => {
+  pi.on("agent_end", async (_event, ctx) => {
+    void repositoryChangeStatus.refresh(ctx);
+  });
+
+  pi.on("session_shutdown", async (_event, ctx) => {
     activeReview = false;
+    clearLocalProgress();
+    await repositoryChangeStatus.shutdown(ctx);
   });
 }

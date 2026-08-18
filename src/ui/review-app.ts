@@ -1,5 +1,4 @@
-import { spawn } from "node:child_process";
-import { join } from "node:path";
+import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { copyToClipboard, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { CURSOR_MARKER, Editor, type EditorTheme, Key, matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { adjustStructuredDiffContext, buildStructuredDiff, getContextExpansionRowIndexes, revealStructuredDiffRows, type ContextExpansionDirection, type StructuredDiff, type StructuredDiffVisibleItem } from "../diff.js";
@@ -17,6 +16,8 @@ import {
   getScopedFiles,
   getSelectedLineTarget,
   hasDraftContent,
+  hasSubmittableDraftContent,
+  isSubmittableComment,
   moveSelectedCommentIndex,
   moveSelectedLineTarget,
   setActiveFileId,
@@ -32,16 +33,19 @@ import {
 } from "../state.js";
 import { detectPiLanguage, highlightCodeLineWithPi } from "../pi-render.js";
 import { loadReviewPreferences, saveReviewPreference, type ReviewPaneVisibility } from "../preferences.js";
-import type { PersistedReviewSession, ReviewSessionData } from "../review-session.js";
+import type { ReviewSessionData } from "../review-session.js";
 import { applyResolvedSeedComments, type ResolvedSeedComment } from "../seed-comments.js";
 import { getShortcutConfigPath, getShortcutsForSide, type CommentShortcut } from "../shortcuts.js";
 import { filterFilesBySearch } from "../search.js";
 import { sanitizeTerminalText } from "../sanitize.js";
 import { highlightJsonLine, highlightMarkdownLine } from "../theme-highlight.js";
-import type { CommentIntent, DiffReviewComment, FileCommentTarget, ReviewContextPanelSource, ReviewFile, ReviewFileContents, ReviewFocus, ReviewLineTarget, ReviewResult, ReviewScope, ReviewState, ReviewSubmoduleInfo } from "../types.js";
+import type { CommentIntent, DiffReviewComment, FileCommentTarget, ReviewContextPanelSource, ReviewFile, ReviewFileContents, ReviewFocus, ReviewLineTarget, ReviewResult, ReviewResumeReference, ReviewScope, ReviewState, ReviewSubmoduleInfo } from "../types.js";
 import { formatIntentLabel, formatScopeLabel, getReviewFileDisplayPath, getSubmoduleInfo, hasExactSubmoduleRange, joinReviewPath } from "../types.js";
 import { getReviewFooterHint, getReviewHelpSections, matchesReviewAction } from "./actions.js";
 import { ExactTextEditor } from "./exact-text-editor.js";
+import { fullScreenOverlayOptions } from "./full-screen-overlay.js";
+import { hashTargetSlice, logicalLineCount } from "../workbench/target.js";
+import { validateReviewDraftAnchor } from "../adapters/pi/review-bridge.js";
 
 interface LoadedEntryReady {
   status: "ready";
@@ -67,9 +71,33 @@ type ContextPanelState =
   | { status: "error"; error: string };
 
 type EditTarget =
-  | { kind: "line"; fileId: string; scope: ReviewScope; side: ReviewLineTarget["side"]; startLine: number; endLine: number; initialBody: string; intent: CommentIntent; originalText?: string }
+  | { kind: "line"; fileId: string; scope: ReviewScope; side: ReviewLineTarget["side"]; startLine: number; endLine: number; initialBody: string; intent: CommentIntent; originalText?: string; captureHash?: DiffReviewComment["captureHash"]; anchorStatus?: DiffReviewComment["anchorStatus"]; existingComment?: DiffReviewComment }
   | { kind: "file"; fileId: string; scope: ReviewScope; initialBody: string; intent: CommentIntent; fileTarget: FileCommentTarget; label?: string }
   | { kind: "all"; initialBody: string; intent: CommentIntent };
+
+interface ReanchorCandidate {
+  readonly fileId: string;
+  readonly scope: ReviewScope;
+  readonly range: Readonly<{ startLine: number; endLine: number }>;
+  readonly captureHash: Readonly<NonNullable<DiffReviewComment["captureHash"]>>;
+  readonly originalText: string;
+}
+
+interface ReanchorTransactionBase {
+  commentId: string;
+  fileId: string;
+  scope: ReviewScope;
+  originalComment: Readonly<DiffReviewComment>;
+}
+
+type ReanchorTransaction =
+  | (ReanchorTransactionBase & { phase: "loading" })
+  | (ReanchorTransactionBase & { phase: "selecting" })
+  | (ReanchorTransactionBase & {
+      phase: "confirm-modify";
+      candidate: Readonly<ReanchorCandidate>;
+      proposedReplacement: string;
+    });
 
 type CommentPanelItem =
   | { kind: "all"; body: string; intent: CommentIntent }
@@ -85,8 +113,12 @@ interface ReviewAppOptions {
   visibleScopes?: ReviewScope[];
   seedComments?: ResolvedSeedComment[];
   contextPanelSource?: ReviewContextPanelSource;
-  initialSession?: PersistedReviewSession;
-  onSessionChange?: (data: ReviewSessionData) => void;
+  initialSession?: ReviewSessionData;
+  onSessionChange?: (data: ReviewSessionData) => boolean | void;
+  reviewIdentity?: string;
+  reviewSessionId?: string;
+  reviewScopeFingerprint?: string;
+  initialBanner?: string;
   notify: ExtensionContext["ui"]["notify"];
 }
 
@@ -123,6 +155,8 @@ const CONTEXT_PANEL_PADDING_X = 2;
 const MAX_LOADED_FILE_ENTRIES = 50;
 const MAX_DIFF_LAYOUT_ENTRIES = 100;
 const MAX_SYNTAX_LINE_ENTRIES = 5000;
+const STATUS_TEXT_MAX_CELLS = 96;
+const STATUS_TEXT_MAX_BYTES = 256;
 const REVIEW_PANE_ORDER = ["navigator", "diff", "comments", "context"] as const;
 type ReviewPaneName = typeof REVIEW_PANE_ORDER[number];
 
@@ -149,27 +183,60 @@ export interface StackedReviewPaneLayout {
   contextHeight: number;
 }
 
-function shellQuote(value: string): string {
-  return `'${value.replace(/'/g, `'\\''`)}'`;
+export function parseEditorCommand(editorCommand: string): string[] {
+  const tokens: string[] = [];
+  let token = "";
+  let started = false;
+  let quote: "single" | "double" | null = null;
+
+  const finish = () => {
+    if (!started) return;
+    tokens.push(token);
+    token = "";
+    started = false;
+  };
+
+  for (let index = 0; index < editorCommand.length; index += 1) {
+    const character = editorCommand[index]!;
+    if (quote === "single") {
+      if (character === "'") quote = null;
+      else token += character;
+      continue;
+    }
+    if (quote === "double") {
+      if (character === '"') {
+        quote = null;
+        continue;
+      }
+      if (character === "\\") {
+        const escaped = editorCommand[++index];
+        if (escaped !== '"' && escaped !== "\\") throw new Error("Malformed $EDITOR command: double-quoted escapes accept only \\\" and \\\\.");
+        token += escaped;
+      } else token += character;
+      continue;
+    }
+    if (/\s/.test(character)) {
+      finish();
+      continue;
+    }
+    started = true;
+    if (character === "'") quote = "single";
+    else if (character === '"') quote = "double";
+    else if (character === "\\") {
+      const escaped = editorCommand[++index];
+      if (escaped == null) throw new Error("Malformed $EDITOR command: trailing backslash.");
+      token += escaped;
+    } else token += character;
+  }
+  if (quote != null) throw new Error(`Malformed $EDITOR command: unterminated ${quote} quote.`);
+  finish();
+  return tokens;
 }
 
-export function buildEditorLaunchCommand(editorCommand: string, filePath: string, line: number): string {
-  const lineNumber = Math.max(1, Math.floor(line));
-  return `${editorCommand.trim() || "vi"} +${lineNumber} -- ${shellQuote(filePath)}`;
-}
-
-function runShellCommand(command: string, cwd: string): Promise<number | null> {
-  return new Promise((resolve, reject) => {
-    const child = spawn(command, {
-      cwd,
-      env: process.env,
-      shell: true,
-      stdio: "inherit",
-    });
-
-    child.once("error", reject);
-    child.once("close", (code) => resolve(code));
-  });
+export function buildEditorLaunchArgs(editorCommand: string, filePath: string, line: number): { command: string; args: string[] } {
+  const tokens = parseEditorCommand(editorCommand.trim());
+  const command = tokens.shift() || "vi";
+  return { command, args: [...tokens, `+${Math.max(1, Math.floor(line))}`, "--", filePath] };
 }
 
 export function getEditorLineForTarget(diff: StructuredDiff, target: ReviewLineTarget): number {
@@ -576,6 +643,22 @@ function formatLineSideLabel(side: ReviewLineTarget["side"]): string {
 
 function formatLineRangeLabel(startLine: number, endLine: number): string {
   return startLine === endLine ? `${startLine}` : `${startLine}-${endLine}`;
+}
+
+function sanitizeStatusText(text: string): string {
+  const singleLine = text.replace(/[\u0000-\u001F\u007F-\u009F\u2028\u2029]/g, " ");
+  const cellBound = truncateToWidth(singleLine, STATUS_TEXT_MAX_CELLS, "…", false)
+    .replace(/\x1b\[[0-9;]*m/g, "")
+    .replace(/[\u0000-\u001F\u007F-\u009F]/g, "");
+  let result = "";
+  let byteLength = 0;
+  for (const character of cellBound) {
+    const characterBytes = Buffer.byteLength(character, "utf8");
+    if (byteLength + characterBytes > STATUS_TEXT_MAX_BYTES) break;
+    result += character;
+    byteLength += characterBytes;
+  }
+  return result;
 }
 
 export type SelectionClipboardFormat = "source" | "location" | "patch" | "suggestion";
@@ -1305,6 +1388,7 @@ export class ReviewApp {
   private readonly frameStack: ReviewFrame[] = [];
   private openingSubmodule = false;
   private readonly cache = new Map<string, LoadedEntry>();
+  private readonly entryLoads = new Map<string, Promise<void>>();
   private readonly expandedContextRows = new Map<string, Set<number>>();
   private searchMode = false;
   private searchBuffer = "";
@@ -1324,8 +1408,8 @@ export class ReviewApp {
   private showAllLocales: boolean;
   private confirmCancel = false;
   private paneVisibility: ReviewPaneVisibility;
-  private externalEditorOpen = false;
   private editTarget: EditTarget | null = null;
+  private reanchorTarget: ReanchorTransaction | null = null;
   private editor: Editor;
   private readonly exactEditor = new ExactTextEditor();
   private message: string | null = null;
@@ -1361,6 +1445,7 @@ export class ReviewApp {
     this.commentsGlobal = options.initialSession?.commentsGlobal ?? preferences.commentsGlobal;
     this.paneVisibility = { ...preferences.paneVisibility };
     this.showAllLocales = options.initialSession?.showAllLocales ?? false;
+    this.message = options.initialBanner ?? null;
     this.currentVisibleScopes = options.visibleScopes?.filter((scope) => SEARCHABLE_SCOPES.includes(scope)) ?? [];
     if (this.currentVisibleScopes.length === 0) this.currentVisibleScopes = DEFAULT_VISIBLE_SCOPES;
     this.state = ensureActiveFile(createInitialReviewState(options.files), options.files);
@@ -1444,8 +1529,8 @@ export class ReviewApp {
     };
   }
 
-  private persistSession(): void {
-    this.options.onSessionChange?.(this.getSessionData());
+  private persistSession(): boolean {
+    return this.options.onSessionChange?.(this.getSessionData()) !== false;
   }
 
   private requestRender(): void {
@@ -1556,7 +1641,7 @@ export class ReviewApp {
   }
 
   private setMessage(message: string): void {
-    this.message = sanitizeTerminalText(message);
+    this.message = sanitizeStatusText(message);
   }
 
   private copyText(text: string, label: string): void {
@@ -1869,29 +1954,51 @@ export class ReviewApp {
     this.state = clampSelectedLineTarget(this.state, file.id, this.state.activeScope, visibleTargets);
   }
 
-  private async ensureActiveEntry(): Promise<void> {
+  private revalidateDraftAnchors(fileId: string, scope: ReviewScope, contents: ReviewFileContents): void {
+    const file = this.files.find((candidate) => candidate.id === fileId);
+    let newlyStaleCount = 0;
+    const comments = this.state.draft.comments.map((comment) => {
+      if (comment.fileId !== fileId || comment.scope !== scope || comment.side === "file") return comment;
+      const anchorStatus = validateReviewDraftAnchor(comment, file, contents);
+      if (comment.anchorStatus !== "stale" && anchorStatus === "stale") newlyStaleCount += 1;
+      return { ...comment, anchorStatus };
+    });
+    if (newlyStaleCount > 0) this.message = `${newlyStaleCount} review draft location${newlyStaleCount === 1 ? " is" : "s are"} stale; use a in Comments to reanchor.`;
+    this.state = { ...this.state, draft: { ...this.state.draft, comments } };
+  }
+
+  private ensureActiveEntry(): Promise<void> {
     const file = this.activeFile();
-    if (file == null || getSubmoduleInfo(file, this.state.activeScope) != null) return;
-    const key = this.cacheKey(file.id, this.state.activeScope);
+    const scope = this.state.activeScope;
+    if (file == null || getSubmoduleInfo(file, scope) != null) return Promise.resolve();
+    const key = this.cacheKey(file.id, scope);
+    const existingLoad = this.entryLoads.get(key);
+    if (existingLoad != null) return existingLoad;
     if (this.cache.has(key)) {
       this.ensureLineSelection();
-      return;
+      return Promise.resolve();
     }
 
     setBoundedMapEntry(this.cache, key, { status: "loading" }, MAX_LOADED_FILE_ENTRIES);
     this.requestRender();
 
-    try {
-      const contents = await this.options.loadFileContents(this.repoRoot, file, this.state.activeScope);
-      const baseDiff = buildStructuredDiff(contents.originalContent, contents.modifiedContent, DEFAULT_CONTEXT_LINES);
-      setBoundedMapEntry(this.cache, key, { status: "ready", contents, baseDiff }, MAX_LOADED_FILE_ENTRIES);
-      this.ensureLineSelection();
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      setBoundedMapEntry(this.cache, key, { status: "error", error: message }, MAX_LOADED_FILE_ENTRIES);
-    }
-
-    this.requestRender();
+    const load = (async () => {
+      try {
+        const contents = await this.options.loadFileContents(this.repoRoot, file, scope);
+        const baseDiff = buildStructuredDiff(contents.originalContent, contents.modifiedContent, DEFAULT_CONTEXT_LINES);
+        setBoundedMapEntry(this.cache, key, { status: "ready", contents, baseDiff }, MAX_LOADED_FILE_ENTRIES);
+        this.revalidateDraftAnchors(file.id, scope, contents);
+        this.ensureLineSelection();
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        setBoundedMapEntry(this.cache, key, { status: "error", error: message }, MAX_LOADED_FILE_ENTRIES);
+      } finally {
+        this.entryLoads.delete(key);
+        this.requestRender();
+      }
+    })();
+    this.entryLoads.set(key, load);
+    return load;
   }
 
   private setScope(scope: ReviewScope): void {
@@ -1978,7 +2085,8 @@ export class ReviewApp {
     if (target == null || (target.kind !== "line" && intent === "modify")) return;
     const currentText = this.getEditText();
     if (intent === "modify" && target.kind === "line") {
-      const sourceText = target.originalText ?? this.getSourceLinesText(target.fileId, target.scope, target.side, target.startLine, target.endLine);
+      const sourceText = target.originalText
+        ?? (target.anchorStatus === "stale" ? "" : this.getSourceLinesText(target.fileId, target.scope, target.side, target.startLine, target.endLine));
       const nextText = currentText.length > 0 ? currentText : sourceText;
       this.exactEditor.setText(nextText, nextText === sourceText);
     } else if (target.intent === "modify") {
@@ -2012,6 +2120,23 @@ export class ReviewApp {
       this.state = setAllComment(this.state, value, target.intent);
     } else if (target.kind === "file") {
       this.state = upsertFileComment(this.state, target.fileId, target.scope, value, target.intent, target.fileTarget);
+    } else if (target.existingComment?.anchorStatus === "stale") {
+      const original = target.existingComment;
+      const storedBody = target.intent === "modify" ? value : value.trim();
+      const hasContent = target.intent === "modify"
+        ? storedBody !== original.originalText && (storedBody.length > 0 || (original.originalText?.length ?? 0) > 0)
+        : storedBody.length > 0;
+      this.state = hasContent
+        ? {
+            ...this.state,
+            draft: {
+              ...this.state.draft,
+              comments: this.state.draft.comments.map((comment) => comment.id === original.id
+                ? { ...original, intent: target.intent, body: storedBody }
+                : comment),
+            },
+          }
+        : deleteComment(this.state, original.id);
     } else {
       this.state = upsertLineComment(
         this.state,
@@ -2023,6 +2148,13 @@ export class ReviewApp {
         target.intent,
         target.endLine,
         target.intent === "modify" ? target.originalText : undefined,
+        hashTargetSlice(
+          target.side === "deleted"
+            ? this.getSourceContent(target.fileId, target.scope, "deleted")
+            : this.getSourceContent(target.fileId, target.scope, "added"),
+          { startLine: target.startLine, endLine: target.endLine },
+        ),
+        "mapped",
       );
     }
 
@@ -2037,11 +2169,14 @@ export class ReviewApp {
     this.requestRender();
   }
 
-  private getSourceLinesText(fileId: string, scope: ReviewScope, side: ReviewLineTarget["side"], startLine: number, endLine: number): string {
+  private getSourceContent(fileId: string, scope: ReviewScope, side: ReviewLineTarget["side"]): string {
     const entry = this.getEntry(fileId, scope);
     if (entry?.status !== "ready") return "";
-    const content = side === "deleted" ? entry.contents.originalContent : entry.contents.modifiedContent;
-    return getSourceLineRangeText(content, startLine, endLine);
+    return side === "deleted" ? entry.contents.originalContent : entry.contents.modifiedContent;
+  }
+
+  private getSourceLinesText(fileId: string, scope: ReviewScope, side: ReviewLineTarget["side"], startLine: number, endLine: number): string {
+    return getSourceLineRangeText(this.getSourceContent(fileId, scope, side), startLine, endLine);
   }
 
   private editLineCommentWithIntent(defaultIntent: CommentIntent): void {
@@ -2057,10 +2192,11 @@ export class ReviewApp {
     const existing = getLineComment(this.state, file.id, this.state.activeScope, target.side, target.line);
     const startLine = existing?.startLine ?? range.startLine;
     const endLine = existing?.endLine ?? range.endLine;
-    const sourceText = defaultIntent === "modify"
+    const editingStale = existing?.anchorStatus === "stale";
+    const sourceText = defaultIntent === "modify" && !editingStale
       ? this.getSourceLinesText(file.id, this.state.activeScope, target.side, startLine, endLine)
-      : "";
-    const initialBody = existing != null && existing.intent === defaultIntent
+      : existing?.originalText ?? "";
+    const initialBody = existing != null && (existing.intent === defaultIntent || editingStale)
       ? existing.body
       : defaultIntent === "modify"
         ? sourceText
@@ -2074,9 +2210,10 @@ export class ReviewApp {
       endLine,
       initialBody,
       intent: defaultIntent,
-      originalText: defaultIntent === "modify" && sourceText.length > 0
-        ? sourceText
-        : existing?.originalText,
+      originalText: existing?.originalText ?? (defaultIntent === "modify" && sourceText.length > 0 ? sourceText : undefined),
+      captureHash: existing?.captureHash,
+      anchorStatus: existing?.anchorStatus,
+      existingComment: existing,
     });
   }
 
@@ -2104,6 +2241,9 @@ export class ReviewApp {
       initialBody: existing?.body ?? "",
       intent: existing?.intent ?? "discuss",
       originalText: existing?.originalText ?? (sourceText.length > 0 ? sourceText : undefined),
+      captureHash: existing?.captureHash,
+      anchorStatus: existing?.anchorStatus,
+      existingComment: existing,
     });
   }
 
@@ -2211,12 +2351,110 @@ export class ReviewApp {
     this.editLineComment();
   }
 
-  private async openSelectedLineInEditor(): Promise<void> {
-    if (this.externalEditorOpen) return;
+  private openSelectedLineInCode(): void {
+    const file = this.activeFile();
+    if (this.state.activeScope !== "git-diff") {
+      this.setMessage("Open in /code is available only for the local working-tree review.");
+      this.requestRender();
+      return;
+    }
+    if (file == null) {
+      this.setMessage("No current file is selected.");
+      this.requestRender();
+      return;
+    }
+    const target = getSelectedLineTarget(this.state, file.id, this.state.activeScope);
+    if (target == null) {
+      this.setMessage("No current diff line is selected.");
+      this.requestRender();
+      return;
+    }
+    if (target.side !== "added") {
+      this.setMessage("Deleted/old-side lines have no writable current-side /code target.");
+      this.requestRender();
+      return;
+    }
+    if (!file.hasWorkingTreeFile) {
+      this.setMessage("The selected file does not exist in the writable working tree.");
+      this.requestRender();
+      return;
+    }
+    const entry = this.getEntry(file.id, "git-diff");
+    if (entry?.status !== "ready") {
+      this.setMessage("Diff is still loading; try again in a moment.");
+      this.requestRender();
+      return;
+    }
+    const range = getLineTargetRange(target);
+    const changedCurrentLines = new Set(buildStructuredDiff(entry.contents.originalContent, entry.contents.modifiedContent, 0).rows
+      .filter((row) => (row.kind === "insert" || row.kind === "replace") && row.newLineNumber != null)
+      .map((row) => row.newLineNumber!));
+    if (Array.from({ length: range.endLine - range.startLine + 1 }, (_, index) => range.startLine + index).some((line) => !changedCurrentLines.has(line))) {
+      this.setMessage("Open in /code requires a current-side changed diff range.");
+      this.requestRender();
+      return;
+    }
+    const anchor = hashTargetSlice(entry.contents.modifiedContent, range);
+    const contextBefore = 3;
+    const contextAfter = 3;
+    const lineCount = logicalLineCount(entry.contents.modifiedContent);
+    const context = {
+      before: contextBefore,
+      after: contextAfter,
+      hash: hashTargetSlice(entry.contents.modifiedContent, {
+        startLine: Math.max(1, range.startLine - contextBefore),
+        endLine: Math.min(lineCount, range.endLine + contextAfter),
+      }),
+    };
+    const path = joinReviewPath(file.pathPrefix, file.gitDiff?.newPath ?? file.path);
+    if (!this.persistSession()) {
+      this.setMessage("Could not save the full review draft. The review remains open; retry before opening /code.");
+      this.requestRender();
+      return;
+    }
+    this.done({
+      type: "open-code",
+      target: { path, range, anchor },
+      resume: {
+        version: 2,
+        repository: this.repoRoot,
+        sessionId: this.options.reviewSessionId ?? "current",
+        identity: this.options.reviewIdentity ?? `${this.repoRoot}|working|worktree|local`,
+        scope: "git-diff",
+        scopeFingerprint: this.options.reviewScopeFingerprint,
+        path,
+        side: "added",
+        range,
+        focus: { pane: this.state.focus, fileIndex: this.files.findIndex((candidate) => candidate.id === file.id), navigatorScroll: this.navigatorScroll, diffScroll: this.diffScroll, commentsScroll: this.commentsScroll },
+        contextHash: anchor,
+        selectedHash: anchor,
+        context,
+      },
+    });
+  }
 
+  private openSelectedLineInEditor(): void {
     const file = this.activeFile();
     if (file == null) {
       this.setMessage("No file selected.");
+      this.requestRender();
+      return;
+    }
+
+    if (this.state.activeScope !== "git-diff") {
+      this.setMessage("Open in $EDITOR is available only for the local working-tree review.");
+      this.requestRender();
+      return;
+    }
+
+    const target = getSelectedLineTarget(this.state, file.id, this.state.activeScope);
+    if (target == null) {
+      this.setMessage("No selectable diff line to open in $EDITOR.");
+      this.requestRender();
+      return;
+    }
+    if (target.side !== "added") {
+      this.setMessage("Deleted/old-side lines have no writable current-side $EDITOR target.");
       this.requestRender();
       return;
     }
@@ -2227,9 +2465,31 @@ export class ReviewApp {
       return;
     }
 
-    const target = getSelectedLineTarget(this.state, file.id, this.state.activeScope);
-    if (target == null) {
-      this.setMessage("No selectable diff line to open in $EDITOR.");
+    const entry = this.getEntry(file.id, "git-diff");
+    if (entry?.status !== "ready") {
+      this.setMessage("Diff is still loading; try again in a moment.");
+      this.requestRender();
+      return;
+    }
+    if (entry.contents.modifiedAvailable === false) {
+      this.setMessage("Current working-tree content is unavailable for $EDITOR.");
+      this.requestRender();
+      return;
+    }
+    const range = getLineTargetRange(target);
+    const changedCurrentLines = new Set(buildStructuredDiff(entry.contents.originalContent, entry.contents.modifiedContent, 0).rows
+      .filter((row) => (row.kind === "insert" || row.kind === "replace") && row.newLineNumber != null)
+      .map((row) => row.newLineNumber!));
+    if (Array.from({ length: range.endLine - range.startLine + 1 }, (_, index) => range.startLine + index).some((line) => !changedCurrentLines.has(line))) {
+      this.setMessage("Open in $EDITOR requires a current-side changed diff range.");
+      this.requestRender();
+      return;
+    }
+
+    const filePath = resolve(this.repoRoot, file.path);
+    const relativePath = relative(resolve(this.repoRoot), filePath);
+    if (relativePath === ".." || relativePath.startsWith(`..${sep}`) || isAbsolute(relativePath)) {
+      this.setMessage("Cannot open a file outside the repository in $EDITOR.");
       this.requestRender();
       return;
     }
@@ -2243,38 +2503,303 @@ export class ReviewApp {
 
     const editorLine = getEditorLineForTarget(diff, target);
     const editorCommand = (process.env.EDITOR || process.env.VISUAL || "vi").trim() || "vi";
-    const filePath = join(this.repoRoot, file.path);
-    const command = buildEditorLaunchCommand(editorCommand, filePath, editorLine);
-
-    this.externalEditorOpen = true;
-    this.setMessage(`Opening ${file.path}:${editorLine} in $EDITOR…`);
-    this.requestRender();
-
+    let launch: { command: string; args: string[] };
     try {
-      if (typeof this.tui.stop === "function") this.tui.stop();
-      if (typeof this.tui.terminal?.clearScreen === "function") this.tui.terminal.clearScreen();
-      const code = await runShellCommand(command, this.repoRoot);
-      this.setMessage(code === 0 ? `Returned from $EDITOR at ${file.path}:${editorLine}.` : `$EDITOR exited with code ${code ?? "unknown"}.`);
+      launch = buildEditorLaunchArgs(editorCommand, filePath, editorLine);
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      this.setMessage(`Could not open $EDITOR: ${message}`);
-    } finally {
-      this.externalEditorOpen = false;
-      this.invalidateEntry(file.id, this.state.activeScope);
-      void this.ensureActiveEntry();
-      if (typeof this.tui.start === "function") this.tui.start();
-      if (typeof this.tui.requestRender === "function") this.tui.requestRender(true);
-    }
-  }
-
-  private submit(): void {
-    if (!hasDraftContent(this.state) && this.options.allowEmptySubmit !== true) {
-      this.setMessage("Add at least one line comment, file/all-lines comment, or review-wide note before submitting.");
+      this.setMessage(error instanceof Error ? error.message : String(error));
       this.requestRender();
       return;
     }
-    this.persistSession();
-    this.done({ type: "submit", ...this.state.draft });
+
+    let resume: ReviewResumeReference | undefined;
+    if (this.state.activeScope === "git-diff") {
+      const entry = this.getEntry(file.id, "git-diff");
+      if (entry?.status === "ready" && entry.contents.modifiedAvailable !== false) {
+        const range = { startLine: editorLine, endLine: editorLine };
+        const anchor = hashTargetSlice(entry.contents.modifiedContent, range);
+        const contextBefore = 3;
+        const contextAfter = 3;
+        const lineCount = logicalLineCount(entry.contents.modifiedContent);
+        resume = {
+          version: 2,
+          repository: this.repoRoot,
+          sessionId: this.options.reviewSessionId ?? "current",
+          identity: this.options.reviewIdentity ?? `${this.repoRoot}|working|worktree|local`,
+          scope: "git-diff",
+          scopeFingerprint: this.options.reviewScopeFingerprint,
+          path: joinReviewPath(file.pathPrefix, file.gitDiff?.newPath ?? file.path),
+          side: "added",
+          range,
+          focus: { pane: this.state.focus, fileIndex: this.files.findIndex((candidate) => candidate.id === file.id), navigatorScroll: this.navigatorScroll, diffScroll: this.diffScroll, commentsScroll: this.commentsScroll },
+          contextHash: anchor,
+          selectedHash: anchor,
+          context: {
+            before: contextBefore,
+            after: contextAfter,
+            hash: hashTargetSlice(entry.contents.modifiedContent, {
+              startLine: Math.max(1, editorLine - contextBefore),
+              endLine: Math.min(lineCount, editorLine + contextAfter),
+            }),
+          },
+        };
+      }
+    }
+
+    if (!this.persistSession()) {
+      this.setMessage("Could not save the full review draft. The review remains open; retry before opening $EDITOR.");
+      this.requestRender();
+      return;
+    }
+    this.done({
+      type: "open-editor",
+      command: launch.command,
+      args: launch.args,
+      filePath,
+      line: editorLine,
+      ...(resume == null ? {} : { resume }),
+    });
+  }
+
+  private hasModifiedScopeSource(file: ReviewFile, scope: ReviewScope): boolean {
+    const comparison = getScopeComparison(file, scope);
+    return comparison?.hasModified === true
+      || (scope === "all-files" && comparison == null && file.inAllFiles && file.hasWorkingTreeFile);
+  }
+
+  private snapshotReanchorComment(comment: DiffReviewComment): Readonly<DiffReviewComment> {
+    return Object.freeze({
+      ...comment,
+      ...(comment.captureHash == null ? {} : { captureHash: Object.freeze({ ...comment.captureHash }) }),
+    });
+  }
+
+  private activateReanchor(transaction: Extract<ReanchorTransaction, { phase: "loading" }>, file: ReviewFile): void {
+    if (this.reanchorTarget !== transaction) return;
+    if (this.state.activeScope !== transaction.scope || this.state.activeFileId !== file.id) {
+      this.reanchorTarget = null;
+      this.setMessage("Reanchor stopped because its file or scope changed before loading completed.");
+      this.requestRender();
+      return;
+    }
+    const entry = this.getEntry(file.id, transaction.scope);
+    if (entry?.status !== "ready") {
+      this.reanchorTarget = null;
+      this.setMessage(entry?.status === "error"
+        ? `Could not load modified comparison bytes for reanchor: ${entry.error}`
+        : "Could not load modified comparison bytes for reanchor.");
+      this.requestRender();
+      return;
+    }
+    if (entry.contents.modifiedAvailable === false) {
+      this.reanchorTarget = null;
+      this.setMessage("This stale draft cannot be reanchored because its modified comparison bytes are unavailable.");
+      this.requestRender();
+      return;
+    }
+    const addedTargets = this.getVisibleLineTargets(file.id, transaction.scope).filter((target) => target.side === "added");
+    if (addedTargets.length === 0) {
+      this.reanchorTarget = null;
+      this.setMessage("This stale draft has loaded modified bytes but no modified/current-side range to reanchor.");
+      this.requestRender();
+      return;
+    }
+    const current = getSelectedLineTarget(this.state, file.id, transaction.scope);
+    if (current == null || current.side !== "added") {
+      this.state = setSelectedLineTarget(this.state, file.id, transaction.scope, addedTargets[0]!);
+    }
+    this.reanchorTarget = { ...transaction, phase: "selecting" };
+    this.setMessage("Reanchor: choose a current range with Up/Down or Shift+Up/Down, Enter to confirm, Esc to cancel.");
+    this.requestRender();
+  }
+
+  private beginReanchorSelectedComment(): void {
+    const items = getCommentPanelItems(this.state, this.state.activeFileId, this.state.activeScope, this.commentsGlobal);
+    const item = items[this.state.selectedCommentIndex];
+    if (item?.kind !== "comment" || item.comment.side === "file" || item.comment.anchorStatus !== "stale") {
+      this.setMessage("Select a stale line draft to reanchor.");
+      this.requestRender();
+      return;
+    }
+    const file = this.files.find((candidate) => candidate.id === item.comment.fileId);
+    if (file == null
+      || !this.visibleScopes().includes(item.comment.scope)
+      || !this.hasModifiedScopeSource(file, item.comment.scope)
+      || getSubmoduleInfo(file, item.comment.scope) != null) {
+      this.setMessage("This stale draft has no available modified/current-side comparison to reanchor.");
+      this.requestRender();
+      return;
+    }
+    const transaction: Extract<ReanchorTransaction, { phase: "loading" }> = {
+      phase: "loading",
+      commentId: item.comment.id,
+      fileId: file.id,
+      scope: item.comment.scope,
+      originalComment: this.snapshotReanchorComment(item.comment),
+    };
+    this.reanchorTarget = transaction;
+    this.state = setScope(this.state, this.files, item.comment.scope);
+    this.state = setActiveFileId(this.state, this.files, file.id);
+    this.state = setFocus(this.state, "diff");
+    const entry = this.getEntry(file.id, item.comment.scope);
+    if (entry?.status === "ready" || entry?.status === "error") {
+      this.activateReanchor(transaction, file);
+      return;
+    }
+    this.setMessage("Loading the draft's modified comparison before reanchor…");
+    void this.ensureActiveEntry().then(() => this.activateReanchor(transaction, file));
+    this.requestRender();
+  }
+
+  private moveReanchorSelection(delta: number, extend: boolean): void {
+    const pending = this.reanchorTarget;
+    if (pending?.phase !== "selecting") return;
+    const targets = this.getVisibleLineTargets(pending.fileId, pending.scope).filter((target) => target.side === "added");
+    if (!extend) {
+      this.state = moveSelectedLineTarget(this.state, pending.fileId, pending.scope, targets, delta);
+      this.requestRender();
+      return;
+    }
+    const current = getSelectedLineTarget(this.state, pending.fileId, pending.scope);
+    if (current == null || current.side !== "added") return;
+    const currentIndex = targets.findIndex((target) => target.line === current.line);
+    const next = targets[currentIndex + Math.sign(delta)];
+    if (next == null || next.line !== current.line + Math.sign(delta)) return;
+    this.state = extendSelectedLineTarget(this.state, pending.fileId, pending.scope, targets, delta);
+    this.requestRender();
+  }
+
+  private applyReanchorCandidate(transaction: ReanchorTransactionBase, candidate: Readonly<ReanchorCandidate>, proposedReplacement?: string): void {
+    const original = transaction.originalComment;
+    this.state = {
+      ...this.state,
+      draft: {
+        ...this.state.draft,
+        comments: this.state.draft.comments.map((comment) => comment.id === transaction.commentId ? {
+          ...original,
+          fileId: candidate.fileId,
+          scope: candidate.scope,
+          side: "added" as const,
+          startLine: candidate.range.startLine,
+          endLine: candidate.range.endLine,
+          captureHash: candidate.captureHash,
+          anchorStatus: "mapped" as const,
+          ...(original.intent === "modify"
+            ? { body: proposedReplacement ?? original.body, originalText: candidate.originalText }
+            : {}),
+        } : comment),
+      },
+    };
+    this.reanchorTarget = null;
+    this.setMessage("Review draft reanchored.");
+    this.requestRender();
+  }
+
+  private confirmReanchor(): void {
+    const pending = this.reanchorTarget;
+    if (pending?.phase === "confirm-modify") {
+      this.applyReanchorCandidate(pending, pending.candidate, pending.proposedReplacement);
+      return;
+    }
+    if (pending?.phase !== "selecting") return;
+    const file = this.files.find((candidate) => candidate.id === pending.fileId) ?? null;
+    const target = file == null ? null : getSelectedLineTarget(this.state, file.id, pending.scope);
+    const commentExists = this.state.draft.comments.some((comment) => comment.id === pending.commentId);
+    const entry = file == null ? undefined : this.getEntry(file.id, pending.scope);
+    if (file == null
+      || this.state.activeScope !== pending.scope
+      || this.state.activeFileId !== pending.fileId
+      || target == null
+      || target.side !== "added"
+      || !commentExists
+      || entry?.status !== "ready"
+      || entry.contents.modifiedAvailable === false
+      || !this.hasModifiedScopeSource(file, pending.scope)) {
+      this.setMessage("Choose an available modified/current-side range before confirming the reanchor.");
+      this.requestRender();
+      return;
+    }
+    const range = getLineTargetRange(target);
+    const lastLine = logicalLineCount(entry.contents.modifiedContent);
+    const availableLines = new Set(this.getVisibleLineTargets(file.id, pending.scope)
+      .filter((candidate) => candidate.side === "added")
+      .map((candidate) => candidate.line));
+    let rangeIsAvailable = range.startLine >= 1 && range.endLine >= range.startLine && range.endLine <= lastLine;
+    for (let line = range.startLine; rangeIsAvailable && line <= range.endLine; line += 1) {
+      rangeIsAvailable = availableLines.has(line);
+    }
+    if (!rangeIsAvailable) {
+      this.setMessage("Choose a loaded modified/current-side range fully within the available file bounds.");
+      this.requestRender();
+      return;
+    }
+    const captureHash = Object.freeze(hashTargetSlice(entry.contents.modifiedContent, range));
+    const candidate: Readonly<ReanchorCandidate> = Object.freeze({
+      fileId: file.id,
+      scope: pending.scope,
+      range: Object.freeze({ ...range }),
+      captureHash,
+      originalText: getSourceLineRangeText(entry.contents.modifiedContent, range.startLine, range.endLine),
+    });
+    if (pending.originalComment.intent === "modify") {
+      const proposedReplacement = pending.originalComment.body;
+      this.reanchorTarget = { ...pending, phase: "confirm-modify", candidate, proposedReplacement };
+      const preview = sanitizeStatusText(proposedReplacement);
+      this.setMessage(`MODIFY reanchor frozen. Proposed replacement: ${preview} • Enter applies this exact candidate; Esc cancels.`);
+      this.requestRender();
+      return;
+    }
+    this.applyReanchorCandidate(pending, candidate);
+  }
+
+  private cancelReanchor(): void {
+    this.reanchorTarget = null;
+    this.setMessage("Reanchor cancelled; the draft remains stale and unchanged.");
+    this.requestRender();
+  }
+
+  private handleReanchorInput(data: string): void {
+    const pending = this.reanchorTarget;
+    if (pending == null) return;
+    if (matchesKey(data, Key.escape) || matchesKey(data, Key.ctrl("c"))) {
+      this.cancelReanchor();
+      return;
+    }
+    if (pending.phase === "loading") return;
+    if (pending.phase === "confirm-modify") {
+      if (matchesKey(data, Key.enter)) this.confirmReanchor();
+      return;
+    }
+    if (matchesKey(data, Key.shift("down"))) { this.moveReanchorSelection(1, true); return; }
+    if (matchesKey(data, Key.shift("up"))) { this.moveReanchorSelection(-1, true); return; }
+    if (matchesKey(data, Key.down)) { this.moveReanchorSelection(1, false); return; }
+    if (matchesKey(data, Key.up)) { this.moveReanchorSelection(-1, false); return; }
+    if (matchesKey(data, Key.enter)) this.confirmReanchor();
+  }
+
+  private submit(): void {
+    if (!hasSubmittableDraftContent(this.state)) {
+      if (hasDraftContent(this.state)) {
+        this.setMessage("This draft contains only unresolved or stale items. Reanchor or remove them before submitting.");
+        this.requestRender();
+        return;
+      }
+      if (this.options.allowEmptySubmit !== true) {
+        this.setMessage("Add at least one line comment, file/all-lines comment, or review-wide note before submitting.");
+        this.requestRender();
+        return;
+      }
+    }
+    if (!this.persistSession()) {
+      this.setMessage("Could not save the full review draft. The review remains open; retry submission after persistence recovers.");
+      this.requestRender();
+      return;
+    }
+    this.done({
+      type: "submit",
+      ...this.state.draft,
+      comments: this.state.draft.comments.filter(isSubmittableComment),
+    });
   }
 
   private cancel(): void {
@@ -2824,7 +3349,10 @@ export class ReviewApp {
   }
 
   handleInput(data: string): void {
-    if (this.externalEditorOpen) return;
+    if (this.reanchorTarget != null) {
+      this.handleReanchorInput(data);
+      return;
+    }
     if (this.handleMouseWheel(data)) return;
 
     if (this.editTarget != null) {
@@ -2951,7 +3479,7 @@ export class ReviewApp {
     if (data === "S") { this.copySelection("suggestion"); return; }
     if (matchesReviewAction("submit", data)) { this.submit(); return; }
     if (matchesReviewAction("fileComment", data)) { this.editFileComment(); return; }
-    if (matchesReviewAction("allLines", data)) { this.editAllLinesComment(); return; }
+    if (this.state.focus === "diff" && matchesReviewAction("allLines", data)) { this.editAllLinesComment(); return; }
     if (data === "n" && this.jumpSearch(1)) { return; }
     if (data === "N" && this.jumpSearch(-1)) { return; }
     if (data === "n") { this.moveHunk(1); return; }
@@ -3041,7 +3569,11 @@ export class ReviewApp {
           return;
         }
         if (data === "o") {
-          void this.openSelectedLineInEditor();
+          this.openSelectedLineInCode();
+          return;
+        }
+        if (data === "e") {
+          this.openSelectedLineInEditor();
           return;
         }
         if (data === "m" || data === "M" || matchesKey(data, Key.enter)) {
@@ -3054,10 +3586,6 @@ export class ReviewApp {
         }
         if (data === "c") {
           this.editLineCommentWithIntent("comment");
-          return;
-        }
-        if (data === "e") {
-          this.editCurrentLineComment();
           return;
         }
         if (data === "x") {
@@ -3092,6 +3620,10 @@ export class ReviewApp {
       }
       if (matchesKey(data, Key.pageUp)) {
         this.moveCommentSelection(-this.commentsPageSize);
+        return;
+      }
+      if (data === "a") {
+        this.beginReanchorSelectedComment();
         return;
       }
       if (data === "e" || matchesKey(data, Key.enter)) {
@@ -3657,7 +4189,8 @@ export class ReviewApp {
       const commentFile = item.kind === "comment" ? this.options.files.find((candidate) => candidate.id === item.comment.fileId) : undefined;
       const itemPath = item.kind === "comment" ? getReviewFileDisplayPath(commentFile, item.comment.scope) : "";
       const baseLabel = getPanelItemLabel(this.theme, item);
-      const label = this.commentsGlobal && itemPath.length > 0 ? `${itemPath} • ${baseLabel}` : baseLabel;
+      const staleLabel = item.kind === "comment" && item.comment.anchorStatus === "stale" ? " • STALE (a reanchor)" : "";
+      const label = `${this.commentsGlobal && itemPath.length > 0 ? `${itemPath} • ${baseLabel}` : baseLabel}${staleLabel}`;
       const labelText = selected
         ? this.theme.fg("accent", label)
         : searchMatched
@@ -3717,15 +4250,15 @@ export class ReviewApp {
     const bodyTop = overlayOriginRow + 1 + MODAL_INNER_PADDING_Y + headerLines.length;
     const layoutStatus = stackPanes ? "stacked layout • " : "";
     const allPanesHiddenStatus = visiblePanes.length === 0 ? "All panes hidden • 1 Navigator • 2 Diff • 3 Comments • 4 PR context" : null;
-    const promptStatus = this.shortcutMode
+    const promptStatus = sanitizeStatusText(this.shortcutMode
       ? "Template shortcuts • choose from the comments panel • Esc cancel"
       : this.helpMode
         ? "Help open • ? toggle • Esc close"
         : allPanesHiddenStatus ?? this.message ?? (this.searchMode
-          ? `Search ${formatFocusStatus(this.searchPane).replace("Focus: ", "")}: ${sanitizeTerminalText(this.searchBuffer)}`
+          ? `Search ${formatFocusStatus(this.searchPane).replace("Focus: ", "")}: ${this.searchBuffer}`
           : this.editTarget != null
             ? `Editing ${formatIntentLabel(this.editTarget.intent).toLowerCase()} comment`
-            : `${formatFocusStatus(this.state.focus)} • ${layoutStatus}Tab/←/→ focus • / search • t templates • v diff view • ? help • ${scopeHint}1/2/3/4 panes • o open in $EDITOR • s submit${this.frameStack.length > 0 ? " • b parent" : ""} • Esc exit • Ctrl+C exit`);
+            : `${formatFocusStatus(this.state.focus)} • ${layoutStatus}Tab/←/→ focus • / search • t templates • v diff view • ? help • ${scopeHint}1/2/3/4 panes • o open in /code • e open in $EDITOR • s submit${this.frameStack.length > 0 ? " • b parent" : ""} • Esc exit • Ctrl+C exit`));
     const verticalLayout = getReviewVerticalLayout(
       this.theme,
       frameInnerHeight,
@@ -3800,15 +4333,6 @@ export async function runReviewApp(
 ): Promise<ReviewResult> {
   return ctx.ui.custom<ReviewResult>(
     (tui, theme, _kb, done) => new ReviewApp(tui, theme, done, { ...options, notify: ctx.ui.notify.bind(ctx.ui) }),
-    {
-      overlay: true,
-      overlayOptions: {
-        anchor: "center",
-        width: "100%",
-        maxHeight: "100%",
-        minWidth: 40,
-        margin: { top: 1, right: 0, bottom: 1, left: 0 },
-      },
-    },
+    fullScreenOverlayOptions,
   );
 }
