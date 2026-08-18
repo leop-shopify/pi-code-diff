@@ -10,6 +10,8 @@
   "files": [
     "src/diff.ts",
     "src/git.ts",
+    "src/git-change-status.ts",
+    "src/git-filter-policy.ts",
     "src/index.ts",
     "src/locale-files.ts",
     "src/pi-render.ts",
@@ -29,6 +31,11 @@
     "src/theme-highlight.ts",
     "src/types.ts",
     "src/ui",
+    "src/adapters",
+    "src/workbench",
+    "docs",
+    "scripts",
+    "tsconfig.workbench.json",
     "README.md",
     "CHANGELOG.md",
     "LICENSE"
@@ -54,20 +61,24 @@
   "scripts": {
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
-    "benchmark": "vitest bench --run"
+    "benchmark": "vitest bench --run",
+    "workbench:bench": "vitest bench --run src/benchmark/workbench.bench.ts",
+    "workbench:build": "node scripts/build-workbench.mjs",
+    "workbench:start": "node scripts/start-workbench.mjs"
   },
   "dependencies": {
     "@earendil-works/pi-ai": "0.78.0",
     "@earendil-works/pi-tui": "0.78.0",
     "@pierre/diffs": "1.2.7",
-    "typebox": "1.1.38"
+    "@types/node": "24.12.4",
+    "shiki": "3.23.0",
+    "typebox": "1.1.38",
+    "typescript": "5.9.3"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "0.78.0"
   },
   "devDependencies": {
-    "@types/node": "24.12.4",
-    "typescript": "5.9.3",
     "vitest": "3.2.6"
   }
 }

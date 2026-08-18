@@ -398,36 +398,49 @@ export async function mapWithConcurrency<T, R>(items: T[], limit: number, mapper
   return results;
 }
 
-async function getRevisionContent(pi: ExtensionAPI, repoRoot: string, revision: string, path: string): Promise<string> {
+interface LoadedReviewContent {
+  content: string;
+  available: boolean;
+}
+
+async function getRevisionContentResult(pi: ExtensionAPI, repoRoot: string, revision: string, path: string): Promise<LoadedReviewContent> {
   const objectSpec = `${revision}:${path}`;
   const sizeResult = await pi.exec("git", ["cat-file", "-s", objectSpec], { cwd: repoRoot });
   if (sizeResult.code === 0) {
     const size = Number.parseInt(sizeResult.stdout.trim(), 10);
-    if (Number.isFinite(size) && !isReviewFileSizeAllowed(size)) return "";
+    if (Number.isFinite(size) && !isReviewFileSizeAllowed(size)) return { content: "", available: false };
   }
 
   const result = await pi.exec("git", ["show", objectSpec], { cwd: repoRoot });
-  if (result.code !== 0) return "";
-  return result.stdout;
+  if (result.code !== 0) return { content: "", available: false };
+  return { content: result.stdout, available: true };
 }
 
-export async function getWorkingTreeContent(repoRoot: string, path: string): Promise<string> {
+async function getRevisionContent(pi: ExtensionAPI, repoRoot: string, revision: string, path: string): Promise<string> {
+  return (await getRevisionContentResult(pi, repoRoot, revision, path)).content;
+}
+
+async function getWorkingTreeContentResult(repoRoot: string, path: string): Promise<LoadedReviewContent> {
   try {
     const realRepoRoot = await realpath(repoRoot);
     const candidatePath = resolve(realRepoRoot, path);
-    if (!isPathInside(realRepoRoot, candidatePath)) return "";
+    if (!isPathInside(realRepoRoot, candidatePath)) return { content: "", available: false };
 
     const linkStats = await lstat(candidatePath);
     const targetPath = linkStats.isSymbolicLink() ? await realpath(candidatePath) : candidatePath;
-    if (!isPathInside(realRepoRoot, targetPath)) return "";
+    if (!isPathInside(realRepoRoot, targetPath)) return { content: "", available: false };
 
     const targetStats = linkStats.isSymbolicLink() ? await stat(targetPath) : linkStats;
-    if (!targetStats.isFile() || !isReviewFileSizeAllowed(targetStats.size)) return "";
+    if (!targetStats.isFile() || !isReviewFileSizeAllowed(targetStats.size)) return { content: "", available: false };
 
-    return await readFile(targetPath, "utf8");
+    return { content: await readFile(targetPath, "utf8"), available: true };
   } catch {
-    return "";
+    return { content: "", available: false };
   }
+}
+
+export async function getWorkingTreeContent(repoRoot: string, path: string): Promise<string> {
+  return (await getWorkingTreeContentResult(repoRoot, path)).content;
 }
 
 function normalizeGitPath(path: string): string {
@@ -938,14 +951,20 @@ export async function getReviewWindowDataForRevisionRange(pi: ExtensionAPI, cwd:
 
 export async function loadReviewFileContents(pi: ExtensionAPI, repoRoot: string, file: ReviewFile, scope: ReviewScope, branchBaseRevision?: string | null, modifiedRevision = "HEAD"): Promise<ReviewFileContents> {
   const comparison = scope === "git-diff" ? file.gitDiff : scope === "last-commit" ? file.lastCommit : file.allFiles;
+  const unavailable: LoadedReviewContent = { content: "", available: false };
 
   if (scope === "all-files" && comparison == null) {
-    const content = file.hasWorkingTreeFile ? await getWorkingTreeContent(repoRoot, file.path) : "";
-    return { originalContent: content, modifiedContent: content };
+    const loaded = file.hasWorkingTreeFile ? await getWorkingTreeContentResult(repoRoot, file.path) : unavailable;
+    return {
+      originalContent: loaded.content,
+      modifiedContent: loaded.content,
+      originalAvailable: loaded.available,
+      modifiedAvailable: loaded.available,
+    };
   }
 
   if (comparison == null) {
-    return { originalContent: "", modifiedContent: "" };
+    return { originalContent: "", modifiedContent: "", originalAvailable: false, modifiedAvailable: false };
   }
 
   const allFilesBaseRevision = scope === "all-files" && comparison.originalRevision === undefined
@@ -966,12 +985,19 @@ export async function loadReviewFileContents(pi: ExtensionAPI, repoRoot: string,
         ? "HEAD"
         : modifiedRevision;
 
-  const originalContent = comparison.oldPath == null || originalRevision == null ? "" : await getRevisionContent(pi, repoRoot, originalRevision, comparison.oldPath);
-  const modifiedContent = comparison.newPath == null
-    ? ""
+  const original = comparison.oldPath == null || originalRevision == null
+    ? unavailable
+    : await getRevisionContentResult(pi, repoRoot, originalRevision, comparison.oldPath);
+  const modified = comparison.newPath == null
+    ? unavailable
     : comparisonModifiedRevision == null
-      ? await getWorkingTreeContent(repoRoot, comparison.newPath)
-      : await getRevisionContent(pi, repoRoot, comparisonModifiedRevision, comparison.newPath);
+      ? await getWorkingTreeContentResult(repoRoot, comparison.newPath)
+      : await getRevisionContentResult(pi, repoRoot, comparisonModifiedRevision, comparison.newPath);
 
-  return { originalContent, modifiedContent };
+  return {
+    originalContent: original.content,
+    modifiedContent: modified.content,
+    originalAvailable: original.available,
+    modifiedAvailable: modified.available,
+  };
 }

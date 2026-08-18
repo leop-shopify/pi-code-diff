@@ -1,11 +1,11 @@
-import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { createHash, randomUUID } from "node:crypto";
+import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import type { PersistedDiffViewMode } from "./preferences.js";
 import type { ReviewState } from "./types.js";
 
-export const REVIEW_SESSION_VERSION = 1;
+export const REVIEW_SESSION_VERSION = 2;
 
 export interface ReviewSessionData {
   state: ReviewState;
@@ -58,8 +58,26 @@ function isReviewState(value: unknown): value is ReviewState {
     && Array.isArray(value.draft.comments);
 }
 
+function normalizeAnchors(state: ReviewState, legacy: boolean): ReviewState {
+  return {
+    ...state,
+    draft: {
+      ...state.draft,
+      comments: state.draft.comments.map((comment) => {
+        if (comment.side === "file") return { ...comment, anchorStatus: "mapped" as const };
+        const validHash = comment.captureHash?.algorithm === "sha256" && /^[0-9a-f]{64}$/.test(comment.captureHash.value);
+        return {
+          ...comment,
+          ...(validHash ? { captureHash: comment.captureHash } : {}),
+          anchorStatus: !legacy && validHash && comment.anchorStatus === "mapped" ? "mapped" as const : "stale" as const,
+        };
+      }),
+    },
+  };
+}
+
 function migrateReviewSession(value: unknown, identity: string): PersistedReviewSession | null {
-  if (!isRecord(value) || value.version !== REVIEW_SESSION_VERSION || value.identity !== identity) return null;
+  if (!isRecord(value) || (value.version !== 1 && value.version !== REVIEW_SESSION_VERSION) || value.identity !== identity) return null;
   if (!isReviewState(value.state)) return null;
   if (value.diffViewMode !== "unified" && value.diffViewMode !== "side-by-side") return null;
   if (typeof value.id !== "string" || typeof value.updatedAt !== "string") return null;
@@ -67,7 +85,11 @@ function migrateReviewSession(value: unknown, identity: string): PersistedReview
   if (value.showAllLocales != null && typeof value.showAllLocales !== "boolean") return null;
   if (!Array.isArray(value.reviewedFileIds) || value.reviewedFileIds.some((item) => typeof item !== "string")) return null;
   if (typeof value.navigatorScroll !== "number" || typeof value.diffScroll !== "number" || typeof value.commentsScroll !== "number") return null;
-  return value as unknown as PersistedReviewSession;
+  return {
+    ...(value as unknown as PersistedReviewSession),
+    version: REVIEW_SESSION_VERSION,
+    state: normalizeAnchors(value.state, value.version === 1),
+  };
 }
 
 export function loadReviewSession(identity: string, id = createReviewSessionId(identity)): PersistedReviewSession | null {
@@ -80,21 +102,44 @@ export function loadReviewSession(identity: string, id = createReviewSessionId(i
   }
 }
 
-export function saveReviewSession(identity: string, data: ReviewSessionData, id = createReviewSessionId(identity)): string {
+export interface ReviewSessionSaveResult {
+  id: string;
+  saved: boolean;
+}
+
+export function saveReviewSessionWithStatus(
+  identity: string,
+  data: ReviewSessionData,
+  id = createReviewSessionId(identity),
+): ReviewSessionSaveResult {
   const session: PersistedReviewSession = {
+    ...data,
+    state: normalizeAnchors(data.state, false),
     version: REVIEW_SESSION_VERSION,
     id,
     identity,
     updatedAt: new Date().toISOString(),
-    ...data,
   };
+  const path = getReviewSessionPathForDiagnostics(id);
+  const temporaryPath = `${path}.${process.pid}.${randomUUID()}.tmp`;
   try {
     mkdirSync(getSessionsDir(), { recursive: true });
-    writeFileSync(getReviewSessionPathForDiagnostics(id), `${JSON.stringify(session, null, 2)}\n`, "utf8");
+    writeFileSync(temporaryPath, `${JSON.stringify(session, null, 2)}\n`, "utf8");
+    renameSync(temporaryPath, path);
+    return { id, saved: true };
   } catch {
-    return id;
+    try {
+      if (existsSync(temporaryPath)) unlinkSync(temporaryPath);
+    } catch {
+      // Keep the save result truthful even when temporary-file cleanup also fails.
+    }
+    return { id, saved: false };
   }
-  return id;
+}
+
+/** Legacy ID-only persistence delegate; status-aware saving remains authoritative. */
+export function saveReviewSession(identity: string, data: ReviewSessionData, id = createReviewSessionId(identity)): string {
+  return saveReviewSessionWithStatus(identity, data, id).id;
 }
 
 export function deleteReviewSession(identity: string, id = createReviewSessionId(identity)): void {

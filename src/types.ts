@@ -47,6 +47,9 @@ export interface ReviewFile {
 export interface ReviewFileContents {
   originalContent: string;
   modifiedContent: string;
+  /** False when the requested comparison side could not be read; omitted means available for compatibility. */
+  originalAvailable?: boolean;
+  modifiedAvailable?: boolean;
 }
 
 export interface ReviewContextPanelSource {
@@ -60,6 +63,13 @@ export type CommentSide = "added" | "deleted" | "file";
 export type CommentIntent = "discuss" | "comment" | "modify";
 export type FileCommentTarget = "file" | "all-lines";
 
+export interface ReviewAnchorHash {
+  algorithm: "sha256";
+  value: string;
+}
+
+export type ReviewAnchorStatus = "mapped" | "stale";
+
 export interface DiffReviewComment {
   id: string;
   fileId: string;
@@ -72,6 +82,10 @@ export interface DiffReviewComment {
   fileTarget?: FileCommentTarget;
   /** Original source text of the edited line(s), captured when a CHANGE edit is started. */
   originalText?: string;
+  /** Capture-time source hash for line/range drafts. File drafts do not require one. */
+  captureHash?: ReviewAnchorHash;
+  /** Unresolved drafts remain visible but are not submittable. */
+  anchorStatus?: ReviewAnchorStatus;
 }
 
 export interface ReviewDraft {
@@ -110,7 +124,43 @@ export interface ReviewCancelPayload {
   type: "cancel";
 }
 
-export type ReviewResult = ReviewSubmitPayload | ReviewCancelPayload;
+export interface ReviewResumeReference {
+  /** v2 separates the exact selected bytes from bounded relocation context. */
+  version: 1 | 2;
+  repository: string;
+  sessionId: string;
+  identity: string;
+  scope: "git-diff";
+  /** Deterministic local review-discovery frame fingerprint (v2). */
+  scopeFingerprint?: string;
+  path: string;
+  side: "added";
+  range: { startLine: number; endLine: number };
+  focus: { pane: ReviewFocus; fileIndex?: number; navigatorScroll: number; diffScroll: number; commentsScroll: number };
+  /** v1 exact selected-slice hash; retained only for safe legacy tokens. */
+  contextHash: ReviewAnchorHash;
+  /** v2 exact selected-slice hash. */
+  selectedHash?: ReviewAnchorHash;
+  /** v2 bounded surrounding context used only to relocate an eligible selected target. */
+  context?: { before: number; after: number; hash: ReviewAnchorHash };
+}
+
+export interface ReviewOpenCodePayload {
+  type: "open-code";
+  target: import("./workbench/contracts.js").CodeTarget;
+  resume: ReviewResumeReference;
+}
+
+export interface ReviewOpenEditorPayload {
+  type: "open-editor";
+  command: string;
+  args: string[];
+  filePath: string;
+  line: number;
+  resume?: ReviewResumeReference;
+}
+
+export type ReviewResult = ReviewSubmitPayload | ReviewCancelPayload | ReviewOpenCodePayload | ReviewOpenEditorPayload;
 
 export function formatScopeLabel(scope: ReviewScope): string {
   switch (scope) {

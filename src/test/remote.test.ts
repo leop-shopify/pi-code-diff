@@ -603,6 +603,41 @@ describe("remote review helpers", () => {
     });
   });
 
+  it("bypasses cached targets for DISCUSS continuation and replaces the normal cache on success", async () => {
+    const exec = vi.fn(async (command: string, args: string[]) => {
+      if (command === "git" && args[0] === "symbolic-ref") return { code: 0, stdout: "origin/main\n", stderr: "", killed: false };
+      if (command === "git" && args[1] === "fetch") return { code: 0, stdout: "", stderr: "", killed: false };
+      return { code: 1, stdout: "", stderr: `unexpected ${command} ${args.join(" ")}`, killed: false };
+    });
+
+    await resolveRemoteReviewTarget({ exec } as never, "/repo", "feature/review", "/repo");
+    const callsAfterInitial = exec.mock.calls.length;
+    await resolveRemoteReviewTarget({ exec } as never, "/repo", "feature/review", "/repo", undefined, { cacheMode: "bypass" });
+    const callsAfterRefresh = exec.mock.calls.length;
+    await resolveRemoteReviewTarget({ exec } as never, "/repo", "feature/review", "/repo");
+
+    expect(callsAfterRefresh).toBeGreaterThan(callsAfterInitial);
+    expect(exec.mock.calls.length).toBe(callsAfterRefresh);
+  });
+
+  it("retains the old cache when a forced DISCUSS refresh fails", async () => {
+    let failRefresh = false;
+    const exec = vi.fn(async (command: string, args: string[]) => {
+      if (command === "git" && args[0] === "symbolic-ref") return { code: 0, stdout: "origin/main\n", stderr: "", killed: false };
+      if (command === "git" && args[1] === "fetch") return failRefresh
+        ? { code: 1, stdout: "", stderr: "refresh failed", killed: false }
+        : { code: 0, stdout: "", stderr: "", killed: false };
+      return { code: 1, stdout: "", stderr: `unexpected ${command} ${args.join(" ")}`, killed: false };
+    });
+
+    const original = await resolveRemoteReviewTarget({ exec } as never, "/repo", "feature/review", "/repo");
+    failRefresh = true;
+    await expect(resolveRemoteReviewTarget({ exec } as never, "/repo", "feature/review", "/repo", undefined, { cacheMode: "bypass" })).rejects.toThrow("refresh failed");
+    const callsAfterFailure = exec.mock.calls.length;
+    await expect(resolveRemoteReviewTarget({ exec } as never, "/repo", "feature/review", "/repo")).resolves.toBe(original);
+    expect(exec.mock.calls.length).toBe(callsAfterFailure);
+  });
+
   it("reuses the cached remote review target within the TTL and refreshes after expiry", async () => {
     vi.useFakeTimers();
     try {

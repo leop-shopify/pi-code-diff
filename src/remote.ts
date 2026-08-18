@@ -57,6 +57,17 @@ export interface RemoteReviewTarget {
 
 export type RemoteProgress = (message: string) => void;
 
+export interface RemoteDiscussContinuation {
+  kind: "remote-discuss";
+  priorSessionId: string;
+  priorBaseRevision: string;
+  priorHeadRevision: string;
+}
+
+export interface RemoteReviewTargetResolutionOptions {
+  cacheMode?: "default" | "bypass";
+}
+
 function originRef(branch: string): string {
   return `refs/remotes/origin/${branch}`;
 }
@@ -568,7 +579,14 @@ export function clearRemoteReviewTargetCache(): void {
   remoteTargetCache.clear();
 }
 
-export async function resolveRemoteReviewTarget(pi: ExtensionAPI, fallbackCwd: string, remote: string, explicitCwd?: string, onProgress?: RemoteProgress): Promise<RemoteReviewTarget> {
+export async function resolveRemoteReviewTarget(
+  pi: ExtensionAPI,
+  fallbackCwd: string,
+  remote: string,
+  explicitCwd?: string,
+  onProgress?: RemoteProgress,
+  options?: RemoteReviewTargetResolutionOptions,
+): Promise<RemoteReviewTarget> {
   const parsed = extractBranchFromRemote(remote);
   if (parsed == null) throw new Error(`Could not extract branch name from: ${remote}`);
 
@@ -577,11 +595,11 @@ export async function resolveRemoteReviewTarget(pi: ExtensionAPI, fallbackCwd: s
     : remote.trim();
   const cacheKey = JSON.stringify([normalizedRemote, explicitCwd ?? "", parsed.repo == null ? fallbackCwd : ""]);
   const cached = remoteTargetCache.get(cacheKey);
-  if (cached != null && cached.expiresAt > Date.now()) {
+  if (cached != null && cached.expiresAt > Date.now() && options?.cacheMode !== "bypass") {
     onProgress?.(`Using cached remote review for ${remote}…`);
     return cached.target;
   }
-  remoteTargetCache.delete(cacheKey);
+  if (cached != null && cached.expiresAt <= Date.now() && options?.cacheMode !== "bypass") remoteTargetCache.delete(cacheKey);
 
   onProgress?.(`Preparing remote review for ${remote}…`);
   const { gitRoot, fetchRemote, workspacePath, pathspecs, importAliases } = await resolveRepoRoot(pi, fallbackCwd, parsed.repo, explicitCwd, onProgress);
