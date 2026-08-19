@@ -1,16 +1,16 @@
 # pi-code-diff
 
-`/diff`, `/code`, and `/code-diff` open an interactive code diff editor for Pi with comments, editable line suggestions, AI-assisted review handoff, GitHub and provider PR submission support, and local or remote diff review.
+`/diff`, `/code`, and `/code-diff` open an interactive code diff editor for Pi with comments, editable line suggestions, AI-assisted review handoff, configured pull-request submission, and local or remote diff review.
 
 It is inspired by Mario Zechner's [pi-diff-review](https://github.com/badlogic/pi-diff-review).
 
-It lets you stop after an agent turn, walk a local diff or remote PR inside Pi, add fast line/file/all-lines annotations, and route the result either back to the agent or into a GitHub or provider PR review.
+It lets you stop after an agent turn, walk a local diff or remote PR inside Pi, add fast line/file/all-lines annotations, and route the result either back to the agent or into a configured remote review.
 
 The goal is simple: keep terminal-based code review inside Pi, keep annotations precise, and make it easy to separate edits you want applied from comments you want posted and things you want explained.
 
 ## Summary
 
-Use `/diff`, `/code`, or `/code-diff` when you want to review and annotate code changes before sending the agent another turn or posting GitHub PR feedback.
+Use `/diff`, `/code`, or `/code-diff` when you want to review and annotate code changes before sending the agent another turn or posting pull-request feedback.
 
 It supports local and remote review modes:
 
@@ -19,7 +19,7 @@ It supports local and remote review modes:
 - `all files`
 - custom `base..head` / `base...head` ranges
 - remote branches
-- GitHub, stack-host, or review-host PR URLs
+- pull-request URLs recognized by locally configured providers
 
 Inside the review UI you can:
 
@@ -29,11 +29,11 @@ Inside the review UI you can:
 - leave **file-level** annotations
 - leave an **all-lines note** for the current file
 - mark feedback as either:
-  - `DISCUSS` — the agent explains, justifies, or proposes; it never edits code or touches GitHub to satisfy the note
-  - `COMMENT` — a real pull-request comment when the review is a GitHub or provider PR; for a local review it becomes a local comment to the agent about the change
+  - `DISCUSS` — the agent explains, justifies, or proposes; it never edits code or touches the remote provider to satisfy the note
+  - `COMMENT` — a real pull-request comment for configured remote reviews; for a local review it becomes a local comment to the agent about the change
   - `MODIFY` — an exact edit you make in place on the line; the agent applies it locally
 - insert the resulting local review prompt into Pi’s editor
-- for GitHub and provider PR reviews, run a grammar and semantic-safety pass with the active Pi model, automatically apply safe corrections, and submit the confirmed verdict directly
+- for configured remote PR reviews, run a grammar and semantic-safety pass with the active Pi model, automatically apply safe corrections, and submit the confirmed verdict directly
 
 For local reviews, the UI stages the next message for you. For remote PR verdicts, the UI grammar-checks the confirmed text and submits automatically when every correction preserves meaning, intent, tone, and technical substance.
 
@@ -42,7 +42,7 @@ For local reviews, the UI stages the next message for you. For remote PR verdict
 ### Install
 
 ```bash
-pi install https://github.com/leop-example/pi-code-diff
+pi install https://example.com/owner/pi-code-diff
 ```
 
 Then restart Pi or run `/reload`.
@@ -92,8 +92,8 @@ Configure the shortcut with `globalShortcut` in `~/.pi/agent/extensions/code-dif
 
 - `/diff` with no arguments reviews local working-tree/uncommitted changes, including untracked files. When Pi is inside a recognized monorepo workspace such as `packages/app`, review is scoped to that workspace; add `--whole-repo` to include the entire checkout.
 - `/diff --include-generated` includes generated text such as `.rbi`, source maps, and minified JavaScript/CSS while still rejecting binary files.
-- Review state is saved locally while the UI is open and restored for the same repository/range. `/diff --resume <session-id>` selects an explicit session; `/diff --discard-resume` discards the matching saved session before opening.
-- `/diff remote <url | branch>` reviews a remote branch or PR. It accepts a remote branch, a GitHub or stack-host PR URL, a review-host URL, or `owner/repo#123`.
+- Review state is saved locally while the UI is open and restored for the same repository/range. Remote PR reviews are keyed by provider, repository, and PR number, so a parked review survives new pushes and rebases: comments on untouched files keep their exact anchor, comments on files that changed are marked `[needs attention …]`, and comments whose file left the diff are folded into the review-wide note. `/diff --resume` with no value opens a picker over parked reviews; `/diff --resume <session-id>` selects an explicit session; `/diff --discard-resume` discards the matching saved session before opening.
+- `/diff remote <url | branch>` reviews a remote branch or a pull-request URL recognized by local provider settings.
 - `/diff <base>..<head>` compares the two endpoints directly. `/diff <base>...<head>` compares the merge base with `head`.
 
 Local changes open the in-UI scope switcher described below.
@@ -127,14 +127,13 @@ Local changes open the in-UI scope switcher described below.
 
 Use `/diff` directly, or have an agent call `open_code_diff` with the same target syntax:
 
-- `/diff remote <branch | url>` or `open_code_diff({ args: "remote <branch | url>" })` accepts a plain remote branch, a GitHub PR URL, a stack-host PR URL, a review-host URL, or `owner/repo#number`
-- review-host accepts both `https://review-host.example.io/repos/owner/repo/pulls/123` and the same URL ending in `/files`; both forms share the same saved-review identity
+- `/diff remote <branch | url>` or `open_code_diff({ args: "remote <branch | url>" })` accepts a plain remote branch or a URL recognized by local provider settings
 - `/diff` with no args or `open_code_diff({ args: "" })` reviews local working-tree/uncommitted changes, including untracked files, against the configured or detected checkout
 - `/diff base..head` or `open_code_diff({ args: "base..head" })` reviews a `base..head` or `base...head` custom range
 
-Remote branch and PR reviews fetch with `--no-tags` and a 60 second timeout, then review the fetched base/head range in the `/diff` UI. GitHub and provider PR reviews also show a `PR context` column with the exact title, URL, author, review status, problem summary, available validation context, open comments, files touched, and a compact `+added/-removed` line count. PR URLs and `owner/repo#number` do not require a checkout; if no matching local checkout is configured or detected, pi-code-diff uses a lightweight git cache under `~/.pi/agent/cache/pi-code-diff/remotes/`.
+Remote branch and PR reviews fetch with `--no-tags` and a 60 second timeout, then review the fetched base/head range in the `/diff` UI. Configured PR reviews also show a `PR context` column with the exact title, URL, author, review status, problem summary, available validation context, open comments, files touched, and a compact `+added/-removed` line count. PR URLs do not require a checkout; if no matching local checkout is configured or detected, pi-code-diff uses a lightweight git cache under `~/.pi/agent/cache/pi-code-diff/remotes/`.
 
-For monorepos or repos that should resolve to a specific local checkout, add a `repositories` mapping to `~/.pi/agent/extensions/code-diff.json`:
+For monorepos or repos that should resolve to a specific local checkout, add a `repositories` mapping to `~/.pi/agent/pi-code-diff-settings.json`:
 
 ```json
 {
@@ -151,7 +150,7 @@ For monorepos or repos that should resolve to a specific local checkout, add a `
 
 ### Approving and commenting on a PR
 
-When the review is a GitHub or provider PR, finishing the review opens an end-action menu:
+When the review is a configured remote PR, finishing the review opens an end-action menu:
 
 - `Approve`
 - `Request changes`
@@ -167,11 +166,11 @@ The verdicts use an extension-owned submission flow:
 3. A separate semantic-safety pass classifies every correction. Meaning-preserving grammar and clarity corrections are applied and submitted automatically without another approval screen.
 4. Only corrections that may alter meaning, intent, tone, technical substance, or requested scope are shown for an exact use/edit/keep/remove decision. Safe corrections in the same review remain automatic, and there is no final confirmation after uncertain items are resolved.
 5. Invalid model output fails closed and falls back to the agent-mediated submission prompt instead of posting unverified text.
-6. `COMMENT` line items are posted as inline review comments. `MODIFY` line edits are posted as inline comments containing a suggested diff. On GitHub, `COMMENT` file/all-lines items become the review body. On provider, they use the native file-comment anchor. `DISCUSS` items are never submitted.
-7. Approval refuses self-approval with a clear message. GitHub `request changes` requires a body or at least one inline comment; provider requires a review body.
-8. provider metadata, identity, and submission use `provider-cli api`. Immediately before posting, pi-code-diff verifies that the live base and head SHAs still match the reviewed target. The verdict, body, line comments, and file comments are then sent in one atomic review request. Malformed output, authentication errors, target drift, unsupported comment locations, and command failures stop without a fallback post.
+6. `COMMENT` line items are posted as inline review comments. `MODIFY` line edits are posted as inline comments containing a suggested diff. File-comment and atomic-review behavior comes from provider capabilities. `DISCUSS` items are never submitted.
+7. Approval refuses self-approval with a clear message. Body and comment requirements come from provider capabilities.
+8. Metadata, identity, drift validation, routes, response fields, and submission behavior come from the local provider settings. Malformed output, authentication errors, head drift, unsupported comment locations, and command failures stop without a fallback post.
 
-`Start discussion with agents` skips GitHub entirely and stages only the `DISCUSS` items as the prompt for an agent conversation. When an agent opened the review with `open_code_diff`, that prompt returns to the waiting agent; after a direct `/diff remote`, it stays in Pi's editor for you to submit. The `DISCUSS` items are consumed when the discussion starts, while existing `COMMENT` and `MODIFY` items stay in the saved review for the PR author.
+`Start discussion with agents` skips the remote provider entirely and stages only the `DISCUSS` items as the prompt for an agent conversation. When an agent opened the review with `open_code_diff`, that prompt returns to the waiting agent; after a direct `/diff remote`, it stays in Pi's editor for you to submit. The `DISCUSS` items are consumed when the discussion starts, while existing `COMMENT` and `MODIFY` items stay in the saved review for the PR author.
 
 If the discussion produces material findings, the agent asks `Want me to prepopulate the findings as comments?` before adding any confirmed findings as editable `COMMENT` items. It then asks `Good to continue the review?`; only that confirmation reopens the saved review. If the PR head changed during the discussion, pi-code-diff starts a fresh review instead of applying saved comments to stale line mappings.
 
@@ -224,7 +223,7 @@ This distinction is central to how `/diff` works.
 
 #### DISCUSS
 
-Use `DISCUSS` (`d` on a line, `a` for all lines in the current file) when you want explanation, rationale, tradeoffs, or a proposal. It is agent-only and never touches GitHub. In a remote PR review, `Start discussion with agents` consumes only these items, keeps `COMMENT` and `MODIFY` items in the saved review, and resumes that review only after you confirm the conversation is done. A fix can still come out of a discussion, but the agent answers in prose first rather than editing to satisfy the note.
+Use `DISCUSS` (`d` on a line, `a` for all lines in the current file) when you want explanation, rationale, tradeoffs, or a proposal. It is agent-only and never touches the remote provider. In a remote PR review, `Start discussion with agents` consumes only these items, keeps `COMMENT` and `MODIFY` items in the saved review, and resumes that review only after you confirm the conversation is done. A fix can still come out of a discussion, but the agent answers in prose first rather than editing to satisfy the note.
 
 Examples:
 
@@ -234,7 +233,7 @@ Examples:
 
 #### COMMENT
 
-Use `COMMENT` (`c` on a line, `l` on a file) for review remarks. When the review is a remote GitHub PR, these post as real GitHub review comments, mirroring GitHub: inline on the line when the note has a line, or a general PR comment otherwise. For a local review there is nothing to post, so a `COMMENT` becomes actionable feedback to the agent: questions should be answered in prose, and comments that ask for changes or state a preferred implementation should be handled with local edits.
+Use `COMMENT` (`c` on a line, `l` on a file) for review remarks. In configured remote reviews, these post as real review comments: inline on the line when the note has a line, or as a general comment when the provider supports it. For a local review there is nothing to post, so a `COMMENT` becomes actionable feedback to the agent: questions should be answered in prose, and comments that ask for changes or state a preferred implementation should be handled with local edits.
 
 Examples:
 
@@ -262,11 +261,11 @@ When the review UI generates the local prompt, it uses different wording dependi
 
 #### Global
 
-- `1 / 2 / 3 / 4` — toggle Navigator, Diff, Comments, or PR context; pane visibility is restored in the next code-diff review
+- `1 / 2 / 3 / 4 / 5` — toggle Navigator, Diff, Comments, PR context, or Replies; pane visibility is restored in the next code-diff review
 - `Alt+1 / Alt+2 / Alt+3` — switch scope
 - mouse drag — use normal terminal/tmux text selection and copy behavior
 - mouse wheel — scroll the pane under the cursor in Pi fullscreen mode
-- `Tab` / `Shift+Tab` — cycle focus forward / backward
+- `Tab` / `Shift+Tab` — cycle focus forward / backward through the visible panes, including PR context and Replies when available
 - `/` — search the focused pane: files in Navigator, code in Diff, comments in Comments
 - `Esc` while searching — clear that pane's search
 - `n / N` — jump to the next / previous search match in the focused pane
@@ -276,7 +275,7 @@ When the review UI generates the local prompt, it uses different wording dependi
 - `u` — toggle unchanged context in diff scopes
 - `h` — hide/show the Comments pane as an alias for `3`
 - `s` — insert the generated prompt into the editor
-- `Esc` — request review exit; confirms before discarding draft feedback
+- `Esc` — request review exit; when there is draft feedback or reviewed-file state, confirm with `p` to park the review for later or `d` to discard it
 - `Ctrl+C` — request review exit with the same confirmation flow
 
 #### Navigator
@@ -312,7 +311,7 @@ New reviews select the first file in the visible Navigator order. Locale and tra
 - `y` — copy the selected source, or the selected comment when Comments is focused
 - `Y` — copy `path:start-end` for the selected source
 - `P` — copy a unified patch snippet, using the saved `MODIFY` replacement when present
-- `S` — copy a GitHub suggestion block, using the saved `MODIFY` replacement when present
+- `S` — copy a suggestion block, using the saved `MODIFY` replacement when present
 - `c` — line `COMMENT`
 - `d` — line `DISCUSS`
 - `e` — edit the existing line comment on the selected line
@@ -344,6 +343,34 @@ Line comment markers in the diff gutter:
 - `y` — copy selected comment
 - `A` — toggle active-file comments and the cross-file comments overview
 
+#### PR context panel
+
+The fourth pane exists only in configured remote PR reviews. It joins the normal focus cycle there and stays hidden and unfocusable in local reviews, where `4` reports that PR context is not available.
+
+- `↑↓` or `j/k` — scroll the PR context text one line at a time
+- `Ctrl+d` / `Ctrl+u` — scroll by half a pane
+- `Ctrl+f` / `Ctrl+b` or `PageDown` / `PageUp` — scroll by a full pane
+- `gg / G` — jump to the top / bottom
+- mouse wheel — focus the pane under the cursor and scroll it
+- `Enter` — open the PR in your browser at any scroll position
+
+`Enter` opens the canonical PR URL only, and only when it is a plain `http`/`https` address. The browser is launched detached (`open`, `xdg-open`, or `rundll32 url.dll,FileProtocolHandler`) without a shell, so the review UI is never suspended. When no browser can be launched, the URL is copied to the clipboard and the status line says so. Search is not available in this pane.
+
+#### Replies panel
+
+The fifth pane appears for remote PR reviews that can read replies to comments you authored. It is read-only: refreshing, opening, or analyzing a reply never posts or changes anything on the pull request. Pressing `5` when Replies is unavailable reports that instead of opening an empty pane.
+
+- `↑↓` or `j/k` — select a reply
+- `Ctrl+d` / `Ctrl+u` — move by half a pane
+- `Ctrl+f` / `Ctrl+b` or `PageDown` / `PageUp` — move by a full pane
+- `gg / G` — jump to the first / last reply
+- mouse wheel — focus Replies and move the selection
+- `Enter` — open the selected reply in your browser
+- `r` — refresh replies for the current PR
+- `A` — ask the active Pi model for a read-only analysis of the selected reply
+
+Reply text is treated as untrusted input before analysis, and the generated analysis stays in the pane. Search and unrelated Diff or Comments actions are unavailable while Replies is focused.
+
 #### Editor
 
 The note editor opens inline in the diff, directly under the line you are annotating, so you type your note in place instead of in the comments panel. File and all-lines notes open the editor at the top of the diff pane.
@@ -374,31 +401,59 @@ This is designed for repetitive review patterns like:
 
 If you want to refine the templated text after applying it, press `e` on that line.
 
-### Shortcut configuration
+### Provider settings
 
-Optional user-level config file:
+Remote providers and repository profiles are local-only configuration:
 
-- `~/.pi/agent/extensions/code-diff.json`
+- `~/.pi/agent/pi-code-diff-settings.json`
 
-Example:
+Do not commit this file. Provider IDs, executable names, hosts, URL patterns, command arguments, refs, response fields, and capabilities are loaded from it at runtime.
 
 ```json
 {
   "version": 1,
-  "globalShortcut": "ctrl+alt+r",
+  "providers": {
+    "primary": {
+      "label": "Primary code host",
+      "executable": "provider-cli",
+      "urls": {
+        "patterns": [{ "host": "code.example", "path": "/{repo}/change/{number}" }],
+        "canonical": "https://code.example/{repo}/change/{number}",
+        "clone": "https://code.example/{repo}.git"
+      },
+      "operations": {
+        "identity": { "args": ["identity", "--json"] },
+        "pullRequest": { "args": ["change", "show", "{repo}", "{number}"] }
+      },
+      "refs": { "head": "refs/changes/{number}/head" },
+      "fields": { "identityLogin": "actor.name", "number": "number" },
+      "capabilities": { "fileComments": false }
+    }
+  },
   "repositories": {
     "example/widgets": {
       "cwd": "/absolute/path/to/monorepo",
       "subdir": "packages/widgets",
       "pathspecs": ["packages/widgets", "shared/ui"],
-      "importAliases": {
-        "@workspace/shared": "shared/ui"
-      }
+      "importAliases": { "@workspace/shared": "shared/ui" }
     }
-  },
-  "builtins": {
-    "disable": ["restore-deleted"]
-  },
+  }
+}
+```
+
+The settings parser rejects unknown fields and malformed values. Missing settings disable configured remote-provider actions without blocking local diff review.
+
+### Shortcut configuration
+
+Optional shortcut config:
+
+- `~/.pi/agent/extensions/code-diff.json`
+
+```json
+{
+  "version": 1,
+  "globalShortcut": "ctrl+alt+r",
+  "builtins": { "disable": ["restore-deleted"] },
   "shortcuts": [
     {
       "id": "trace-added",
@@ -412,14 +467,11 @@ Example:
 }
 ```
 
-#### Fields
-
 - `version` — schema version, currently `1`
-- `globalShortcut` — global Pi shortcut that opens the review UI, defaults to `alt+s`. Use Pi key identifiers such as `alt+s`, `ctrl+alt+r`, `shift+f5`, or `f5`. Single printable characters require a modifier, so normal typing stays in the editor. Bare special keys such as `f5`, `home`, and `pageUp` are supported. Escape is supported as `escape` or `esc` without modifiers. The shortcut is registered when the extension loads; restart Pi or run `/reload` after changing it. If the configured shortcut is invalid, pi-code-diff uses `alt+s` and shows a config warning.
-- `repositories` — optional remote repository profiles. Each entry accepts a checkout `cwd` or `path`, a default workspace `subdir`, review `pathspecs`, and JavaScript/TypeScript `importAliases`. Configured checkouts are validated against their `origin` before use.
-- Review display preferences are stored in `code-diff-preferences.json`; in-progress versioned sessions are stored under Pi's local `cache/pi-code-diff/sessions` directory and removed after submit or explicit discard.
+- `globalShortcut` — global Pi shortcut that opens the review UI, defaults to `alt+s`
 - `builtins.disable` — built-in shortcut ids to turn off
-- `shortcuts` — your custom shortcuts
+- `shortcuts` — custom comment shortcuts
+- Review display preferences are stored in `code-diff-preferences.json`; in-progress sessions are stored under Pi's local `cache/pi-code-diff/sessions` directory.
 
 Each shortcut has:
 

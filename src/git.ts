@@ -327,7 +327,14 @@ function toDisplayPath(change: ChangedPath): string {
   return change.newPath ?? change.oldPath ?? "(unknown)";
 }
 
-function toComparison(change: ChangedPath, stats?: ChangeStats, revisions?: { originalRevision?: string | null; modifiedRevision?: string | null }): ReviewFileComparison {
+function toComparison(
+  change: ChangedPath,
+  stats?: ChangeStats,
+  revisions?: { originalRevision?: string | null; modifiedRevision?: string | null },
+  raw?: RawDiffChange,
+): ReviewFileComparison {
+  const originalBlobSha = raw == null ? undefined : readComparisonBlobSha(change.oldPath, raw.oldSha);
+  const modifiedBlobSha = raw == null ? undefined : readComparisonBlobSha(change.newPath, raw.newSha);
   return {
     status: change.status,
     oldPath: change.oldPath,
@@ -339,6 +346,8 @@ function toComparison(change: ChangedPath, stats?: ChangeStats, revisions?: { or
     deletions: stats?.deletions,
     originalRevision: revisions?.originalRevision,
     modifiedRevision: revisions?.modifiedRevision,
+    ...(originalBlobSha === undefined ? {} : { originalBlobSha }),
+    ...(modifiedBlobSha === undefined ? {} : { modifiedBlobSha }),
   };
 }
 
@@ -442,7 +451,12 @@ function inferWorkspacePath(repoRoot: string, cwd: string): string | undefined {
 }
 
 function normalizeDiffSha(sha: string): string | null {
-  return /^0+$/.test(sha) ? null : sha;
+  return sha.length === 0 || /^0+$/.test(sha) ? null : sha;
+}
+
+function readComparisonBlobSha(path: string | null, sha: string): string | null | undefined {
+  if (path == null) return null;
+  return normalizeDiffSha(sha) ?? undefined;
 }
 
 function isSubmoduleRawChange(change: RawDiffChange): boolean {
@@ -812,14 +826,14 @@ export async function getReviewWindowData(pi: ExtensionAPI, cwd: string, options
     seed.worktreeStatus = change.status;
     seed.hasWorkingTreeFile = change.newPath != null;
     seed.inGitDiff = true;
-    seed.gitDiff = toComparison(change, worktreeStats.get(normalizeGitPath(key)));
+    seed.gitDiff = toComparison(change, worktreeStats.get(normalizeGitPath(key)), undefined, worktreeRaw.get(normalizeGitPath(key)));
   }
 
   for (const change of branchChanges) {
     const key = getChangeKey(change);
     const seed = upsertSeed(seeds, key, () => createSeed(key, change.newPath != null && currentPathSet.has(change.newPath)));
     seed.inAllFiles = true;
-    seed.allFiles = toComparison(change, branchStats.get(normalizeGitPath(key)));
+    seed.allFiles = toComparison(change, branchStats.get(normalizeGitPath(key)), undefined, branchRaw.get(normalizeGitPath(key)));
     seed.allFilesReferenceCount = branchReferenceGraph.counts.get(normalizeGitPath(key)) ?? 0;
     seed.allFilesOutgoingReferences = branchReferenceGraph.outgoing.get(normalizeGitPath(key)) ?? [];
     seed.allFilesIncomingReferences = branchReferenceGraph.incoming.get(normalizeGitPath(key)) ?? [];
@@ -829,7 +843,7 @@ export async function getReviewWindowData(pi: ExtensionAPI, cwd: string, options
     const key = getChangeKey(change);
     const seed = upsertSeed(seeds, key, () => createSeed(key, change.newPath != null && currentPathSet.has(change.newPath)));
     seed.inLastCommit = true;
-    seed.lastCommit = toComparison(change, lastCommitStats.get(normalizeGitPath(key)));
+    seed.lastCommit = toComparison(change, lastCommitStats.get(normalizeGitPath(key)), undefined, lastCommitRaw.get(normalizeGitPath(key)));
   }
 
   const markSubmodules = async (scope: ReviewScope, rawChanges: Map<string, RawDiffChange>, stats: Map<string, ChangeStats>): Promise<void> => {
@@ -840,13 +854,13 @@ export async function getReviewWindowData(pi: ExtensionAPI, cwd: string, options
         seed.worktreeStatus = raw.status;
         seed.hasWorkingTreeFile = raw.newPath != null;
         seed.inGitDiff = true;
-        seed.gitDiff ??= toComparison(raw, stats.get(key));
+        seed.gitDiff ??= toComparison(raw, stats.get(key), undefined, raw);
       } else if (scope === "last-commit") {
         seed.inLastCommit = true;
-        seed.lastCommit ??= toComparison(raw, stats.get(key));
+        seed.lastCommit ??= toComparison(raw, stats.get(key), undefined, raw);
       } else {
         seed.inAllFiles = true;
-        seed.allFiles ??= toComparison(raw, stats.get(key));
+        seed.allFiles ??= toComparison(raw, stats.get(key), undefined, raw);
       }
       seed.submodule = { ...(seed.submodule ?? {}), [scope]: await resolveSubmoduleInfo(pi, repoRoot, raw) };
     }
@@ -908,7 +922,7 @@ export async function getReviewWindowDataForRevisionRange(pi: ExtensionAPI, cwd:
     seed.allFiles = toComparison(change, branchStats.get(normalizeGitPath(key)), {
       originalRevision: resolvedBaseRevision,
       modifiedRevision,
-    });
+    }, branchRaw.get(normalizeGitPath(key)));
     seed.allFilesReferenceCount = branchReferenceGraph.counts.get(normalizeGitPath(key)) ?? 0;
     seed.allFilesOutgoingReferences = branchReferenceGraph.outgoing.get(normalizeGitPath(key)) ?? [];
     seed.allFilesIncomingReferences = branchReferenceGraph.incoming.get(normalizeGitPath(key)) ?? [];
@@ -921,7 +935,7 @@ export async function getReviewWindowDataForRevisionRange(pi: ExtensionAPI, cwd:
     seed.allFiles ??= toComparison(raw, branchStats.get(key), {
       originalRevision: resolvedBaseRevision,
       modifiedRevision,
-    });
+    }, raw);
     seed.submodule = { ...(seed.submodule ?? {}), "all-files": await resolveSubmoduleInfo(pi, repoRoot, raw) };
   }
 

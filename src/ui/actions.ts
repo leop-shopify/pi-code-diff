@@ -11,7 +11,7 @@ export interface ReviewActionDefinition {
 
 export const REVIEW_ACTIONS: ReviewActionDefinition[] = [
   { id: "scope", section: "Core", keys: "Alt+1/2/3", label: "switch review scope" },
-  { id: "panes", section: "Core", keys: "1/2/3/4", label: "toggle Navigator/Diff/Comments/PR context", footer: true },
+  { id: "panes", section: "Core", keys: "1/2/3/4/5", label: "toggle Navigator/Diff/Comments/PR context/Replies", footer: true },
   { id: "focus", section: "Core", keys: "Tab / Shift+Tab", label: "cycle focus", footer: true },
   { id: "search", section: "Core", keys: "/", label: "search focused pane • n/N next/prev search", footer: true },
   { id: "help", section: "Core", keys: "?", label: "toggle help/actions", inputs: ["?"], footer: true },
@@ -27,6 +27,7 @@ export const REVIEW_ACTIONS: ReviewActionDefinition[] = [
   { id: "fullPage", section: "Navigation", keys: "Ctrl+f/b • PageDown/PageUp", label: "full page" },
   { id: "boundary", section: "Navigation", keys: "gg/G", label: "top/bottom" },
   { id: "tree", section: "Navigation", keys: "T", label: "tree/flat files", inputs: ["T"] },
+  { id: "order", section: "Navigation", keys: "O", label: "risk/alphabetical file order", inputs: ["O"] },
   { id: "locales", section: "Navigation", keys: "L", label: "show/hide other locales", inputs: ["L"] },
   { id: "reviewed", section: "Navigation", keys: "R", label: "mark reviewed", inputs: ["R"] },
   { id: "unreviewed", section: "Navigation", keys: "]/ [", label: "next/previous unreviewed", inputs: ["]", "["] },

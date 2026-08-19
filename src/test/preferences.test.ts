@@ -34,19 +34,23 @@ describe("review preferences", () => {
         diff: true,
         comments: false,
         context: true,
+        replies: true,
       },
     });
 
     expect(loadReviewPreferences()).toEqual({
       diffViewMode: "side-by-side",
       navigatorTreeMode: false,
+      navigatorFileOrder: "risk",
       contextLineNavigation: true,
       commentsGlobal: true,
+      lastReviewVerdict: null,
       paneVisibility: {
         navigator: false,
         diff: true,
         comments: false,
         context: true,
+        replies: true,
       },
     });
 
@@ -60,6 +64,22 @@ describe("review preferences", () => {
         context: true,
       },
     });
+  });
+
+  it("remembers the navigator file order and the last submitted verdict", () => {
+    saveReviewPreference({ navigatorFileOrder: "alphabetical" });
+    saveReviewPreference({ lastReviewVerdict: "approve" });
+
+    expect(loadReviewPreferences()).toMatchObject({ navigatorFileOrder: "alphabetical", lastReviewVerdict: "approve" });
+  });
+
+  it("falls back to defaults for unknown order and verdict values", async () => {
+    await writeFile(process.env.PI_CODE_DIFF_PREFERENCES_PATH!, JSON.stringify({
+      navigatorFileOrder: "random",
+      lastReviewVerdict: "merge",
+    }), "utf8");
+
+    expect(loadReviewPreferences()).toMatchObject({ navigatorFileOrder: "risk", lastReviewVerdict: null });
   });
 
   it("fills missing pane visibility keys from defaults", async () => {

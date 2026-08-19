@@ -121,13 +121,13 @@ export function setActiveFileId(state: ReviewState, files: ReviewFile[], fileId:
 }
 
 export function cycleFocus(state: ReviewState): ReviewState {
-  const order: ReviewFocus[] = ["navigator", "diff", "comments"];
+  const order: ReviewFocus[] = ["navigator", "diff", "comments", "context"];
   const index = order.indexOf(state.focus);
   return { ...state, focus: order[(index + 1) % order.length]! };
 }
 
 export function cycleFocusBackward(state: ReviewState): ReviewState {
-  const order: ReviewFocus[] = ["navigator", "diff", "comments"];
+  const order: ReviewFocus[] = ["navigator", "diff", "comments", "context"];
   const index = order.indexOf(state.focus);
   return { ...state, focus: order[(index - 1 + order.length) % order.length]! };
 }

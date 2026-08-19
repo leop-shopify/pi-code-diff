@@ -13,6 +13,8 @@ export interface ReviewFileComparison {
   deletions?: number;
   originalRevision?: string | null;
   modifiedRevision?: string | null;
+  originalBlobSha?: string | null;
+  modifiedBlobSha?: string | null;
 }
 
 export interface ReviewSubmoduleInfo {
@@ -53,6 +55,38 @@ export interface ReviewContextPanelSource {
   title: string;
   loadingText: string;
   load: () => Promise<string>;
+  /** Canonical http(s) URL opened from the PR context pane. */
+  url?: string;
+}
+
+export interface ReviewReplyItem {
+  /** Stable selection key: `<threadId>:<commentId>`. */
+  id: string;
+  threadId: string;
+  commentId: string;
+  author: string;
+  /** Bounded, control-character-escaped reply text. Never rendered raw. */
+  body: string;
+  createdAt?: string;
+  url?: string;
+  path?: string;
+  line: number | null;
+  resolved: boolean;
+}
+
+export interface ReviewRepliesSnapshot {
+  replies: ReviewReplyItem[];
+  selfLogin: string;
+  fetchedAt: string;
+}
+
+export interface ReviewRepliesPanelSource {
+  title: string;
+  loadingText: string;
+  /** Reads only the current pull request; the pane never queues a second one. */
+  load: () => Promise<ReviewRepliesSnapshot>;
+  /** On-demand, read-only analysis. Never posts anything back to the provider. */
+  analyze?: (reply: ReviewReplyItem) => Promise<string>;
 }
 
 export type CommentSide = "added" | "deleted" | "file";
@@ -80,7 +114,7 @@ export interface ReviewDraft {
   comments: DiffReviewComment[];
 }
 
-export type ReviewFocus = "navigator" | "diff" | "comments";
+export type ReviewFocus = "navigator" | "diff" | "comments" | "context" | "replies";
 
 export interface ReviewLineTarget {
   side: Exclude<CommentSide, "file">;
@@ -106,8 +140,12 @@ export interface ReviewSubmitPayload extends ReviewDraft {
   type: "submit";
 }
 
+export type ReviewExitDisposition = "park" | "discard";
+
 export interface ReviewCancelPayload {
   type: "cancel";
+  /** Park keeps the saved session for a later resume; discard deletes it. Defaults to park. */
+  disposition?: ReviewExitDisposition;
 }
 
 export type ReviewResult = ReviewSubmitPayload | ReviewCancelPayload;

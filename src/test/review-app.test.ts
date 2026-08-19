@@ -2,7 +2,7 @@ import { visibleWidth } from "@earendil-works/pi-tui";
 import { describe, expect, it } from "vitest";
 import { buildStructuredDiff } from "../diff.js";
 import type { DiffReviewComment, ReviewFile, ReviewState } from "../types.js";
-import { buildCommentPanelEmptyStateLines, buildCommentPanelTextLines, buildContextPanelLines, buildDiffActionHintLine, buildDisplayRows, buildEditorLaunchCommand, buildFooterLines, buildHelpPanelLines, buildModifyPreviewLines, buildSelectionClipboardText, buildSideBySideDisplayRows, diffTextMatchesSearch, fitFooterLines, formatFocusStatus, formatPaneTitle, formatSelectedLineTargetLabel, getCancelAction, getChangedLineTargets, getDraftCommentCount, getEditorLineForTarget, getHalfPageStep, getMatchingDiffLineTargets, getMeasuredPageRange, getNavigatorGroup, getNavigatorMoveIndex, getNextSearchIndex, getPaneLayout, getPaneLayoutForVisibility, getPaneLayoutWithContext, getRelatedFileMarker, getRelatedFilePanelSections, getRelatedFilePaths, getReviewVerticalLayout, getSideBySideColumnTarget, getSideBySideLineTargets, getSideBySidePairedLineTarget, getSourceLineRangeText, getStableDiffScroll, getStackedPaneLayout, getStackedPaneLayoutForVisibility, getStackedPaneLayoutWithContext, getVirtualRowRange, groupNavigatorFiles, isUnchangedModify, parseMouseWheelInput, renderCenteredOverlay, setBoundedMapEntry, shouldStackPanes, shouldStackPanesWithContext } from "../ui/review-app.js";
+import { buildCommentPanelEmptyStateLines, buildCommentPanelTextLines, buildContextPanelLines, buildDiffActionHintLine, buildDisplayRows, buildEditorLaunchCommand, buildFooterLines, buildReviewHeaderLine, buildReviewHeaderText, buildHelpPanelLines, buildModifyPreviewLines, buildSelectionClipboardText, buildSideBySideDisplayRows, diffTextMatchesSearch, fitFooterLines, formatFocusStatus, formatPaneTitle, formatSelectedLineTargetLabel, getCancelAction, getChangedLineTargets, getDraftCommentCount, getEditorLineForTarget, getHalfPageStep, getMatchingDiffLineTargets, getMeasuredPageRange, getNavigatorGroup, getNavigatorMoveIndex, getNextSearchIndex, getPaneLayout, getPaneLayoutForVisibility, getPaneLayoutWithContext, getRelatedFileMarker, getRelatedFilePanelSections, getRelatedFilePaths, getReviewVerticalLayout, getSideBySideColumnTarget, getSideBySideLineTargets, getSideBySidePairedLineTarget, getSourceLineRangeText, getStableDiffScroll, getStackedPaneLayout, getStackedPaneLayoutForVisibility, getStackedPaneLayoutWithContext, getVirtualRowRange, groupNavigatorFiles, isUnchangedModify, parseMouseWheelInput, renderCenteredOverlay, setBoundedMapEntry, shouldStackPanes, shouldStackPanesWithContext } from "../ui/review-app.js";
 
 function makeFile(path: string, flags?: Partial<ReviewFile>): ReviewFile {
   return {
@@ -255,6 +255,7 @@ describe("pane layout", () => {
       diff: true,
       comments: true,
       context: false,
+      replies: false,
     });
 
     expect(layout.navigatorWidth).toBe(0);
@@ -268,6 +269,7 @@ describe("pane layout", () => {
       diff: true,
       comments: false,
       context: true,
+      replies: false,
     });
 
     expect(layout.commentsWidth).toBe(0);
@@ -315,11 +317,13 @@ describe("pane layout", () => {
       diff: true,
       comments: false,
       context: true,
+      replies: false,
     })).toEqual({
       navigatorHeight: 0,
       diffHeight: 7,
       commentsHeight: 0,
       contextHeight: 4,
+      repliesHeight: 0,
     });
   });
 
@@ -329,11 +333,13 @@ describe("pane layout", () => {
       diff: true,
       comments: true,
       context: true,
+      replies: false,
     }, 2)).toEqual({
       navigatorHeight: 2,
       diffHeight: 4,
       commentsHeight: 2,
       contextHeight: 2,
+      repliesHeight: 0,
     });
   });
 });
@@ -400,9 +406,10 @@ describe("cancel helpers", () => {
     expect(getDraftCommentCount(makeState({ allComment: "Explain the diff.", comments: [lineComment] }))).toBe(2);
   });
 
-  it("confirms cancellation when draft feedback exists", () => {
+  it("confirms cancellation when draft feedback or reviewed-file state exists", () => {
     expect(getCancelAction(makeState())).toBe("cancel");
     expect(getCancelAction(makeState({ comments: [lineComment] }))).toBe("confirm");
+    expect(getCancelAction(makeState(), 2)).toBe("confirm");
   });
 });
 
@@ -461,6 +468,38 @@ describe("focused panel feedback", () => {
     expect(formatFocusStatus("navigator")).toBe("Focus: Navigator");
     expect(formatFocusStatus("diff")).toBe("Focus: Diff");
     expect(formatFocusStatus("comments")).toBe("Focus: Comments");
+    expect(formatFocusStatus("replies")).toBe("Focus: Replies");
+  });
+});
+
+describe("persistent review header", () => {
+  const info = {
+    identity: "example/widgets#1",
+    title: "Add review mode",
+    state: "OPEN",
+    revision: "b".repeat(40),
+    queue: { position: 2, total: 5 },
+    openThreads: 3,
+    awaitingReply: 1,
+  };
+
+  it("shows PR identity, queue position, revision, progress, and thread counts", () => {
+    expect(buildReviewHeaderText(info, { files: 12, reviewed: 4, comments: 2 })).toBe(
+      "example/widgets#1 • Add review mode • OPEN • queue 2/5 • @bbbbbbb • 4/12 reviewed • 2 comments • 3 open threads, 1 awaiting reply",
+    );
+  });
+
+  it("drops the parts the caller did not supply", () => {
+    expect(buildReviewHeaderText({ identity: "example/widgets#7" }, { files: 1, reviewed: 0, comments: 1 })).toBe(
+      "example/widgets#7 • 0/1 reviewed • 1 comment",
+    );
+  });
+
+  it("fits the header into the frame width", () => {
+    const line = buildReviewHeaderLine(plainTheme as any, 30, info, { files: 12, reviewed: 4, comments: 2 });
+
+    expect(visibleWidth(line)).toBeLessThanOrEqual(30);
+    expect(line.startsWith("example/widgets#1")).toBe(true);
   });
 });
 
@@ -470,7 +509,7 @@ describe("action and shortcut help rendering", () => {
     const text = lines.join(" ");
 
     expect(lines.length).toBeGreaterThan(2);
-    expect(text).toContain("1/2/3/4 toggle Navigator/Diff/Comments/PR context");
+    expect(text).toContain("1/2/3/4/5 toggle Navigator/Diff/Comments/PR context/Replies");
     expect(text).toContain("Esc / Ctrl+C exit");
     expect(text).not.toContain("navigator:");
     expect(text).not.toContain("diff:");

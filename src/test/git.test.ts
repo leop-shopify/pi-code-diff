@@ -220,6 +220,7 @@ describe("git helpers", () => {
       if (key === "merge-base base head") return { code: 0, stdout: "merged-base\n", stderr: "" };
       if (key === "diff --find-renames -M --name-status merged-base head -- packages/widget") return { code: 0, stdout: "M\tpackages/widget/src/app.ts\n", stderr: "" };
       if (key === "diff --find-renames -M --numstat merged-base head -- packages/widget") return { code: 0, stdout: "2\t1\tpackages/widget/src/app.ts\n", stderr: "" };
+      if (key === "diff --find-renames -M --raw -z merged-base head -- packages/widget") return { code: 0, stdout: ":100644 100644 aaa111 bbb222 M\0packages/widget/src/app.ts\0", stderr: "" };
       if (key === "cat-file -s head:packages/widget/src/app.ts") return { code: 0, stdout: "20\n", stderr: "" };
       if (key === "show head:packages/widget/src/app.ts") return { code: 0, stdout: "export const app = 1;\n", stderr: "" };
       return { code: 1, stdout: "", stderr: `unexpected command: ${key}` };
@@ -236,6 +237,7 @@ describe("git helpers", () => {
     expect(data.branchBaseRevision).toBe("merged-base");
     expect(data.workspacePath).toBe("packages/widget");
     expect(data.files).toHaveLength(1);
+    expect(data.files[0]?.allFiles).toMatchObject({ originalBlobSha: "aaa111", modifiedBlobSha: "bbb222" });
   });
 
   it("marks nested submodule ranges and loads their explicit revisions", async () => {

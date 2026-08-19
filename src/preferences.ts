@@ -6,19 +6,26 @@ import { getShortcutConfigPath } from "./shortcuts.js";
 
 export type PersistedDiffViewMode = "unified" | "side-by-side";
 
+export type PersistedNavigatorFileOrder = "risk" | "alphabetical";
+
+export type PersistedReviewVerdict = "approve" | "request_changes" | "comment";
+
 export interface ReviewPaneVisibility {
   navigator: boolean;
   diff: boolean;
   comments: boolean;
   context: boolean;
+  replies: boolean;
 }
 
 export interface ReviewPreferences {
   diffViewMode: PersistedDiffViewMode;
   navigatorTreeMode: boolean;
+  navigatorFileOrder: PersistedNavigatorFileOrder;
   contextLineNavigation: boolean;
   commentsGlobal: boolean;
   paneVisibility: ReviewPaneVisibility;
+  lastReviewVerdict: PersistedReviewVerdict | null;
 }
 
 export const DEFAULT_REVIEW_PANE_VISIBILITY: ReviewPaneVisibility = {
@@ -26,14 +33,17 @@ export const DEFAULT_REVIEW_PANE_VISIBILITY: ReviewPaneVisibility = {
   diff: true,
   comments: true,
   context: true,
+  replies: true,
 };
 
 export const DEFAULT_REVIEW_PREFERENCES: ReviewPreferences = {
   diffViewMode: "unified",
   navigatorTreeMode: true,
+  navigatorFileOrder: "risk",
   contextLineNavigation: false,
   commentsGlobal: false,
   paneVisibility: DEFAULT_REVIEW_PANE_VISIBILITY,
+  lastReviewVerdict: null,
 };
 
 function getPreferencesPath(): string {
@@ -42,6 +52,14 @@ function getPreferencesPath(): string {
 
 function isPersistedDiffViewMode(value: unknown): value is PersistedDiffViewMode {
   return value === "unified" || value === "side-by-side";
+}
+
+function isPersistedNavigatorFileOrder(value: unknown): value is PersistedNavigatorFileOrder {
+  return value === "risk" || value === "alphabetical";
+}
+
+function isPersistedReviewVerdict(value: unknown): value is PersistedReviewVerdict {
+  return value === "approve" || value === "request_changes" || value === "comment";
 }
 
 function defaultReviewPreferences(): ReviewPreferences {
@@ -58,6 +76,7 @@ function loadPaneVisibility(value: unknown): ReviewPaneVisibility {
     diff: typeof record.diff === "boolean" ? record.diff : DEFAULT_REVIEW_PANE_VISIBILITY.diff,
     comments: typeof record.comments === "boolean" ? record.comments : DEFAULT_REVIEW_PANE_VISIBILITY.comments,
     context: typeof record.context === "boolean" ? record.context : DEFAULT_REVIEW_PANE_VISIBILITY.context,
+    replies: typeof record.replies === "boolean" ? record.replies : DEFAULT_REVIEW_PANE_VISIBILITY.replies,
   };
 }
 
@@ -72,6 +91,8 @@ export function loadReviewPreferences(): ReviewPreferences {
     return {
       diffViewMode: isPersistedDiffViewMode(record.diffViewMode) ? record.diffViewMode : DEFAULT_REVIEW_PREFERENCES.diffViewMode,
       navigatorTreeMode: typeof record.navigatorTreeMode === "boolean" ? record.navigatorTreeMode : DEFAULT_REVIEW_PREFERENCES.navigatorTreeMode,
+      navigatorFileOrder: isPersistedNavigatorFileOrder(record.navigatorFileOrder) ? record.navigatorFileOrder : DEFAULT_REVIEW_PREFERENCES.navigatorFileOrder,
+      lastReviewVerdict: isPersistedReviewVerdict(record.lastReviewVerdict) ? record.lastReviewVerdict : DEFAULT_REVIEW_PREFERENCES.lastReviewVerdict,
       contextLineNavigation: typeof record.contextLineNavigation === "boolean" ? record.contextLineNavigation : DEFAULT_REVIEW_PREFERENCES.contextLineNavigation,
       commentsGlobal: typeof record.commentsGlobal === "boolean" ? record.commentsGlobal : DEFAULT_REVIEW_PREFERENCES.commentsGlobal,
       paneVisibility: loadPaneVisibility(record.paneVisibility),

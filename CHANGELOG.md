@@ -1,10 +1,26 @@
 # Changelog
 
+## 0.4.1 - 2026-08-18
+
+### Added
+
+- Keep parked review comments aligned across pushes and rebases: unchanged files retain exact anchors, changed files are flagged for another look, and comments from removed files move into the review-wide note.
+- Open a newest-first picker with `/diff --resume` and clean up parked reviews after 30 days without an update.
+- Sort Navigator files by review risk from unresolved threads, blast radius, and change size; toggle risk and alphabetical order with `O`.
+- Open pull requests and selected review replies in the browser without suspending the review UI.
+- Track replies to review comments in a fifth read-only pane with refresh, browser-open, and opt-in analysis actions.
+- Remember the last review verdict and ask explicitly whether to park or discard draft work when exiting.
+
+### Fixed
+
+- Validate agent-supplied pull request context against the live repository, number, provider, and head revision before using it.
+- Save bounded local review receipts only after confirmed successful submissions and protect them with owner-only permissions on POSIX systems.
+
 ## 0.4.0 - 2026-08-13
 
 ### Added
 
-- Review review-host and provider pull requests through the existing `/diff remote` workflow.
+- Review pull requests from additional locally configured providers through the existing `/diff remote` workflow.
 
 ## 0.3.6 - 2026-08-12
 

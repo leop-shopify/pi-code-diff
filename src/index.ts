@@ -6,11 +6,17 @@ import { truncateToWidth, type Component, type TUI } from "@earendil-works/pi-tu
 import { Type } from "typebox";
 import { getReviewWindowData, getReviewWindowDataForRevisionRange, loadReviewFileContents, type ReviewWindowData, type ReviewWindowOptions } from "./git.js";
 import { composeDiscussionPrompt, composeReviewPrompt } from "./prompt.js";
+import { parsePullRequestHandoff, type PullRequestHandoff } from "./pr-handoff.js";
 import { createRemotePullRequestSummarySource } from "./pr-summary.js";
+import { loadReviewPreferences, saveReviewPreference, type PersistedReviewVerdict } from "./preferences.js";
+import { getProviderCapability, renderProviderTemplate, requireProviderSettings, type ProviderSettings } from "./provider-settings.js";
+import { buildReviewOrderSignals, countHandoffThreads } from "./review-order.js";
+import { saveReviewReceipt } from "./review-receipts.js";
+import { createRemoteReviewRepliesSource } from "./review-replies.js";
 import { reviewGrammar, type GrammarReviewResult, type GrammarTextChange, type ReviewTextSet } from "./review-grammar.js";
-import { createReviewSessionId, deleteReviewSession, loadReviewSession, saveReviewSession, type ReviewSessionData } from "./review-session.js";
+import { buildReviewFileSignatures, createReviewSessionId, deleteReviewSession, listReviewSessions, loadReviewSession, rebaseReviewSession, saveReviewSession, type PersistedReviewSession, type ReviewSessionData, type ReviewSessionIndexEntry, type ReviewSessionMeta } from "./review-session.js";
 import { formatPullRequestContext, resolveRemoteReviewTarget, type RemoteReviewTarget } from "./remote.js";
-import { buildproviderComments, buildInlineComments, buildReviewBody, submitPullRequestReview, type ReviewInlineComment, type ReviewVerdict } from "./review-submit.js";
+import { buildProviderComments, buildReviewBody, submitPullRequestReview, type ReviewInlineComment, type ReviewVerdict } from "./review-submit.js";
 import { partitionResolvedSeedComments, resolveSeedComments, type SeedReviewComment } from "./seed-comments.js";
 import { sanitizeTerminalText } from "./sanitize.js";
 import { loadCommentShortcuts } from "./shortcuts.js";
@@ -23,10 +29,12 @@ interface InteractiveReviewParams {
   mode?: InteractiveReviewMode;
   ref?: string;
   resume?: string;
+  resumeIdentity?: string;
   tree?: string;
   branch?: string;
   project?: string;
   remote?: string;
+  handoff?: PullRequestHandoff;
   cwd?: string;
   includeGenerated?: boolean;
   wholeRepo?: boolean;
@@ -38,6 +46,10 @@ interface ReviewRunStatus {
   message?: string;
   prompt?: string;
   context?: string;
+  /** True only after a provider accepted the review submission. */
+  submitted?: boolean;
+  /** Next pull request the caller queued, offered after a successful submission. */
+  nextCandidate?: { url: string; title?: string };
 }
 
 const MODE_VALUES = new Set(["working", "staged", "branch", "custom"]);
@@ -99,6 +111,19 @@ function parseInteractiveReviewArgs(args: string): InteractiveReviewParams {
   return params;
 }
 
+function extractRemoteArgs(trimmed: string, fallbackCwd: string): string | null {
+  if (trimmed.length === 0) return null;
+  const tokens = trimmed.split(/\s+/);
+  const firstToken = tokens[0]!;
+  if (firstToken.toLowerCase() === "remote") {
+    const target = trimmed.slice(firstToken.length).trim();
+    return target.length === 0 ? null : target;
+  }
+  if (trimmed.startsWith("-") || MODE_VALUES.has(firstToken)) return parseInteractiveReviewArgs(trimmed).remote ?? null;
+  if (trimmed.includes("..")) return null;
+  return resolveLocalReviewCwdArg(trimmed, fallbackCwd) == null ? trimmed : null;
+}
+
 function unsupported(message: string, ctx: ExtensionContext): ReviewRunStatus {
   if (ctx.hasUI) ctx.ui.notify(message, "warning");
   return { started: false, message };
@@ -140,14 +165,21 @@ export function mergeReviewBodies(...bodies: Array<string | undefined>): string 
   return parts.length > 0 ? parts.join("\n\n") : undefined;
 }
 
+function providerForTarget(target: RemoteReviewTarget): ProviderSettings {
+  const providerId = target.provider ?? target.handoff?.provider;
+  if (providerId == null) throw new Error("Remote pull request provider is not configured.");
+  return requireProviderSettings(providerId);
+}
+
 function pullRequestProviderName(target: RemoteReviewTarget): string {
-  return target.provider === "provider" ? "provider" : "GitHub";
+  return providerForTarget(target).label;
 }
 
 function pullRequestUrl(target: RemoteReviewTarget): string {
   const pr = target.pullRequest!;
-  if (target.provider === "provider") return `https://review-host.example.io/repos/${target.repo}/pulls/${pr.number}`;
-  return target.repo == null ? target.remote : `https://github.com/${target.repo}/pull/${pr.number}`;
+  const repo = target.repo ?? pr.repo;
+  if (repo == null) return target.remote;
+  return renderProviderTemplate(providerForTarget(target).urls.canonical, { repo, number: pr.number });
 }
 
 export function composeReviewSubmissionPrompt(target: RemoteReviewTarget, verdict: ReviewVerdict, body: string | undefined, comments: ReviewInlineComment[]): string {
@@ -299,6 +331,7 @@ export async function submitUiConfirmedReview(
   comments: ReviewInlineComment[],
 ): Promise<ReviewRunStatus> {
   const pr = target.pullRequest!;
+  const provider = providerForTarget(target);
   const original: ReviewTextSet = {
     body,
     comments: comments.map((comment) => comment.body),
@@ -340,7 +373,7 @@ export async function submitUiConfirmedReview(
     return { started: true, message, context: formatPullRequestContext(pr) };
   }
   const submission = await submitPullRequestReview(pi, {
-    provider: target.provider,
+    provider: provider.id,
     repo,
     prNumber: pr.number,
     commitId: pr.headRefOid,
@@ -355,6 +388,21 @@ export async function submitUiConfirmedReview(
   if (!submission.ok) return { started: true, message: submission.message, context: formatPullRequestContext(pr) };
 
   const prUrl = pullRequestUrl(target);
+  saveReviewReceipt({
+    provider: provider.id,
+    repo,
+    number: pr.number,
+    url: prUrl,
+    verdict,
+    headSha: pr.headRefOid,
+    body: resolved.body,
+    comments: resolved.comments.map((comment) => ({
+      path: comment.path,
+      line: comment.line,
+      side: comment.side,
+      body: comment.body,
+    })),
+  });
   sendReviewFollowUp(pi, ctx, [
     `pi-code-diff already submitted this ${pullRequestProviderName(target)} review after its grammar safety pass.`,
     "Do not ask for confirmation and do not submit the review again.",
@@ -362,7 +410,44 @@ export async function submitUiConfirmedReview(
     `PR: ${prUrl}`,
     submission.message,
   ].join("\n"));
-  return { started: true, message: submission.message, context: formatPullRequestContext(pr) };
+  return { started: true, message: submission.message, submitted: true, context: formatPullRequestContext(pr) };
+}
+
+const REVIEW_VERDICT_LABELS: Record<ReviewVerdict, string> = {
+  approve: "Approve",
+  request_changes: "Request changes",
+  comment: "Post Comments",
+};
+
+const REVIEW_VERDICT_ORDER: ReviewVerdict[] = ["approve", "request_changes", "comment"];
+
+export interface ReviewEndAction {
+  verdict: ReviewVerdict;
+  skipBody: boolean;
+}
+
+/**
+ * Puts the last-used verdict first so the selector opens on it, and offers one explicit
+ * empty-body fast path for that verdict. Every choice still requires a deliberate pick.
+ */
+export function buildReviewEndActions(lastVerdict: PersistedReviewVerdict | null | undefined): { choices: string[]; actions: Map<string, ReviewEndAction> } {
+  const ordered = lastVerdict == null
+    ? REVIEW_VERDICT_ORDER
+    : [lastVerdict, ...REVIEW_VERDICT_ORDER.filter((verdict) => verdict !== lastVerdict)];
+  const choices: string[] = [];
+  const actions = new Map<string, ReviewEndAction>();
+
+  for (const verdict of ordered) {
+    const label = REVIEW_VERDICT_LABELS[verdict];
+    choices.push(label);
+    actions.set(label, { verdict, skipBody: false });
+    if (verdict !== lastVerdict) continue;
+    const fastLabel = `${label} without a body`;
+    choices.push(fastLabel);
+    actions.set(fastLabel, { verdict, skipBody: true });
+  }
+
+  return { choices, actions };
 }
 
 export function composeRemoteReviewPrompt(target: RemoteReviewTarget, reviewPrompt: string): string {
@@ -382,7 +467,7 @@ export function composeRemoteReviewPrompt(target: RemoteReviewTarget, reviewProm
   lines.push("");
   lines.push("Remote review agent-only flow:");
   lines.push("- This handoff is for the agent only. Do not post comments, approve, request changes, or take any public pull-request action from this prompt.");
-  lines.push("- DISCUSS items are agent-only questions. Answer them in prose; do not edit files or post to GitHub to satisfy DISCUSS items unless the user explicitly asks for a separate change.");
+  lines.push("- DISCUSS items are agent-only questions. Answer them in prose; do not edit files or post to the pull request unless the user explicitly asks for a separate change.");
   lines.push("");
   lines.push("Rules for pull-request actions:");
   lines.push("- Do not post comments, approve, or request changes until the user explicitly confirms the exact public action.");
@@ -438,6 +523,68 @@ interface RemotePrFinishResult {
   sessionAction: RemotePrSessionAction;
 }
 
+interface ReviewSessionTarget {
+  identity: string;
+  revision: string;
+  meta: ReviewSessionMeta;
+}
+
+function buildReviewSessionTarget(data: ReviewWindowData, remoteTarget?: RemoteReviewTarget): ReviewSessionTarget {
+  const { repoRoot, branchBaseRevision, modifiedRevision } = data;
+  const pr = remoteTarget?.pullRequest;
+  const revision = pr?.headRefOid ?? modifiedRevision ?? "worktree";
+
+  if (remoteTarget != null && pr != null) {
+    const provider = providerForTarget(remoteTarget).id;
+    const repo = remoteTarget.repo ?? remoteTarget.remote;
+    const url = pullRequestUrl(remoteTarget);
+    return {
+      identity: ["pr", provider, repo, pr.number].join("|"),
+      revision,
+      meta: {
+        kind: "remote",
+        label: `${repo}#${pr.number} ${pr.title}`,
+        url,
+        resumeArgs: `remote ${remoteTarget.remote}`,
+        cwd: remoteTarget.gitRoot,
+      },
+    };
+  }
+
+  const identity = [repoRoot, branchBaseRevision ?? "working", revision, remoteTarget?.remote ?? "local"].join("|");
+  if (remoteTarget != null) {
+    return {
+      identity,
+      revision,
+      meta: { kind: "remote", label: `${remoteTarget.repo ?? remoteTarget.remote} ${remoteTarget.branch}`, resumeArgs: `remote ${remoteTarget.remote}`, cwd: remoteTarget.gitRoot },
+    };
+  }
+  return { identity, revision, meta: { kind: "local", label: repoRoot, resumeArgs: "", cwd: repoRoot } };
+}
+
+async function pickParkedReview(ctx: ExtensionContext): Promise<ReviewSessionIndexEntry | null> {
+  const sessions = listReviewSessions();
+  if (sessions.length === 0) {
+    ctx.ui.notify("No parked reviews to resume.", "info");
+    return null;
+  }
+  const labels = sessions.map(formatParkedSessionChoice);
+  const choice = await ctx.ui.select("Resume a parked review", labels);
+  if (choice == null) return null;
+  return sessions[labels.indexOf(choice)] ?? null;
+}
+
+function shortRevisionLabel(revision: string): string {
+  return /^[0-9a-f]{40}$/i.test(revision) ? revision.slice(0, 7) : revision;
+}
+
+function formatParkedSessionChoice(entry: ReviewSessionIndexEntry): string {
+  const comments = `${entry.commentCount} comment${entry.commentCount === 1 ? "" : "s"}`;
+  const reviewed = `${entry.reviewedCount} reviewed`;
+  const when = entry.updatedAt.slice(0, 16).replace("T", " ");
+  return `${entry.label} · ${comments} · ${reviewed} · ${when}`;
+}
+
 function consumeDiscussionItems(session: ReviewSessionData, result: ReviewSubmitPayload): ReviewSessionData {
   return {
     ...session,
@@ -467,7 +614,7 @@ export default function codeDiffExtension(pi: ExtensionAPI) {
     data: ReviewWindowData,
     remoteTarget?: RemoteReviewTarget,
     seedComments?: SeedReviewComment[],
-    sessionOptions?: { resumeId?: string; discard?: boolean },
+    sessionOptions?: { resumeId?: string; resumeIdentity?: string; discard?: boolean },
   ): Promise<ReviewRunStatus> {
     if (activeReview) {
       const message = "A review session is already open.";
@@ -486,19 +633,48 @@ export default function codeDiffExtension(pi: ExtensionAPI) {
       }
 
       notifyShortcutWarnings(ctx, shortcutConfig.warnings);
-      const sessionRevision = remoteTarget?.pullRequest?.headRefOid ?? modifiedRevision ?? "worktree";
-      const sessionIdentity = [repoRoot, branchBaseRevision ?? "working", sessionRevision, remoteTarget?.remote ?? "local"].join("|");
+      const sessionTarget = buildReviewSessionTarget(data, remoteTarget);
+      const sessionIdentity = sessionTarget.identity;
+      const sessionRevision = sessionTarget.revision;
+      const fileSignatures = buildReviewFileSignatures(files);
+      const sessionContext = { revision: sessionRevision, fileSignatures, meta: sessionTarget.meta };
       const sessionId = sessionOptions?.resumeId != null && sessionOptions.resumeId !== "latest"
         ? sessionOptions.resumeId
         : createReviewSessionId(sessionIdentity);
       if (sessionOptions?.discard) deleteReviewSession(sessionIdentity, sessionId);
-      const initialSession = sessionOptions?.discard ? null : loadReviewSession(sessionIdentity, sessionId);
+      const savedSession = sessionOptions?.discard ? null : loadReviewSession(sessionOptions?.resumeIdentity ?? sessionIdentity, sessionId);
+      let initialSession: PersistedReviewSession | null = savedSession;
+      if (savedSession != null && savedSession.revision !== sessionRevision) {
+        const rebase = rebaseReviewSession(savedSession, files, visibleScopes, fileSignatures);
+        initialSession = { ...savedSession, ...rebase.data, identity: sessionIdentity, revision: sessionRevision, fileSignatures };
+        const details = [
+          `${rebase.reanchored} kept`,
+          ...(rebase.needsAttention > 0 ? [`${rebase.needsAttention} need attention`] : []),
+          ...(rebase.unanchored > 0 ? [`${rebase.unanchored} unanchored into the review note`] : []),
+        ].join(", ");
+        ctx.ui.notify(`Resumed review from ${shortRevisionLabel(rebase.previousRevision)}; head moved to ${shortRevisionLabel(sessionRevision)}: ${details}.`, rebase.needsAttention + rebase.unanchored > 0 ? "warning" : "info");
+      } else if (savedSession != null) {
+        ctx.ui.notify(`Resumed review session ${sessionId}.`, "info");
+      }
       let latestSession: ReviewSessionData | null = initialSession;
-      if (initialSession != null) ctx.ui.notify(`Resumed review session ${sessionId}.`, "info");
 
       if (remoteTarget?.pullRequest != null) {
         ctx.ui.notify(formatPullRequestContext(remoteTarget.pullRequest), "info");
       }
+
+      const handoff = remoteTarget?.handoff;
+      const handoffThreads = countHandoffThreads(handoff);
+      const pullRequest = remoteTarget?.pullRequest;
+      const reviewHeader = remoteTarget == null || pullRequest == null
+        ? undefined
+        : {
+            identity: `${remoteTarget.repo ?? remoteTarget.remote}#${pullRequest.number}`,
+            title: pullRequest.title,
+            state: pullRequest.state,
+            revision: pullRequest.headRefOid,
+            ...(handoff?.queue == null ? {} : { queue: handoff.queue }),
+            ...(handoffThreads == null ? {} : { openThreads: handoffThreads.open, awaitingReply: handoffThreads.awaitingReply }),
+          };
 
       const seed = resolveSeedComments(files, visibleScopes, seedComments ?? []);
       const partitionedSeed = initialSession == null
@@ -530,17 +706,29 @@ export default function codeDiffExtension(pi: ExtensionAPI) {
         visibleScopes,
         seedComments: partitionedSeed.applicable,
         contextPanelSource: createRemotePullRequestSummarySource(pi, ctx, remoteTarget),
+        repliesSource: createRemoteReviewRepliesSource(pi, ctx, remoteTarget),
+        orderSignals: buildReviewOrderSignals(handoff),
+        reviewHeader,
         initialSession: initialSession ?? undefined,
         onSessionChange: (session) => {
           latestSession = session;
-          if (sessionActive) saveReviewSession(sessionIdentity, session, sessionId);
+          if (sessionActive) saveReviewSession(sessionIdentity, session, { ...sessionContext, id: sessionId });
         },
       });
       sessionActive = false;
 
       if (result.type === "cancel") {
-        deleteReviewSession(sessionIdentity, sessionId);
-        const message = "Review cancelled.";
+        if (result.disposition === "discard") {
+          deleteReviewSession(sessionIdentity, sessionId);
+          const message = "Review discarded.";
+          ctx.ui.notify(message, "info");
+          return { started: true, message };
+        }
+        if (latestSession != null) saveReviewSession(sessionIdentity, latestSession, { ...sessionContext, id: sessionId });
+        const resumeHint = sessionTarget.meta.resumeArgs == null || sessionTarget.meta.resumeArgs.length === 0
+          ? "/diff --resume"
+          : `/diff ${sessionTarget.meta.resumeArgs}`;
+        const message = `Review parked. Resume with ${resumeHint}.`;
         ctx.ui.notify(message, "info");
         return { started: true, message };
       }
@@ -551,9 +739,11 @@ export default function codeDiffExtension(pi: ExtensionAPI) {
           deleteReviewSession(sessionIdentity, sessionId);
         } else if (finished.sessionAction === "consume-discussion") {
           const session = latestSession ?? loadReviewSession(sessionIdentity, sessionId);
-          if (session != null) saveReviewSession(sessionIdentity, consumeDiscussionItems(session, result), sessionId);
+          if (session != null) saveReviewSession(sessionIdentity, consumeDiscussionItems(session, result), { ...sessionContext, id: sessionId });
         }
-        return finished.status;
+        const nextCandidate = handoff?.nextCandidate;
+        if (finished.status.submitted !== true || nextCandidate == null) return finished.status;
+        return { ...finished.status, nextCandidate };
       }
 
       deleteReviewSession(sessionIdentity, sessionId);
@@ -579,16 +769,14 @@ export default function codeDiffExtension(pi: ExtensionAPI) {
 
   async function finishRemotePrReview(ctx: ExtensionContext, files: Parameters<typeof composeReviewPrompt>[0], result: ReviewSubmitPayload, target: RemoteReviewTarget): Promise<RemotePrFinishResult> {
     const pr = target.pullRequest!;
-    const inlineComments = target.provider === "provider"
-      ? buildproviderComments(files, result.comments)
-      : buildInlineComments(files, result.comments);
+    const provider = providerForTarget(target);
+    const supportsFileComments = getProviderCapability(provider, "fileComments");
+    const inlineComments = buildProviderComments(files, result.comments, supportsFileComments, provider.label);
     const discussionPrompt = composeDiscussionPrompt(files, result);
 
-    const approveChoice = "Approve";
-    const requestChoice = "Request changes";
-    const commentChoice = "Post Comments";
     const discussionChoice = "Start discussion with agents";
-    const choices = [approveChoice, requestChoice, commentChoice];
+    const endActions = buildReviewEndActions(loadReviewPreferences().lastReviewVerdict);
+    const choices = [...endActions.choices];
     if (discussionPrompt.length > 0) choices.push(discussionChoice);
     const choice = await ctx.ui.select(`PR #${pr.number}: ${pr.title}`, choices);
     if (choice == null) {
@@ -603,11 +791,40 @@ export default function codeDiffExtension(pi: ExtensionAPI) {
       return { status: { started: true, prompt }, sessionAction: "consume-discussion" };
     }
 
-    const verdict: ReviewVerdict = choice === approveChoice ? "approve" : choice === requestChoice ? "request_changes" : "comment";
-    const reviewBody = buildReviewBody(files, result, target.provider !== "provider");
-    const optionalBody = await ctx.ui.editor(`${choice}: optional review body comment`, "");
+    const action = endActions.actions.get(choice);
+    if (action == null) {
+      ctx.ui.notify("Review kept as a draft; nothing was submitted.", "info");
+      return { status: { started: true, message: "No end action selected." }, sessionAction: "keep" };
+    }
+
+    const verdict: ReviewVerdict = action.verdict;
+    saveReviewPreference({ lastReviewVerdict: verdict });
+    const reviewBody = buildReviewBody(files, result, !supportsFileComments);
+    const optionalBody = action.skipBody
+      ? undefined
+      : await ctx.ui.editor(`${REVIEW_VERDICT_LABELS[verdict]}: optional review body comment`, "");
     const body = mergeReviewBodies(optionalBody, reviewBody);
     return { status: await submitUiConfirmedReview(pi, ctx, target, verdict, body, inlineComments), sessionAction: "delete" };
+  }
+
+  async function offerNextReview(ctx: ExtensionContext, status: ReviewRunStatus, cwd: string): Promise<ReviewRunStatus> {
+    const candidate = status.nextCandidate;
+    if (candidate == null || !ctx.hasUI) return status;
+
+    const startChoice = "Review it now";
+    const label = candidate.title == null ? candidate.url : `${candidate.title} (${candidate.url})`;
+    const choice = await ctx.ui.select(`Next queued review: ${label}`, [startChoice, "Not now"]);
+    if (choice !== startChoice) return status;
+
+    try {
+      const next = await runDiff(`remote ${candidate.url}`, ctx, cwd);
+      if (next.started) return next;
+      return { ...status, message: `${status.message ?? "Review submitted."} Next review did not start: ${next.message ?? "unknown reason"}.` };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      ctx.ui.notify(`Could not open the next review: ${message}`, "warning");
+      return { ...status, message: `${status.message ?? "Review submitted."} Next review did not start: ${message}.` };
+    }
   }
 
   async function openReview(
@@ -615,7 +832,7 @@ export default function codeDiffExtension(pi: ExtensionAPI) {
     cwd = ctx.cwd,
     comments?: SeedReviewComment[],
     options?: ReviewWindowOptions,
-    sessionOptions?: { resumeId?: string; discard?: boolean },
+    sessionOptions?: { resumeId?: string; resumeIdentity?: string; discard?: boolean },
   ): Promise<ReviewRunStatus> {
     const reviewCwd = normalizeReviewCwd(cwd, ctx.cwd);
     const data = options == null
@@ -626,6 +843,25 @@ export default function codeDiffExtension(pi: ExtensionAPI) {
 
   async function runInteractiveReview(params: InteractiveReviewParams, ctx: ExtensionContext, fallbackCwd = ctx.cwd, comments?: SeedReviewComment[]): Promise<ReviewRunStatus> {
     if (!ctx.hasUI) return { started: false, message: "Interactive review requires a TUI session." };
+
+    if (params.resume === "latest" && params.remote == null && params.mode == null && params.ref == null && params.cwd == null && params.discardResume !== true) {
+      const picked = await pickParkedReview(ctx);
+      if (picked == null) return { started: false, message: "No parked review selected." };
+      const remote = picked.resumeArgs?.startsWith("remote ") === true ? picked.resumeArgs.slice("remote ".length) : undefined;
+      return runInteractiveReview(
+        {
+          ...params,
+          resume: picked.id,
+          resumeIdentity: picked.identity,
+          ...(remote == null ? {} : { remote }),
+          ...(picked.cwd == null ? {} : { cwd: picked.cwd }),
+        },
+        ctx,
+        picked.cwd ?? fallbackCwd,
+        comments,
+      );
+    }
+
     const reviewCwd = params.cwd == null ? undefined : normalizeReviewCwd(params.cwd, fallbackCwd);
     const reviewOptions = {
       ...(params.includeGenerated ? { includeGenerated: true } : {}),
@@ -638,7 +874,7 @@ export default function codeDiffExtension(pi: ExtensionAPI) {
     if (params.remote != null) {
       try {
         const reportProgress = (message: string) => setRemoteProgress(ctx, message);
-        const target = await resolveRemoteReviewTarget(pi, fallbackCwd, params.remote, reviewCwd, reportProgress);
+        const target = await resolveRemoteReviewTarget(pi, fallbackCwd, params.remote, reviewCwd, reportProgress, params.handoff);
         reportProgress(`Preparing diff for ${target.repo ?? target.branch}…`);
         const rangeOptions = {
           ...reviewOptions,
@@ -650,7 +886,8 @@ export default function codeDiffExtension(pi: ExtensionAPI) {
           ? await getReviewWindowDataForRevisionRange(pi, target.gitRoot, target.baseRef, target.headRef)
           : await getReviewWindowDataForRevisionRange(pi, target.gitRoot, target.baseRef, target.headRef, rangeOptions);
         setRemoteProgress(ctx, undefined);
-        return openReviewData(ctx, data, target, comments, { resumeId: params.resume, discard: params.discardResume });
+        const status = await openReviewData(ctx, data, target, comments, { resumeId: params.resume, resumeIdentity: params.resumeIdentity, discard: params.discardResume });
+        return offerNextReview(ctx, status, target.gitRoot);
       } catch (error) {
         setRemoteProgress(ctx, undefined);
         const message = error instanceof Error ? error.message : String(error);
@@ -671,7 +908,7 @@ export default function codeDiffExtension(pi: ExtensionAPI) {
       const data = Object.keys(rangeOptions).length === 0
         ? await getReviewWindowDataForRevisionRange(pi, reviewCwd ?? fallbackCwd, baseRef, headRef)
         : await getReviewWindowDataForRevisionRange(pi, reviewCwd ?? fallbackCwd, baseRef, headRef, rangeOptions);
-      return openReviewData(ctx, data, undefined, comments, { resumeId: params.resume, discard: params.discardResume });
+      return openReviewData(ctx, data, undefined, comments, { resumeId: params.resume, resumeIdentity: params.resumeIdentity, discard: params.discardResume });
     }
 
     return openReview(
@@ -679,15 +916,22 @@ export default function codeDiffExtension(pi: ExtensionAPI) {
       reviewCwd ?? fallbackCwd,
       comments,
       hasReviewOptions ? reviewOptions : undefined,
-      { resumeId: params.resume, discard: params.discardResume },
+      { resumeId: params.resume, resumeIdentity: params.resumeIdentity, discard: params.discardResume },
     );
   }
 
-  async function runDiff(args: string, ctx: ExtensionContext, cwd = ctx.cwd, comments?: SeedReviewComment[]): Promise<ReviewRunStatus> {
+  async function runDiff(args: string, ctx: ExtensionContext, cwd = ctx.cwd, comments?: SeedReviewComment[], handoff?: PullRequestHandoff): Promise<ReviewRunStatus> {
     if (!ctx.hasUI) return { started: false, message: "Interactive review requires a TUI session." };
 
     const fallbackCwd = normalizeReviewCwd(cwd, ctx.cwd);
     const trimmed = args.trim();
+
+    if (handoff != null) {
+      const remote = extractRemoteArgs(trimmed, fallbackCwd);
+      if (remote == null) return unsupported("Supplied pull request metadata requires a remote review target, for example: remote <url>.", ctx);
+      return runInteractiveReview({ remote, handoff }, ctx, fallbackCwd, comments);
+    }
+
     if (trimmed.length === 0) return openReview(ctx, fallbackCwd, comments);
 
     const tokens = trimmed.split(/\s+/);
@@ -770,6 +1014,7 @@ export default function codeDiffExtension(pi: ExtensionAPI) {
       "Wait for the tool result. It returns message, prompt, and context details after the interactive UI finishes.",
       "For agent-only remote DISCUSS follow-ups, answer in prose only and do not act on COMMENT or MODIFY items retained for the PR author. Ask `Good to continue the review?` when the discussion is complete; only a yes authorizes reopening the exact saved target.",
       "If remote discussion produces material findings, ask `Want me to prepopulate the findings as comments?` before reopening. Pass only confirmed new findings to open_code_diff with intent `comment`; never convert them to `modify` or `discuss`.",
+      "Pass pullRequest only when you already resolved the exact PR metadata for the same remote target in args. It skips the duplicate metadata, stack, and context lookups; the head commit is still fetched and verified, so stale or mismatched metadata fails the review instead of opening it.",
     ],
     parameters: Type.Object({
       args: Type.Optional(Type.String({ description: "Same target syntax as /diff, for example empty string, 'remote <url | branch>', or 'base..head'." })),
@@ -783,11 +1028,71 @@ export default function codeDiffExtension(pi: ExtensionAPI) {
         endLine: Type.Optional(Type.Number({ description: "End line of a range. Defaults to the start line." })),
         intent: Type.Optional(Type.Union([Type.Literal("discuss"), Type.Literal("comment"), Type.Literal("modify")], { description: "discuss = prose only, comment = actionable feedback (default), modify = apply the proposed change." })),
       }), { description: "Optional review comments to prepopulate into the diff UI. Each becomes an editable, deletable draft comment attached to the matching file/line and flows through the same review prompt as hand-written comments. Comments whose path does not match a reviewed file are surfaced as a warning, never silently dropped." })),
+      pullRequest: Type.Optional(Type.Object({
+        provider: Type.String({ description: "Configured pull request provider ID. Must match the provider implied by args." }),
+        repo: Type.String({ description: "Repository as owner/repo. Must match args." }),
+        number: Type.String({ description: "Pull request number. Must match args." }),
+        url: Type.String({ description: "Canonical pull request URL for the configured provider." }),
+        title: Type.String({ description: "Pull request title." }),
+        authorLogin: Type.String({ description: "Pull request author login." }),
+        state: Type.String({ description: "Pull request state, for example OPEN or MERGED." }),
+        body: Type.Optional(Type.String({ description: "Pull request description body." })),
+        baseRefName: Type.String({ description: "Base branch name." }),
+        baseRefOid: Type.Optional(Type.String({ description: "Base commit SHA when required by the configured provider." })),
+        headRefName: Type.String({ description: "Head branch name." }),
+        headRefOid: Type.String({ description: "Head commit SHA. Verified against the freshly fetched head before the UI opens." }),
+        additions: Type.Number({ description: "Added line count." }),
+        deletions: Type.Number({ description: "Deleted line count." }),
+        changedFiles: Type.Number({ description: "Changed file count." }),
+        reviews: Type.Optional(Type.Array(Type.Object({ author: Type.String(), state: Type.String() }), { description: "Existing review states per reviewer." })),
+        reviewDecision: Type.Optional(Type.String({ description: "Overall review decision, for example APPROVED or CHANGES_REQUESTED." })),
+        stackParent: Type.Optional(Type.Object({
+          number: Type.String(),
+          title: Type.String(),
+          headRefName: Type.String(),
+          state: Type.String(),
+          url: Type.Optional(Type.String()),
+        }, { description: "Stack parent PR, when this PR stacks on another PR." })),
+        threads: Type.Optional(Type.Array(Type.Object({
+          path: Type.Optional(Type.String()),
+          line: Type.Optional(Type.Number()),
+          resolved: Type.Optional(Type.Boolean()),
+          outdated: Type.Optional(Type.Boolean()),
+          comments: Type.Array(Type.Object({
+            author: Type.String(),
+            body: Type.String(),
+            createdAt: Type.Optional(Type.String()),
+            state: Type.Optional(Type.String()),
+          })),
+        }), { description: "Review threads. Supplying them skips the PR context fetch." })),
+        checks: Type.Optional(Type.Array(Type.Object({
+          name: Type.String(),
+          status: Type.Optional(Type.String()),
+          conclusion: Type.Optional(Type.String()),
+        }), { description: "CI checks. Supplying them skips the PR context fetch." })),
+        summary: Type.Optional(Type.String({ description: "Pre-rendered PR context summary. Supplying it skips both the context fetch and the summarization pass." })),
+        filePriority: Type.Optional(Type.Array(Type.Object({ path: Type.String(), reason: Type.Optional(Type.String()) }), { description: "Suggested review order for changed files." })),
+        queue: Type.Optional(Type.Object({ position: Type.Number(), total: Type.Optional(Type.Number()) }, { description: "Position of this PR in the caller's review queue." })),
+        nextCandidate: Type.Optional(Type.Object({ url: Type.String(), title: Type.Optional(Type.String()) }, { description: "Next PR the caller intends to review after this one." })),
+      }, { description: "Optional pre-resolved pull request metadata for a remote target. Skips redundant metadata, stack, and context lookups. Must match the args target exactly; malformed or stale metadata aborts the review." })),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      const input = params as { args?: string; cwd?: string; comments?: SeedReviewComment[] };
+      const input = params as { args?: string; cwd?: string; comments?: SeedReviewComment[]; pullRequest?: unknown };
       const args = input.args ?? "";
       const cwd = normalizeReviewCwd(input.cwd ?? ctx.cwd, ctx.cwd);
+
+      let handoff: PullRequestHandoff | undefined;
+      try {
+        handoff = input.pullRequest == null ? undefined : parsePullRequestHandoff(input.pullRequest);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (ctx.hasUI) ctx.ui.notify(message, "warning");
+        const status: ReviewRunStatus = { started: false, message };
+        return {
+          content: [{ type: "text" as const, text: formatOpenCodeDiffToolText(status, args, cwd) }],
+          details: { ...status, args, cwd },
+        };
+      }
 
       if (reviewRunInFlight || activeReview) {
         const message = "A review session is already open.";
@@ -801,7 +1106,7 @@ export default function codeDiffExtension(pi: ExtensionAPI) {
 
       reviewRunInFlight = true;
       try {
-        const status = await runDiff(args, ctx, cwd, input.comments);
+        const status = await runDiff(args, ctx, cwd, input.comments, handoff);
         return {
           content: [{ type: "text" as const, text: formatOpenCodeDiffToolText(status, args, cwd) }],
           details: { ...status, args, cwd },
@@ -823,8 +1128,8 @@ export default function codeDiffExtension(pi: ExtensionAPI) {
   pi.registerTool({
     name: "submit_pr_review",
     label: "submit-pr-review",
-    description: "Submit a GitHub or provider pull request review after confirmation. Refuses self-approval and validates immutable provider targets before one atomic submission.",
-    promptSnippet: "Submit a confirmed GitHub or provider PR review verdict through the matching provider.",
+    description: "Submit a pull request review through a configured provider after confirmation. Refuses self-approval and applies configured drift checks.",
+    promptSnippet: "Submit a confirmed pull request review verdict through the matching configured provider.",
     promptGuidelines: [
       "Only call submit_pr_review after the user explicitly confirms the verdict and review text. The review UI confirmation also authorizes grammar, spelling, capitalization, punctuation, and meaning-preserving syntax corrections without another confirmation.",
       "Fix only grammar and English in the body and comment text; never change meaning, intent, tone, technical substance, or requested scope. Only changes that may cross those boundaries require exact approval before submission.",
@@ -832,15 +1137,15 @@ export default function codeDiffExtension(pi: ExtensionAPI) {
       "Keep existing inline comments in the comments array for approve, request_changes, and comment verdicts.",
       "After a successful submission, report the PR link and short summary returned by the tool.",
       "Pass repo as owner/repo, the prNumber, the commitId (PR head SHA), and prAuthorLogin so self-approval can be blocked.",
-      "For provider, pass provider=provider and baseCommitId so target drift can be rejected before submission.",
+      "Pass the provider ID from the reviewed target; configured capabilities determine live-head validation and submission behavior.",
       "Pass cwd to the local checkout of the repository so the provider CLI runs in the right place.",
     ],
     parameters: Type.Object({
-      provider: Type.Optional(Type.Union([Type.Literal("github"), Type.Literal("provider")], { description: "Pull request provider; defaults to github" })),
+      provider: Type.String({ description: "Configured pull request provider ID" }),
       repo: Type.String({ description: "Repository as owner/repo" }),
       prNumber: Type.String({ description: "Pull request number" }),
       commitId: Type.String({ description: "PR head commit SHA (headRefOid)" }),
-      baseCommitId: Type.Optional(Type.String({ description: "Immutable PR base SHA, required for provider" })),
+      baseCommitId: Type.Optional(Type.String({ description: "PR base SHA retained for compatibility; normal base-branch movement does not block submission" })),
       verdict: Type.Union([
         Type.Literal("approve"),
         Type.Literal("request_changes"),
@@ -855,13 +1160,13 @@ export default function codeDiffExtension(pi: ExtensionAPI) {
         start_line: Type.Optional(Type.Number()),
         start_side: Type.Optional(Type.Union([Type.Literal("LEFT"), Type.Literal("RIGHT")])),
         subject_type: Type.Optional(Type.Literal("file")),
-      }), { description: "Line review comments, or provider file comments with subject_type=file" })),
+      }), { description: "Line review comments, plus file comments when supported by the configured provider" })),
       prAuthorLogin: Type.Optional(Type.String({ description: "PR author login, used to block self-approval" })),
-      cwd: Type.Optional(Type.String({ description: "Local checkout directory to run provider-cli in" })),
+      cwd: Type.Optional(Type.String({ description: "Local checkout directory for the configured provider command" })),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const input = params as {
-        provider?: "github" | "provider";
+        provider: string;
         repo: string;
         prNumber: string;
         commitId: string;

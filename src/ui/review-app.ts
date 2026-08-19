@@ -32,15 +32,17 @@ import {
 } from "../state.js";
 import { detectPiLanguage, highlightCodeLineWithPi } from "../pi-render.js";
 import { loadReviewPreferences, saveReviewPreference, type ReviewPaneVisibility } from "../preferences.js";
+import { orderNavigatorFiles, type NavigatorFileOrder, type ReviewOrderSignals } from "../review-order.js";
 import type { PersistedReviewSession, ReviewSessionData } from "../review-session.js";
 import { applyResolvedSeedComments, type ResolvedSeedComment } from "../seed-comments.js";
 import { getShortcutConfigPath, getShortcutsForSide, type CommentShortcut } from "../shortcuts.js";
 import { filterFilesBySearch } from "../search.js";
 import { sanitizeTerminalText } from "../sanitize.js";
 import { highlightJsonLine, highlightMarkdownLine } from "../theme-highlight.js";
-import type { CommentIntent, DiffReviewComment, FileCommentTarget, ReviewContextPanelSource, ReviewFile, ReviewFileContents, ReviewFocus, ReviewLineTarget, ReviewResult, ReviewScope, ReviewState, ReviewSubmoduleInfo } from "../types.js";
+import type { CommentIntent, DiffReviewComment, FileCommentTarget, ReviewContextPanelSource, ReviewExitDisposition, ReviewFile, ReviewFileContents, ReviewFocus, ReviewLineTarget, ReviewRepliesPanelSource, ReviewRepliesSnapshot, ReviewReplyItem, ReviewResult, ReviewScope, ReviewState, ReviewSubmoduleInfo } from "../types.js";
 import { formatIntentLabel, formatScopeLabel, getReviewFileDisplayPath, getSubmoduleInfo, hasExactSubmoduleRange, joinReviewPath } from "../types.js";
 import { getReviewFooterHint, getReviewHelpSections, matchesReviewAction } from "./actions.js";
+import { openExternalUrl, type UrlOpenResult } from "./open-url.js";
 import { ExactTextEditor } from "./exact-text-editor.js";
 
 interface LoadedEntryReady {
@@ -66,6 +68,18 @@ type ContextPanelState =
   | { status: "ready"; text: string }
   | { status: "error"; error: string };
 
+type RepliesPanelState =
+  | { status: "idle" }
+  | { status: "loading" }
+  | { status: "ready"; snapshot: ReviewRepliesSnapshot }
+  | { status: "error"; error: string };
+
+type ReplyAnalysisState =
+  | { status: "idle" }
+  | { status: "loading"; replyId: string }
+  | { status: "ready"; replyId: string; text: string }
+  | { status: "error"; replyId: string; error: string };
+
 type EditTarget =
   | { kind: "line"; fileId: string; scope: ReviewScope; side: ReviewLineTarget["side"]; startLine: number; endLine: number; initialBody: string; intent: CommentIntent; originalText?: string }
   | { kind: "file"; fileId: string; scope: ReviewScope; initialBody: string; intent: CommentIntent; fileTarget: FileCommentTarget; label?: string }
@@ -85,8 +99,12 @@ interface ReviewAppOptions {
   visibleScopes?: ReviewScope[];
   seedComments?: ResolvedSeedComment[];
   contextPanelSource?: ReviewContextPanelSource;
+  repliesSource?: ReviewRepliesPanelSource;
+  orderSignals?: ReviewOrderSignals;
+  reviewHeader?: ReviewHeaderInfo;
   initialSession?: PersistedReviewSession;
   onSessionChange?: (data: ReviewSessionData) => void;
+  openUrl?: (url: string) => Promise<UrlOpenResult>;
   notify: ExtensionContext["ui"]["notify"];
 }
 
@@ -111,6 +129,8 @@ interface MousePaneLayout {
   navigator: MousePaneBounds | null;
   diff: MousePaneBounds | null;
   comments: MousePaneBounds | null;
+  context: MousePaneBounds | null;
+  replies: MousePaneBounds | null;
 }
 
 const SEARCHABLE_SCOPES: ReviewScope[] = ["git-diff", "last-commit", "all-files"];
@@ -119,20 +139,27 @@ const DEFAULT_CONTEXT_LINES = 3;
 const CONTEXT_EXPANSION_LINES = 10;
 const STACKED_LAYOUT_MAX_WIDTH = 99;
 const STACKED_CONTEXT_LAYOUT_MAX_WIDTH = 155;
+const STACKED_WIDE_PANE_STEP_WIDTH = 56;
+const MINIMUM_WIDE_PANE_WIDTH = 24;
+const MAXIMUM_WIDE_PANE_WIDTH = 72;
 const CONTEXT_PANEL_PADDING_X = 2;
 const MAX_LOADED_FILE_ENTRIES = 50;
 const MAX_DIFF_LAYOUT_ENTRIES = 100;
 const MAX_SYNTAX_LINE_ENTRIES = 5000;
-const REVIEW_PANE_ORDER = ["navigator", "diff", "comments", "context"] as const;
+const REVIEW_PANE_ORDER = ["navigator", "diff", "comments", "context", "replies"] as const;
 type ReviewPaneName = typeof REVIEW_PANE_ORDER[number];
 
-const FOCUSABLE_PANE_ORDER: ReviewFocus[] = ["navigator", "diff", "comments"];
+/** PR context and Replies share the same wide side-pane role and split that space evenly. */
+const WIDE_PANE_ORDER: ReviewPaneName[] = ["context", "replies"];
+
+const FOCUSABLE_PANE_ORDER: ReviewFocus[] = ["navigator", "diff", "comments", "context", "replies"];
 const SCOPE_KEYS = [Key.alt("1"), Key.alt("2"), Key.alt("3")] as const;
 const REVIEW_PANE_LABELS: Record<ReviewPaneName, string> = {
   navigator: "Navigator",
   diff: "Diff",
   comments: "Comments",
   context: "PR context",
+  replies: "Replies",
 };
 
 export interface ReviewPaneLayout {
@@ -140,6 +167,7 @@ export interface ReviewPaneLayout {
   diffWidth: number;
   commentsWidth: number;
   contextWidth: number;
+  repliesWidth: number;
 }
 
 export interface StackedReviewPaneLayout {
@@ -147,6 +175,7 @@ export interface StackedReviewPaneLayout {
   diffHeight: number;
   commentsHeight: number;
   contextHeight: number;
+  repliesHeight: number;
 }
 
 function shellQuote(value: string): string {
@@ -206,6 +235,21 @@ export function shouldStackPanesWithContext(frameInnerWidth: number, contextVisi
   return shouldStackPanes(frameInnerWidth) || (contextVisible && frameInnerWidth <= STACKED_CONTEXT_LAYOUT_MAX_WIDTH);
 }
 
+export function countVisibleWidePanes(visibility: ReviewPaneVisibility): number {
+  return WIDE_PANE_ORDER.filter((pane) => visibility[pane]).length;
+}
+
+/**
+ * Each extra wide pane needs its own readable column, so the side-by-side breakpoint moves up
+ * with every visible wide pane instead of squeezing five panes into a laptop terminal.
+ */
+export function shouldStackPanesForVisibility(frameInnerWidth: number, visibility: ReviewPaneVisibility): boolean {
+  const wideCount = countVisibleWidePanes(visibility);
+  if (wideCount === 0) return shouldStackPanes(frameInnerWidth);
+  const threshold = STACKED_CONTEXT_LAYOUT_MAX_WIDTH + (wideCount - 1) * (STACKED_WIDE_PANE_STEP_WIDTH + 1);
+  return shouldStackPanes(frameInnerWidth) || frameInnerWidth <= threshold;
+}
+
 export function getPaneLayout(frameInnerWidth: number, commentsHidden: boolean): { navigatorWidth: number; diffWidth: number; commentsWidth: number } {
   const sideWidth = Math.max(24, Math.min(36, Math.floor(frameInnerWidth * 0.26)));
   if (commentsHidden) {
@@ -229,10 +273,7 @@ export function getPaneLayoutWithContext(frameInnerWidth: number, commentsHidden
 
   const navigatorWidth = Math.max(20, Math.min(32, base.navigatorWidth));
   const commentsWidth = navigatorWidth;
-  const minimumDiffWidth = 48;
-  const maximumContextWidth = 72;
-  const maximumReadableContextWidth = Math.floor((frameInnerWidth - navigatorWidth - minimumDiffWidth - 3) / 2);
-  const contextWidth = Math.max(24, Math.min(maximumContextWidth, maximumReadableContextWidth));
+  const contextWidth = getWidePaneWidth(frameInnerWidth, navigatorWidth, 1);
   return {
     navigatorWidth,
     commentsWidth,
@@ -241,18 +282,36 @@ export function getPaneLayoutWithContext(frameInnerWidth: number, commentsHidden
   };
 }
 
+/** Every wide pane gets the same width so PR context and Replies stay visually equal. */
+function getWidePaneWidth(frameInnerWidth: number, navigatorWidth: number, wideCount: number): number {
+  const minimumDiffWidth = 48;
+  const separators = wideCount + 2;
+  const readable = Math.floor((frameInnerWidth - navigatorWidth - minimumDiffWidth - separators) / (wideCount + 1));
+  return Math.max(MINIMUM_WIDE_PANE_WIDTH, Math.min(MAXIMUM_WIDE_PANE_WIDTH, readable));
+}
+
 export function getPaneLayoutForVisibility(frameInnerWidth: number, visibility: ReviewPaneVisibility): ReviewPaneLayout {
-  const base = getPaneLayoutWithContext(frameInnerWidth, false, visibility.context);
+  const wideCount = countVisibleWidePanes(visibility);
+  const narrowBase = getPaneLayout(frameInnerWidth, !visibility.comments);
+  const navigatorWidth = wideCount === 0 ? narrowBase.navigatorWidth : Math.max(20, Math.min(32, narrowBase.navigatorWidth));
+  const commentsWidth = wideCount === 0 ? narrowBase.commentsWidth : navigatorWidth;
+  const wideWidth = wideCount === 0 ? 0 : getWidePaneWidth(frameInnerWidth, navigatorWidth, wideCount);
+  const usedSideWidth = (visibility.navigator ? navigatorWidth : 0) + (visibility.comments ? commentsWidth : 0) + wideCount * wideWidth;
+
   const layout: ReviewPaneLayout = {
-    navigatorWidth: visibility.navigator ? base.navigatorWidth : 0,
-    diffWidth: visibility.diff ? base.diffWidth : 0,
-    commentsWidth: visibility.comments ? base.commentsWidth : 0,
-    contextWidth: visibility.context ? base.contextWidth : 0,
+    navigatorWidth: visibility.navigator ? navigatorWidth : 0,
+    diffWidth: 0,
+    commentsWidth: visibility.comments ? commentsWidth : 0,
+    contextWidth: visibility.context ? wideWidth : 0,
+    repliesWidth: visibility.replies ? wideWidth : 0,
   };
   const visiblePanes = REVIEW_PANE_ORDER.filter((pane) => visibility[pane]);
   if (visiblePanes.length === 0) return layout;
 
-  const usedWidth = visiblePanes.reduce((total, pane) => total + layout[`${pane}Width`], 0) + visiblePanes.length - 1;
+  const separators = visiblePanes.length - 1;
+  if (visibility.diff) layout.diffWidth = Math.max(24, frameInnerWidth - usedSideWidth - separators);
+
+  const usedWidth = visiblePanes.reduce((total, pane) => total + layout[`${pane}Width`], 0) + separators;
   const primaryPane = visiblePanes.includes("diff")
     ? "diff"
     : visiblePanes.includes("context")
@@ -322,6 +381,7 @@ export function getStackedPaneLayoutForVisibility(bodyHeight: number, visibility
     diffHeight: 0,
     commentsHeight: 0,
     contextHeight: 0,
+    repliesHeight: 0,
   };
   if (visiblePanes.length === 0) return layout;
 
@@ -367,7 +427,7 @@ export function parseMouseWheelInput(data: string): MouseWheelEvent | null {
   };
 }
 
-type PaneName = "navigator" | "diff" | "comments";
+type PaneName = ReviewFocus;
 
 type RelatedFileMarker = "→" | "←" | "↔";
 
@@ -658,8 +718,8 @@ export function getDraftCommentCount(state: ReviewState): number {
   return state.draft.comments.length + (state.draft.allComment.trim().length > 0 ? 1 : 0);
 }
 
-export function getCancelAction(state: ReviewState): "cancel" | "confirm" {
-  return hasDraftContent(state) ? "confirm" : "cancel";
+export function getCancelAction(state: ReviewState, reviewedCount = 0): "cancel" | "confirm" {
+  return hasDraftContent(state) || reviewedCount > 0 ? "confirm" : "cancel";
 }
 
 function centerText(text: string, width: number): string {
@@ -670,6 +730,47 @@ function centerText(text: string, width: number): string {
 }
 
 const MONOREPO_GROUP_ROOTS = new Set(["apps", "areas", "modules", "packages", "services"]);
+
+export interface ReviewHeaderInfo {
+  identity: string;
+  title?: string;
+  state?: string;
+  revision?: string;
+  queue?: { position: number; total?: number };
+  openThreads?: number;
+  awaitingReply?: number;
+}
+
+export interface ReviewHeaderCounts {
+  files: number;
+  reviewed: number;
+  comments: number;
+}
+
+const HEADER_TITLE_WIDTH = 40;
+
+function shortHeaderRevision(revision: string): string {
+  return /^[0-9a-f]{40}$|^[0-9a-f]{64}$/i.test(revision) ? revision.slice(0, 7) : revision;
+}
+
+export function buildReviewHeaderText(info: ReviewHeaderInfo, counts: ReviewHeaderCounts): string {
+  const parts = [info.identity];
+  if (info.title != null && info.title.length > 0) parts.push(truncateToWidth(info.title, HEADER_TITLE_WIDTH, "…", false));
+  if (info.state != null && info.state.length > 0) parts.push(info.state);
+  if (info.queue != null) parts.push(`queue ${info.queue.position}${info.queue.total == null ? "" : `/${info.queue.total}`}`);
+  if (info.revision != null && info.revision.length > 0) parts.push(`@${shortHeaderRevision(info.revision)}`);
+  parts.push(`${counts.reviewed}/${counts.files} reviewed`);
+  parts.push(`${counts.comments} comment${counts.comments === 1 ? "" : "s"}`);
+  if (info.openThreads != null) {
+    const awaiting = info.awaitingReply == null || info.awaitingReply === 0 ? "" : `, ${info.awaitingReply} awaiting reply`;
+    parts.push(`${info.openThreads} open thread${info.openThreads === 1 ? "" : "s"}${awaiting}`);
+  }
+  return parts.join(" • ");
+}
+
+export function buildReviewHeaderLine(theme: Theme, width: number, info: ReviewHeaderInfo, counts: ReviewHeaderCounts): string {
+  return theme.fg("muted", truncateToWidth(sanitizeTerminalText(buildReviewHeaderText(info, counts)), Math.max(1, width), "…", false));
+}
 
 export function getNavigatorGroup(file: ReviewFile): string {
   if (file.pathPrefix != null && file.pathPrefix.length > 0) return file.pathPrefix;
@@ -717,6 +818,8 @@ export function formatFocusStatus(focus: ReviewState["focus"]): string {
     case "navigator": return "Focus: Navigator";
     case "diff": return "Focus: Diff";
     case "comments": return "Focus: Comments";
+    case "context": return "Focus: PR context";
+    case "replies": return "Focus: Replies";
   }
 }
 
@@ -1319,6 +1422,7 @@ export class ReviewApp {
   private diffViewMode: DiffViewMode;
   private contextLineNavigation: boolean;
   private navigatorTreeMode: boolean;
+  private navigatorFileOrder: NavigatorFileOrder;
   private readonly reviewedFileIds = new Set<string>();
   private commentsGlobal: boolean;
   private showAllLocales: boolean;
@@ -1333,9 +1437,20 @@ export class ReviewApp {
   private diffScroll = 0;
   private commentsScroll = 0;
   private contextPanelState: ContextPanelState = { status: "idle" };
+  private repliesPanelState: RepliesPanelState = { status: "idle" };
+  private replyAnalysis: ReplyAnalysisState = { status: "idle" };
+  /** Only the newest replies request may write state, so an in-flight refresh cannot overwrite it. */
+  private repliesRequestToken = 0;
+  private analysisRequestToken = 0;
+  private repliesScroll = 0;
+  private repliesPageSize = 1;
+  private selectedReplyIndex = 0;
+  private contextScroll = 0;
+  private contextLineCount = 0;
   private navigatorPageSize = 1;
   private diffPageSize = 1;
   private commentsPageSize = 1;
+  private contextPageSize = 1;
   private relatedFilterAnchorFileId: string | null = null;
   private relatedFilterReturnFileId: string | null = null;
   private mousePaneLayout: MousePaneLayout | null = null;
@@ -1358,6 +1473,7 @@ export class ReviewApp {
     this.diffViewMode = options.initialSession?.diffViewMode ?? preferences.diffViewMode;
     this.contextLineNavigation = options.initialSession?.contextLineNavigation ?? preferences.contextLineNavigation;
     this.navigatorTreeMode = options.initialSession?.navigatorTreeMode ?? preferences.navigatorTreeMode;
+    this.navigatorFileOrder = preferences.navigatorFileOrder;
     this.commentsGlobal = options.initialSession?.commentsGlobal ?? preferences.commentsGlobal;
     this.paneVisibility = { ...preferences.paneVisibility };
     this.showAllLocales = options.initialSession?.showAllLocales ?? false;
@@ -1471,10 +1587,134 @@ export class ReviewApp {
     this.requestRender();
     void source.load().then((text) => {
       this.contextPanelState = { status: "ready", text };
+      this.contextScroll = 0;
       this.requestRender();
     }).catch((error: unknown) => {
       const message = error instanceof Error ? error.message : String(error);
       this.contextPanelState = { status: "error", error: sanitizeTerminalText(message) };
+      this.contextScroll = 0;
+      this.requestRender();
+    });
+  }
+
+  private ensureRepliesPanel(): void {
+    if (this.options.repliesSource == null || !this.paneVisibility.replies) return;
+    if (this.repliesPanelState.status !== "idle") return;
+    this.loadReplies();
+  }
+
+  /**
+   * Reads only the current pull request. The race token means a stale response from an earlier
+   * refresh is dropped instead of replacing newer data.
+   */
+  private loadReplies(): void {
+    const source = this.options.repliesSource;
+    if (source == null) return;
+
+    this.repliesRequestToken += 1;
+    const token = this.repliesRequestToken;
+    this.repliesPanelState = { status: "loading" };
+    this.requestRender();
+    void source.load().then((snapshot) => {
+      if (token !== this.repliesRequestToken) return;
+      this.repliesPanelState = { status: "ready", snapshot };
+      this.repliesScroll = 0;
+      this.selectedReplyIndex = Math.min(this.selectedReplyIndex, Math.max(0, snapshot.replies.length - 1));
+      this.requestRender();
+    }).catch((error: unknown) => {
+      if (token !== this.repliesRequestToken) return;
+      const message = error instanceof Error ? error.message : String(error);
+      this.repliesPanelState = { status: "error", error: sanitizeTerminalText(message) };
+      this.repliesScroll = 0;
+      this.requestRender();
+    });
+  }
+
+  private refreshReplies(): void {
+    if (this.options.repliesSource == null) {
+      this.setMessage("Replies are not available in this review.");
+      this.requestRender();
+      return;
+    }
+    this.replyAnalysis = { status: "idle" };
+    this.analysisRequestToken += 1;
+    this.loadReplies();
+    this.setMessage("Refreshing replies for this PR...");
+  }
+
+  private getReplies(): ReviewReplyItem[] {
+    return this.repliesPanelState.status === "ready" ? this.repliesPanelState.snapshot.replies : [];
+  }
+
+  private selectedReply(): ReviewReplyItem | null {
+    const replies = this.getReplies();
+    if (replies.length === 0) return null;
+    return replies[Math.max(0, Math.min(this.selectedReplyIndex, replies.length - 1))] ?? null;
+  }
+
+  private moveReplySelection(delta: number): void {
+    const replies = this.getReplies();
+    if (replies.length === 0) {
+      this.requestRender();
+      return;
+    }
+    const next = Math.max(0, Math.min(replies.length - 1, this.selectedReplyIndex + delta));
+    if (next === this.selectedReplyIndex) {
+      this.requestRender();
+      return;
+    }
+    this.selectedReplyIndex = next;
+    this.requestRender();
+  }
+
+  private openSelectedReply(): void {
+    const reply = this.selectedReply();
+    if (reply == null) {
+      this.setMessage("No reply is selected.");
+      this.requestRender();
+      return;
+    }
+    const url = reply.url;
+    if (url == null || url.trim().length === 0) {
+      this.setMessage("This reply has no link to open.");
+      this.requestRender();
+      return;
+    }
+    this.openUrlInBrowser(url, "reply");
+  }
+
+  /** Read-only, explicitly requested, and never posts anything back to the provider. */
+  private analyzeSelectedReply(): void {
+    const source = this.options.repliesSource;
+    const reply = this.selectedReply();
+    if (source?.analyze == null) {
+      this.setMessage("Reply analysis is not available in this review.");
+      this.requestRender();
+      return;
+    }
+    if (reply == null) {
+      this.setMessage("No reply is selected.");
+      this.requestRender();
+      return;
+    }
+    if (this.replyAnalysis.status === "loading") {
+      this.setMessage("An analysis is already running.");
+      this.requestRender();
+      return;
+    }
+
+    this.analysisRequestToken += 1;
+    const token = this.analysisRequestToken;
+    this.replyAnalysis = { status: "loading", replyId: reply.id };
+    this.requestRender();
+    void source.analyze(reply).then((text) => {
+      if (token !== this.analysisRequestToken) return;
+      this.replyAnalysis = { status: "ready", replyId: reply.id, text: sanitizeTerminalText(text) };
+      this.requestRender();
+    }).catch((error: unknown) => {
+      if (token !== this.analysisRequestToken) return;
+      const message = error instanceof Error ? error.message : String(error);
+      this.replyAnalysis = { status: "error", replyId: reply.id, error: sanitizeTerminalText(message) };
       this.requestRender();
     });
   }
@@ -1483,6 +1723,7 @@ export class ReviewApp {
     return {
       ...this.paneVisibility,
       context: this.paneVisibility.context && this.options.contextPanelSource != null,
+      replies: this.paneVisibility.replies && this.options.repliesSource != null,
     };
   }
 
@@ -1501,6 +1742,8 @@ export class ReviewApp {
     if (contains(layout.navigator)) return "navigator";
     if (contains(layout.diff)) return "diff";
     if (contains(layout.comments)) return "comments";
+    if (contains(layout.context)) return "context";
+    if (contains(layout.replies)) return "replies";
     return null;
   }
 
@@ -1844,7 +2087,14 @@ export class ReviewApp {
     const anchor = this.relatedFilterAnchorFile();
     const localeFiltered = filterReviewFilesByLocale(this.getNavigatorCandidateFiles(), this.showAllLocales);
     const filtered = filterFilesBySearch(localeFiltered, this.state.searchQuery);
-    return this.navigatorTreeMode && anchor == null ? groupNavigatorFiles(filtered) : filtered;
+    if (anchor != null) return filtered;
+    return orderNavigatorFiles(filtered, {
+      mode: this.navigatorFileOrder,
+      scope: this.state.activeScope,
+      treeMode: this.navigatorTreeMode,
+      groupOf: getNavigatorGroup,
+      signals: this.options.orderSignals,
+    });
   }
 
   private getHiddenLocaleFileCount(): number {
@@ -1909,10 +2159,12 @@ export class ReviewApp {
   private getSearchQueryForPane(pane: ReviewFocus): string {
     if (pane === "navigator") return this.state.searchQuery;
     if (pane === "diff") return this.diffSearchQuery;
+    if (pane === "context" || pane === "replies") return "";
     return this.commentSearchQuery;
   }
 
   private setSearchQueryForPane(pane: ReviewFocus, query: string): void {
+    if (pane === "context" || pane === "replies") return;
     this.message = null;
     if (pane === "navigator") {
       this.relatedFilterAnchorFileId = null;
@@ -1934,6 +2186,11 @@ export class ReviewApp {
   }
 
   private openSearch(): void {
+    if (this.state.focus === "context" || this.state.focus === "replies") {
+      this.setMessage(`Search is not available in the ${this.state.focus === "context" ? "PR context" : "Replies"} pane.`);
+      this.requestRender();
+      return;
+    }
     this.searchPane = this.state.focus;
     this.searchBuffer = this.getSearchQueryForPane(this.searchPane);
     this.searchInitialQuery = this.searchBuffer;
@@ -2277,13 +2534,18 @@ export class ReviewApp {
     this.done({ type: "submit", ...this.state.draft });
   }
 
-  private cancel(): void {
-    this.done({ type: "cancel" });
+  private cancel(disposition: ReviewExitDisposition): void {
+    if (this.sessionSaveTimer != null) {
+      clearTimeout(this.sessionSaveTimer);
+      this.sessionSaveTimer = null;
+    }
+    if (disposition === "park") this.persistSession();
+    this.done({ type: "cancel", disposition });
   }
 
   private requestCancel(): void {
-    if (getCancelAction(this.state) === "cancel") {
-      this.cancel();
+    if (getCancelAction(this.state, this.reviewedFileIds.size) === "cancel") {
+      this.cancel("discard");
       return;
     }
 
@@ -2300,7 +2562,12 @@ export class ReviewApp {
 
   private handleCancelConfirmationInput(data: string): void {
     if (data.toLowerCase() === "d") {
-      this.cancel();
+      this.cancel("discard");
+      return;
+    }
+
+    if (data.toLowerCase() === "p") {
+      this.cancel("park");
       return;
     }
 
@@ -2451,6 +2718,11 @@ export class ReviewApp {
       this.requestRender();
       return;
     }
+    if (pane === "replies" && this.options.repliesSource == null) {
+      this.setMessage("Replies are not available in this review.");
+      this.requestRender();
+      return;
+    }
 
     const visible = !this.paneVisibility[pane];
     this.paneVisibility = { ...this.paneVisibility, [pane]: visible };
@@ -2459,6 +2731,7 @@ export class ReviewApp {
       this.shortcutMode = false;
     }
     if (pane === "context" && visible) this.ensureContextPanel();
+    if (pane === "replies" && visible) this.ensureRepliesPanel();
     this.ensureVisibleFocus();
     saveReviewPreference({ paneVisibility: this.paneVisibility });
     this.setMessage(`${REVIEW_PANE_LABELS[pane]} ${visible ? "shown" : "hidden"}.`);
@@ -2473,7 +2746,7 @@ export class ReviewApp {
     const visibility = this.effectivePaneVisibility();
     const visiblePanes = FOCUSABLE_PANE_ORDER.filter((pane) => visibility[pane]);
     if (visiblePanes.length === 0) {
-      this.setMessage("No focusable pane is visible. Press 1, 2, or 3 to show one.");
+      this.setMessage("No focusable pane is visible. Press 1, 2, 3, 4, or 5 to show one.");
       this.requestRender();
       return;
     }
@@ -2602,6 +2875,62 @@ export class ReviewApp {
     this.requestRender();
   }
 
+  private maxContextScroll(): number {
+    return Math.max(0, this.contextLineCount - this.contextPageSize);
+  }
+
+  private scrollContextPanel(delta: number): void {
+    const next = Math.max(0, Math.min(this.maxContextScroll(), this.contextScroll + delta));
+    if (next === this.contextScroll) {
+      this.requestRender();
+      return;
+    }
+    this.contextScroll = next;
+    this.requestRender();
+  }
+
+  private focusedPageSize(): number {
+    if (this.state.focus === "navigator") return this.navigatorPageSize;
+    if (this.state.focus === "diff") return this.diffPageSize;
+    if (this.state.focus === "context") return this.contextPageSize;
+    if (this.state.focus === "replies") return this.repliesPageSize;
+    return this.commentsPageSize;
+  }
+
+  private openUrlInBrowser(url: string, label: string): void {
+    const open = this.options.openUrl ?? ((target: string) => openExternalUrl(target));
+    void open(url).then((result) => {
+      if (result.status === "opened") {
+        this.setMessage(`Opened ${result.url} in your browser.`);
+        this.requestRender();
+        return;
+      }
+      if (result.status === "invalid") {
+        this.setMessage(`${label} URL is not a valid http(s) address.`);
+        this.requestRender();
+        return;
+      }
+      void copyToClipboard(result.url).then(() => {
+        this.setMessage(`Could not open a browser (${result.error}); copied ${result.url} to the clipboard.`);
+        this.requestRender();
+      }).catch(() => {
+        this.setMessage(`Could not open ${result.url}: ${result.error}`);
+        this.requestRender();
+      });
+    });
+  }
+
+  private openPullRequestUrl(): void {
+    const url = this.options.contextPanelSource?.url;
+    if (url == null || url.trim().length === 0) {
+      this.setMessage("No PR URL is available for this review.");
+      this.requestRender();
+      return;
+    }
+
+    this.openUrlInBrowser(url, "PR");
+  }
+
   private moveFocusedSelection(delta: number): void {
     if (this.state.focus === "navigator") {
       this.moveNavigatorSelection(delta);
@@ -2609,6 +2938,14 @@ export class ReviewApp {
     }
     if (this.state.focus === "diff") {
       this.moveDiffSelection(delta);
+      return;
+    }
+    if (this.state.focus === "context") {
+      this.scrollContextPanel(delta);
+      return;
+    }
+    if (this.state.focus === "replies") {
+      this.moveReplySelection(delta);
       return;
     }
     this.moveCommentSelection(delta);
@@ -2693,6 +3030,7 @@ export class ReviewApp {
   private jumpSearch(direction: 1 | -1): boolean {
     if (this.state.focus === "navigator") return this.jumpNavigatorSearch(direction);
     if (this.state.focus === "diff") return this.jumpDiffSearch(direction);
+    if (this.state.focus === "context" || this.state.focus === "replies") return false;
     return this.jumpCommentSearch(direction);
   }
 
@@ -2714,6 +3052,20 @@ export class ReviewApp {
       if (visibleTargets.length === 0) return;
       const target = direction === "start" ? visibleTargets[0]! : visibleTargets[visibleTargets.length - 1]!;
       this.state = setSelectedLineTarget(this.state, file.id, this.state.activeScope, target);
+      this.requestRender();
+      return;
+    }
+
+    if (this.state.focus === "context") {
+      this.contextScroll = direction === "start" ? 0 : this.maxContextScroll();
+      this.requestRender();
+      return;
+    }
+
+    if (this.state.focus === "replies") {
+      const replies = this.getReplies();
+      if (replies.length === 0) return;
+      this.selectedReplyIndex = direction === "start" ? 0 : replies.length - 1;
       this.requestRender();
       return;
     }
@@ -2746,6 +3098,16 @@ export class ReviewApp {
     if (pane === "comments") {
       this.state = setFocus(this.state, "comments");
       this.moveCommentSelection(delta);
+      return true;
+    }
+    if (pane === "context") {
+      this.state = setFocus(this.state, "context");
+      this.scrollContextPanel(delta);
+      return true;
+    }
+    if (pane === "replies") {
+      this.state = setFocus(this.state, "replies");
+      this.moveReplySelection(delta);
       return true;
     }
 
@@ -2893,7 +3255,7 @@ export class ReviewApp {
       return;
     }
 
-    if (/^[1-4]$/.test(data)) {
+    if (/^[1-5]$/.test(data)) {
       this.toggleReviewPane(REVIEW_PANE_ORDER[Number.parseInt(data, 10) - 1]!);
       return;
     }
@@ -2910,9 +3272,50 @@ export class ReviewApp {
     if (data === "g") { this.pendingVimSequence = "g"; return; }
     if (data === "G") { this.jumpToBoundary("end"); return; }
     if (data === "/") { this.openSearch(); return; }
-    if (matchesKey(data, Key.ctrl("f"))) { this.moveFocusedSelection(this.state.focus === "navigator" ? this.navigatorPageSize : this.state.focus === "diff" ? this.diffPageSize : this.commentsPageSize); return; }
-    if (matchesKey(data, Key.ctrl("b"))) { this.moveFocusedSelection(-(this.state.focus === "navigator" ? this.navigatorPageSize : this.state.focus === "diff" ? this.diffPageSize : this.commentsPageSize)); return; }
+    if (matchesKey(data, Key.ctrl("f"))) { this.moveFocusedSelection(this.focusedPageSize()); return; }
+    if (matchesKey(data, Key.ctrl("b"))) { this.moveFocusedSelection(-this.focusedPageSize()); return; }
     if (matchesKey(data, Key.escape) || matchesKey(data, Key.ctrl("c"))) { this.requestCancel(); return; }
+
+    if (this.state.focus === "replies") {
+      if (matchesKey(data, Key.down) || data === "j") {
+        this.moveReplySelection(1);
+        return;
+      }
+      if (matchesKey(data, Key.up) || data === "k") {
+        this.moveReplySelection(-1);
+        return;
+      }
+      if (matchesKey(data, Key.ctrl("d"))) {
+        this.moveReplySelection(getHalfPageStep(this.repliesPageSize));
+        return;
+      }
+      if (matchesKey(data, Key.ctrl("u"))) {
+        this.moveReplySelection(-getHalfPageStep(this.repliesPageSize));
+        return;
+      }
+      if (matchesKey(data, Key.pageDown)) {
+        this.moveReplySelection(this.repliesPageSize);
+        return;
+      }
+      if (matchesKey(data, Key.pageUp)) {
+        this.moveReplySelection(-this.repliesPageSize);
+        return;
+      }
+      if (matchesKey(data, Key.enter)) {
+        this.openSelectedReply();
+        return;
+      }
+      if (data === "r") {
+        this.refreshReplies();
+        return;
+      }
+      if (data === "A") {
+        this.analyzeSelectedReply();
+        return;
+      }
+      return;
+    }
+
     if (matchesReviewAction("commentsPane", data)) { this.toggleCommentsPane(); return; }
     if (matchesReviewAction("wrap", data)) { this.state = setWrapLines(this.state, !this.state.wrapLines); this.requestRender(); return; }
     if (matchesReviewAction("view", data)) { this.toggleDiffViewMode(); return; }
@@ -2929,6 +3332,14 @@ export class ReviewApp {
       saveReviewPreference({ navigatorTreeMode: this.navigatorTreeMode });
       this.navigatorScroll = 0;
       this.setMessage(this.navigatorTreeMode ? "Navigator grouped by package." : "Navigator using flat review order.");
+      this.requestRender();
+      return;
+    }
+    if (matchesReviewAction("order", data)) {
+      this.navigatorFileOrder = this.navigatorFileOrder === "risk" ? "alphabetical" : "risk";
+      saveReviewPreference({ navigatorFileOrder: this.navigatorFileOrder });
+      this.navigatorScroll = 0;
+      this.setMessage(this.navigatorFileOrder === "risk" ? "Navigator ordered by review risk." : "Navigator ordered alphabetically.");
       this.requestRender();
       return;
     }
@@ -3103,6 +3514,37 @@ export class ReviewApp {
         return;
       }
     }
+
+    if (this.state.focus === "context") {
+      if (matchesKey(data, Key.down) || data === "j") {
+        this.scrollContextPanel(1);
+        return;
+      }
+      if (matchesKey(data, Key.up) || data === "k") {
+        this.scrollContextPanel(-1);
+        return;
+      }
+      if (matchesKey(data, Key.ctrl("d"))) {
+        this.scrollContextPanel(getHalfPageStep(this.contextPageSize));
+        return;
+      }
+      if (matchesKey(data, Key.ctrl("u"))) {
+        this.scrollContextPanel(-getHalfPageStep(this.contextPageSize));
+        return;
+      }
+      if (matchesKey(data, Key.pageDown)) {
+        this.scrollContextPanel(this.contextPageSize);
+        return;
+      }
+      if (matchesKey(data, Key.pageUp)) {
+        this.scrollContextPanel(-this.contextPageSize);
+        return;
+      }
+      if (matchesKey(data, Key.enter)) {
+        this.openPullRequestUrl();
+        return;
+      }
+    }
   }
 
   private renderNavigator(width: number, height: number): string[] {
@@ -3122,7 +3564,8 @@ export class ReviewApp {
       : this.showAllLocales
         ? ` • all locales • L hide ${hiddenLocaleCount}`
         : ` • ${hiddenLocaleCount} locale${hiddenLocaleCount === 1 ? "" : "s"} hidden • L show`;
-    lines.push(this.theme.fg("muted", `${files.length} file${files.length === 1 ? "" : "s"} • ${reviewedCount} reviewed${localeSuffix}${titleSuffix}${relatedSuffix}`));
+    const orderSuffix = relatedAnchor != null ? "" : this.navigatorFileOrder === "risk" ? " • risk order • O a-z" : " • a-z order • O risk";
+    lines.push(this.theme.fg("muted", `${files.length} file${files.length === 1 ? "" : "s"} • ${reviewedCount} reviewed${orderSuffix}${localeSuffix}${titleSuffix}${relatedSuffix}`));
     lines.push("");
 
     if (files.length === 0) {
@@ -3518,34 +3961,119 @@ export class ReviewApp {
     const count = getDraftCommentCount(this.state);
     const noun = count === 1 ? "draft item" : "draft items";
     const lines = [
-      this.theme.fg("warning", `Discard ${count} ${noun}?`),
+      this.theme.fg("warning", `Leave review with ${count} ${noun}?`),
       "",
-      this.theme.fg("muted", "d discard review"),
+      this.theme.fg("muted", "p park review and exit (resume later)"),
+      this.theme.fg("muted", "d discard review and delete the saved session"),
       this.theme.fg("muted", "Enter keep reviewing"),
       this.theme.fg("muted", "Esc keep reviewing • Ctrl+C keep reviewing"),
     ];
-    return renderBox("Discard review", 50, 7, this.theme, lines, true)
+    return renderBox("Park or discard review", 54, 8, this.theme, lines, true)
       .map((line) => this.theme.bg("toolPendingBg", line));
   }
 
   private renderContextPanel(width: number, height: number): string[] {
     const source = this.options.contextPanelSource;
+    const focused = this.state.focus === "context";
     const lines: string[] = [];
-    if (source == null) return renderBox("PR context", width, height, this.theme, lines, false);
+    if (source == null) {
+      this.contextLineCount = 0;
+      this.contextPageSize = 1;
+      this.contextScroll = 0;
+      return renderBox("PR context", width, height, this.theme, lines, false);
+    }
 
     if (this.contextPanelState.status === "idle" || this.contextPanelState.status === "loading") {
       lines.push(this.theme.fg("muted", source.loadingText));
-      return renderBox(source.title, width, height, this.theme, lines, false);
-    }
-
-    if (this.contextPanelState.status === "error") {
+    } else if (this.contextPanelState.status === "error") {
       lines.push(this.theme.fg("error", "Could not load PR context."));
       pushWrappedText(lines, this.theme, this.contextPanelState.error, Math.max(1, width - 2), "muted");
-      return renderBox(source.title, width, height, this.theme, lines, false);
+    } else {
+      lines.push(...buildContextPanelLines(this.theme, width, this.contextPanelState.text));
     }
 
-    lines.push(...buildContextPanelLines(this.theme, width, this.contextPanelState.text));
-    return renderBox(source.title, width, height, this.theme, lines, false);
+    const bodyHeight = Math.max(1, Math.floor(height) - 2);
+    this.contextLineCount = lines.length;
+    this.contextPageSize = bodyHeight;
+    this.contextScroll = Math.max(0, Math.min(this.contextScroll, this.maxContextScroll()));
+    return renderBox(source.title, width, height, this.theme, lines.slice(this.contextScroll, this.contextScroll + bodyHeight), focused);
+  }
+
+  private renderRepliesPanel(width: number, height: number): string[] {
+    const source = this.options.repliesSource;
+    const focused = this.state.focus === "replies";
+    const lines: string[] = [];
+    const contentWidth = Math.max(1, width - 2);
+    const bodyHeight = Math.max(1, Math.floor(height) - 2);
+
+    if (source == null) {
+      this.repliesScroll = 0;
+      this.repliesPageSize = 1;
+      return renderBox("Replies", width, height, this.theme, lines, false);
+    }
+
+    if (this.repliesPanelState.status === "idle" || this.repliesPanelState.status === "loading") {
+      pushWrappedText(lines, this.theme, source.loadingText, contentWidth);
+      this.repliesScroll = 0;
+      this.repliesPageSize = bodyHeight;
+      return renderBox(sanitizeTerminalText(source.title), width, height, this.theme, lines, focused);
+    }
+
+    if (this.repliesPanelState.status === "error") {
+      lines.push(this.theme.fg("error", "Could not load replies."));
+      pushWrappedText(lines, this.theme, this.repliesPanelState.error, contentWidth, "muted");
+      this.repliesScroll = 0;
+      this.repliesPageSize = bodyHeight;
+      return renderBox(sanitizeTerminalText(source.title), width, height, this.theme, lines, focused);
+    }
+
+    const replies = this.repliesPanelState.snapshot.replies;
+    this.selectedReplyIndex = Math.max(0, Math.min(this.selectedReplyIndex, Math.max(0, replies.length - 1)));
+    lines.push(this.theme.fg("muted", `${replies.length} repl${replies.length === 1 ? "y" : "ies"}`));
+    lines.push(this.theme.fg("dim", "↑↓ select • Enter open • r refresh • A analyze"));
+    lines.push("");
+
+    if (replies.length === 0) {
+      lines.push(this.theme.fg("dim", "No replies to review."));
+      this.repliesScroll = 0;
+      this.repliesPageSize = 1;
+      return renderBox(sanitizeTerminalText(source.title), width, height, this.theme, lines, focused);
+    }
+
+    const itemBlocks = replies.map((reply, index) => {
+      const selected = index === this.selectedReplyIndex;
+      const block: string[] = [];
+      const prefix = selected ? this.theme.fg("accent", "› ") : "  ";
+      const author = sanitizeTerminalText(reply.author);
+      pushWrappedAnsiText(block, this.theme.fg(selected ? "accent" : "text", author), contentWidth, prefix);
+      const location = reply.path == null || reply.path.length === 0
+        ? "Pull request"
+        : `${sanitizeTerminalText(reply.path)}${reply.line == null ? "" : `:${reply.line}`}`;
+      const resolution = reply.resolved ? "resolved" : "unresolved";
+      pushWrappedText(block, this.theme, `${location} • ${resolution}`, contentWidth, "dim", "   ");
+      block.push(...buildCommentPanelTextLines(this.theme, width, reply.body, "muted", "   ", 4));
+
+      const analysis = this.replyAnalysis;
+      if (selected && analysis.status !== "idle" && analysis.replyId === reply.id) {
+        if (analysis.status === "loading") {
+          pushWrappedText(block, this.theme, "Analyzing reply…", contentWidth, "dim", "   ");
+        } else if (analysis.status === "error") {
+          block.push(...buildCommentPanelTextLines(this.theme, width, `Analysis failed: ${analysis.error}`, "muted", "   ", 5));
+        } else {
+          block.push(...buildCommentPanelTextLines(this.theme, width, `Analysis: ${analysis.text}`, "muted", "   ", 5));
+        }
+      }
+      block.push("");
+      return block;
+    });
+
+    const itemViewportHeight = Math.max(1, bodyHeight - lines.length);
+    const page = getMeasuredPageRange(itemBlocks.map((block) => block.length), this.selectedReplyIndex, this.repliesScroll, itemViewportHeight);
+    this.repliesScroll = page.start;
+    this.repliesPageSize = Math.max(1, page.end - page.start);
+    for (const block of itemBlocks.slice(page.start, page.end)) lines.push(...block);
+
+    return renderBox(sanitizeTerminalText(source.title), width, height, this.theme, lines, focused);
   }
 
   private renderComments(width: number, height: number): string[] {
@@ -3685,7 +4213,9 @@ export class ReviewApp {
     if (pane === "navigator") return this.renderNavigator(width, height);
     if (pane === "diff") return this.renderDiff(width, height);
     if (pane === "comments") return this.renderComments(width, height);
-    return this.renderContextPanel(width, height);
+    if (pane === "context") return this.renderContextPanel(width, height);
+    this.ensureRepliesPanel();
+    return this.renderRepliesPanel(width, height);
   }
 
   render(width: number): string[] {
@@ -3697,7 +4227,7 @@ export class ReviewApp {
     const frameInnerHeight = Math.max(10, totalHeight - 2 - MODAL_INNER_PADDING_Y * 2);
     const visibility = this.effectivePaneVisibility();
     const visiblePanes = REVIEW_PANE_ORDER.filter((pane) => visibility[pane]);
-    const stackPanes = visiblePanes.length > 1 && shouldStackPanesWithContext(frameInnerWidth, visibility.context);
+    const stackPanes = visiblePanes.length > 1 && shouldStackPanesForVisibility(frameInnerWidth, visibility);
     const terminalCols = this.tui?.terminal?.columns ?? this.lastWidth;
     const overlayOriginCol = Math.max(0, Math.floor((terminalCols - this.lastWidth) / 2));
     const overlayOriginRow = Math.max(0, Math.floor((terminalRows - totalHeight) / 2));
@@ -3705,18 +4235,27 @@ export class ReviewApp {
 
     const visibleScopes = this.visibleScopes();
     const scopeHint = visibleScopes.length > 1 ? `Alt+${visibleScopes.map((_, index) => index + 1).join("/")} scopes • ` : "";
-    const headerLines = visibleScopes.length > 1
-      ? [truncateToWidth(visibleScopes.map((scope, index) => {
-          const active = this.state.activeScope === scope;
-          const count = getScopedFiles(this.files, scope).length;
-          const text = `Alt+${index + 1}:${formatScopeLabel(scope)}(${count})`;
-          return active ? this.theme.bg("selectedBg", this.theme.fg("text", ` ${text} `)) : this.theme.fg("muted", ` ${text} `);
-        }).join(" "), frameInnerWidth, "", false)]
-      : [];
+    const headerLines: string[] = [];
+    if (this.options.reviewHeader != null) {
+      const scopedFiles = getScopedFiles(this.files, this.state.activeScope);
+      headerLines.push(buildReviewHeaderLine(this.theme, frameInnerWidth, this.options.reviewHeader, {
+        files: scopedFiles.length,
+        reviewed: scopedFiles.filter((file) => this.reviewedFileIds.has(file.id)).length,
+        comments: getDraftCommentCount(this.state),
+      }));
+    }
+    if (visibleScopes.length > 1) {
+      headerLines.push(truncateToWidth(visibleScopes.map((scope, index) => {
+        const active = this.state.activeScope === scope;
+        const count = getScopedFiles(this.files, scope).length;
+        const text = `Alt+${index + 1}:${formatScopeLabel(scope)}(${count})`;
+        return active ? this.theme.bg("selectedBg", this.theme.fg("text", ` ${text} `)) : this.theme.fg("muted", ` ${text} `);
+      }).join(" "), frameInnerWidth, "", false));
+    }
 
     const bodyTop = overlayOriginRow + 1 + MODAL_INNER_PADDING_Y + headerLines.length;
     const layoutStatus = stackPanes ? "stacked layout • " : "";
-    const allPanesHiddenStatus = visiblePanes.length === 0 ? "All panes hidden • 1 Navigator • 2 Diff • 3 Comments • 4 PR context" : null;
+    const allPanesHiddenStatus = visiblePanes.length === 0 ? "All panes hidden • 1 Navigator • 2 Diff • 3 Comments • 4 PR context • 5 Replies" : null;
     const promptStatus = this.shortcutMode
       ? "Template shortcuts • choose from the comments panel • Esc cancel"
       : this.helpMode
@@ -3725,7 +4264,7 @@ export class ReviewApp {
           ? `Search ${formatFocusStatus(this.searchPane).replace("Focus: ", "")}: ${sanitizeTerminalText(this.searchBuffer)}`
           : this.editTarget != null
             ? `Editing ${formatIntentLabel(this.editTarget.intent).toLowerCase()} comment`
-            : `${formatFocusStatus(this.state.focus)} • ${layoutStatus}Tab/←/→ focus • / search • t templates • v diff view • ? help • ${scopeHint}1/2/3/4 panes • o open in $EDITOR • s submit${this.frameStack.length > 0 ? " • b parent" : ""} • Esc exit • Ctrl+C exit`);
+            : `${formatFocusStatus(this.state.focus)} • ${layoutStatus}Tab/←/→ focus • / search • t templates • v diff view • ? help • ${scopeHint}1/2/3/4/5 panes • o open in $EDITOR • s submit${this.frameStack.length > 0 ? " • b parent" : ""} • Esc exit • Ctrl+C exit`);
     const verticalLayout = getReviewVerticalLayout(
       this.theme,
       frameInnerHeight,
@@ -3742,21 +4281,19 @@ export class ReviewApp {
     const mouseBounds: Partial<Record<PaneName, MousePaneBounds>> = {};
 
     if (visiblePanes.length === 0) {
-      body.push(padLine(centerText("All panes are hidden. Press 1, 2, 3, or 4 to show one.", frameInnerWidth), frameInnerWidth));
+      body.push(padLine(centerText("All panes are hidden. Press 1, 2, 3, 4, or 5 to show one.", frameInnerWidth), frameInnerWidth));
       while (body.length < bodyHeight) body.push(" ".repeat(frameInnerWidth));
     } else if (stackPanes) {
       const layout = getStackedPaneLayoutForVisibility(bodyHeight, visibility, verticalLayout.stackedPaneMinimumHeight);
       let paneTop = bodyTop;
       for (const pane of visiblePanes) {
         const paneHeight = layout[`${pane}Height`];
-        if (pane !== "context") {
-          mouseBounds[pane] = {
-            top: paneTop,
-            bottom: paneTop + paneHeight - 1,
-            left: contentLeft,
-            right: contentLeft + frameInnerWidth - 1,
-          };
-        }
+        mouseBounds[pane] = {
+          top: paneTop,
+          bottom: paneTop + paneHeight - 1,
+          left: contentLeft,
+          right: contentLeft + frameInnerWidth - 1,
+        };
         body.push(...this.renderReviewPane(pane, frameInnerWidth, paneHeight));
         paneTop += paneHeight;
       }
@@ -3766,14 +4303,12 @@ export class ReviewApp {
       let paneLeft = contentLeft;
       for (const pane of visiblePanes) {
         const paneWidth = layout[`${pane}Width`];
-        if (pane !== "context") {
-          mouseBounds[pane] = {
-            top: bodyTop,
-            bottom: bodyTop + bodyHeight - 1,
-            left: paneLeft,
-            right: paneLeft + paneWidth - 1,
-          };
-        }
+        mouseBounds[pane] = {
+          top: bodyTop,
+          bottom: bodyTop + bodyHeight - 1,
+          left: paneLeft,
+          right: paneLeft + paneWidth - 1,
+        };
         renderedPanes.push({ pane, lines: this.renderReviewPane(pane, paneWidth, bodyHeight) });
         paneLeft += paneWidth + 1;
       }
@@ -3786,6 +4321,8 @@ export class ReviewApp {
       navigator: mouseBounds.navigator ?? null,
       diff: mouseBounds.diff ?? null,
       comments: mouseBounds.comments ?? null,
+      context: mouseBounds.context ?? null,
+      replies: mouseBounds.replies ?? null,
     };
 
     const rendered = renderOuterFrame(this.lastWidth, totalHeight, this.theme, "code-diff", [...headerLines, ...body, ...footer], frameColor);

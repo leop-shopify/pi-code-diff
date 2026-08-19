@@ -1,12 +1,30 @@
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync } from "node:fs";
 import { mkdir } from "node:fs/promises";
 import { homedir } from "node:os";
-import { isAbsolute, join, posix } from "node:path";
+import { isAbsolute, join, posix, resolve, sep } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { getDefaultBranchRef } from "./git.js";
-import { getShortcutConfigPath } from "./shortcuts.js";
+import {
+  isSafeRepositoryName,
+  parseConfiguredPullRequestUrl,
+  pullRequestMetadataFromHandoff,
+  type PullRequestHandoff,
+} from "./pr-handoff.js";
+import type {
+  PiCodeDiffSettings,
+  ProviderSettings,
+  RepositoryProfileSettings,
+} from "./provider-settings.js";
+import {
+  getProviderCapability,
+  loadPiCodeDiffSettings,
+  readConfiguredField,
+  renderProviderOperation,
+  renderProviderTemplate,
+  requireProviderSettings,
+} from "./provider-settings.js";
 
-export type PullRequestProvider = "github" | "provider";
+export type PullRequestProvider = string;
 
 export interface RemoteParseResult {
   branch: string;
@@ -53,9 +71,21 @@ export interface RemoteReviewTarget {
   pathspecs?: string[];
   importAliases?: Record<string, string>;
   provider?: PullRequestProvider;
+  handoff?: PullRequestHandoff;
 }
 
 export type RemoteProgress = (message: string) => void;
+
+interface ConfiguredRepositoryProfile {
+  gitRoot: string;
+  workspacePath?: string;
+  pathspecs?: string[];
+  importAliases?: Record<string, string>;
+}
+
+interface ResolvedRepoRoot extends ConfiguredRepositoryProfile {
+  fetchRemote?: string;
+}
 
 function originRef(branch: string): string {
   return `refs/remotes/origin/${branch}`;
@@ -73,101 +103,58 @@ function stripOriginPrefix(ref: string): string {
   return ref.replace(/^origin\//, "");
 }
 
-export function extractBranchFromRemote(input: string): RemoteParseResult | null {
+export function extractBranchFromRemote(input: string, settings = loadPiCodeDiffSettings()): RemoteParseResult | null {
   const trimmed = input.trim();
-  try {
-    const url = new URL(trimmed);
-    if (url.protocol === "https:" && url.hostname === "review-host.example.io" && url.port === "" && url.username === "" && url.password === "" && url.search === "" && url.hash === "") {
-      const match = url.pathname.match(/^\/repos\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\/pulls\/([1-9]\d*)(?:\/files)?$/);
-      if (match != null) {
-        const repo = `${match[1]}/${match[2]}`;
-        return { branch: `__pr__${match[3]}`, repo, prNumber: match[3], provider: "provider" };
-      }
-      return null;
-    }
-  } catch {}
-
-  const ghMatch = trimmed.match(/github\.com\/([^/\s]+\/[^/\s]+)\/pull\/(\d+)/);
-  if (ghMatch != null) return { branch: `__pr__${ghMatch[2]}`, repo: ghMatch[1], prNumber: ghMatch[2], provider: "github" };
-
-  const stack-hostMatch = trimmed.match(/stack-host\.dev\/github\/pr\/([^/\s]+\/[^/\s]+)\/(\d+)/);
-  if (stack-hostMatch != null) return { branch: `__pr__${stack-hostMatch[2]}`, repo: stack-hostMatch[1], prNumber: stack-hostMatch[2], provider: "github" };
-
-  const shortMatch = trimmed.match(/^([^/\s]+\/[^#\s]+)#(\d+)$/);
-  if (shortMatch != null) return { branch: `__pr__${shortMatch[2]}`, repo: shortMatch[1], prNumber: shortMatch[2], provider: "github" };
-
+  const pullRequest = parseConfiguredPullRequestUrl(trimmed, settings);
+  if (pullRequest != null) {
+    return {
+      branch: `__pr__${pullRequest.number}`,
+      repo: pullRequest.repo,
+      prNumber: pullRequest.number,
+      provider: pullRequest.provider,
+    };
+  }
   if (/^[\w./-]+$/.test(trimmed)) return { branch: trimmed };
   return null;
-}
-
-interface RemoteRepositoryConfig {
-  cwd?: unknown;
-  path?: unknown;
-  subdir?: unknown;
-  pathspecs?: unknown;
-  importAliases?: unknown;
-}
-
-interface ConfiguredRepositoryProfile {
-  gitRoot: string;
-  workspacePath?: string;
-  pathspecs?: string[];
-  importAliases?: Record<string, string>;
-}
-
-interface CodeDiffConfigFile {
-  repositories?: Record<string, string | RemoteRepositoryConfig>;
 }
 
 function normalizeRepoName(repo: string): string {
   return repo.trim().toLowerCase();
 }
 
-function getCodeDiffConfigPath(): string {
-  return process.env.PI_CODE_DIFF_CONFIG_PATH ?? getShortcutConfigPath();
-}
-
-function normalizeConfiguredPathspec(value: unknown): string | undefined {
-  if (typeof value !== "string" || value.trim().length === 0 || isAbsolute(value)) return undefined;
+function normalizeConfiguredPathspec(value: string): string | undefined {
+  if (value.trim().length === 0 || isAbsolute(value)) return undefined;
   const normalized = posix.normalize(value.trim().replace(/\\/g, "/")).replace(/^\.\//, "");
   return normalized === "." || normalized === ".." || normalized.startsWith("../") ? undefined : normalized;
 }
 
-function getConfiguredRepositoryProfile(repo: string): ConfiguredRepositoryProfile | undefined {
-  const configPath = getCodeDiffConfigPath();
-  if (!existsSync(configPath)) return undefined;
-
-  let config: CodeDiffConfigFile;
-  try {
-    config = JSON.parse(readFileSync(configPath, "utf8")) as CodeDiffConfigFile;
-  } catch {
-    return undefined;
-  }
-
-  const repositories = config.repositories ?? {};
-  const entry = repositories[repo] ?? repositories[normalizeRepoName(repo)];
-  const candidate = typeof entry === "string" ? entry : typeof entry?.cwd === "string" ? entry.cwd : typeof entry?.path === "string" ? entry.path : undefined;
-  if (candidate == null || !existsSync(candidate)) return undefined;
-  if (typeof entry === "string") return { gitRoot: candidate };
-
-  const workspacePath = normalizeConfiguredPathspec(entry.subdir);
+function normalizeRepositoryProfile(repo: string, entry: RepositoryProfileSettings): ConfiguredRepositoryProfile | undefined {
+  if (!existsSync(entry.cwd)) return undefined;
+  const workspacePath = entry.subdir == null ? undefined : normalizeConfiguredPathspec(entry.subdir);
   if (entry.subdir != null && workspacePath == null) throw new Error(`Invalid subdir configured for ${repo}.`);
-  const configuredPathspecs = Array.isArray(entry.pathspecs)
-    ? entry.pathspecs.map(normalizeConfiguredPathspec).filter((path): path is string => path != null)
-    : [];
-  if (Array.isArray(entry.pathspecs) && configuredPathspecs.length !== entry.pathspecs.length) {
-    throw new Error(`Invalid pathspec configured for ${repo}.`);
-  }
-  const pathspecs = configuredPathspecs.length > 0 ? [...new Set(configuredPathspecs)] : workspacePath == null ? undefined : [workspacePath];
-  const importAliases = entry.importAliases != null && typeof entry.importAliases === "object" && !Array.isArray(entry.importAliases)
-    ? Object.fromEntries(Object.entries(entry.importAliases)
-        .map(([prefix, target]) => [prefix.trim(), normalizeConfiguredPathspec(target)] as const)
-        .filter((item): item is readonly [string, string] => item[0].length > 0 && item[1] != null))
-    : undefined;
-  if (entry.importAliases != null && (importAliases == null || Object.keys(importAliases).length !== Object.keys(entry.importAliases as object).length)) {
-    throw new Error(`Invalid import alias configured for ${repo}.`);
-  }
-  return { gitRoot: candidate, workspacePath, pathspecs, importAliases };
+  const configuredPathspecs = entry.pathspecs?.map(normalizeConfiguredPathspec) ?? [];
+  if (configuredPathspecs.some((path) => path == null)) throw new Error(`Invalid pathspec configured for ${repo}.`);
+  const pathspecs = configuredPathspecs.length > 0
+    ? [...new Set(configuredPathspecs as string[])]
+    : workspacePath == null ? undefined : [workspacePath];
+  const importAliases = entry.importAliases == null
+    ? undefined
+    : Object.fromEntries(Object.entries(entry.importAliases).map(([prefix, target]) => {
+        const normalized = normalizeConfiguredPathspec(target);
+        if (prefix.trim().length === 0 || normalized == null) throw new Error(`Invalid import alias configured for ${repo}.`);
+        return [prefix.trim(), normalized];
+      }));
+  return {
+    gitRoot: entry.cwd,
+    workspacePath,
+    pathspecs,
+    importAliases,
+  };
+}
+
+function getConfiguredRepositoryProfile(repo: string, settings: PiCodeDiffSettings): ConfiguredRepositoryProfile | undefined {
+  const entry = settings.repositories[normalizeRepoName(repo)];
+  return entry == null ? undefined : normalizeRepositoryProfile(repo, entry);
 }
 
 function repoMatchesRemoteUrl(repo: string, remoteUrl: string): boolean {
@@ -179,19 +166,21 @@ function repoMatchesRemoteUrl(repo: string, remoteUrl: string): boolean {
 async function getMatchingLocalRepoRoot(pi: ExtensionAPI, cwd: string, repo: string): Promise<string | undefined> {
   const rootResult = await pi.exec("git", ["rev-parse", "--show-toplevel"], { cwd, timeout: 10000 });
   if (rootResult.code !== 0) return undefined;
-
   const gitRoot = rootResult.stdout.trim();
   if (gitRoot.length === 0) return undefined;
-
   const remoteResult = await pi.exec("git", ["remote", "get-url", "origin"], { cwd: gitRoot, timeout: 10000 });
   if (remoteResult.code !== 0 || !repoMatchesRemoteUrl(repo, remoteResult.stdout)) return undefined;
   return gitRoot;
 }
 
-function getRemoteCacheRoot(repo: string): string {
+export function getRemoteCacheRoot(repo: string): string {
+  if (!isSafeRepositoryName(repo)) throw new Error(`Invalid repository name: ${repo}.`);
   const safeParts = repo.split("/").map((part) => part.replace(/[^\w.-]/g, "_")).filter(Boolean);
-  const root = process.env.PI_CODE_DIFF_REMOTE_CACHE_ROOT ?? join(homedir(), ".pi", "agent", "cache", "pi-code-diff", "remotes");
-  return join(root, ...safeParts);
+  if (safeParts.some((part) => part === "." || part === "..")) throw new Error(`Invalid repository name: ${repo}.`);
+  const root = resolve(process.env.PI_CODE_DIFF_REMOTE_CACHE_ROOT ?? join(homedir(), ".pi", "agent", "cache", "pi-code-diff", "remotes"));
+  const candidate = resolve(root, ...safeParts);
+  if (!candidate.startsWith(`${root}${sep}`)) throw new Error(`Invalid repository cache path for ${repo}.`);
+  return candidate;
 }
 
 async function ensureRemoteCacheRepo(pi: ExtensionAPI, repo: string, onProgress?: RemoteProgress): Promise<string> {
@@ -202,7 +191,6 @@ async function ensureRemoteCacheRepo(pi: ExtensionAPI, repo: string, onProgress?
     const result = await pi.exec("git", ["init"], { cwd: gitRoot, timeout: 10000 });
     if (result.code !== 0) throw new Error(result.stderr || result.stdout || `Could not initialize remote review cache for ${repo}.`);
   }
-
   const ok = await pi.exec("git", ["rev-parse", "--show-toplevel"], { cwd: gitRoot, timeout: 10000 });
   if (ok.code !== 0) throw new Error(`Remote review cache is not a usable git repository at ${gitRoot}.`);
   return ok.stdout.trim() || gitRoot;
@@ -214,7 +202,15 @@ async function validateConfiguredRepoRoot(pi: ExtensionAPI, repo: string, gitRoo
   if (!matches) throw new Error(`Configured checkout ${gitRoot} does not match ${repo}.`);
 }
 
-async function resolveRepoRoot(pi: ExtensionAPI, fallbackCwd: string, repo: string | undefined, explicitCwd: string | undefined, onProgress?: RemoteProgress): Promise<{ gitRoot: string; fetchRemote?: string; workspacePath?: string; pathspecs?: string[]; importAliases?: Record<string, string> }> {
+async function resolveRepoRoot(
+  pi: ExtensionAPI,
+  fallbackCwd: string,
+  repo: string | undefined,
+  explicitCwd: string | undefined,
+  settings: PiCodeDiffSettings,
+  provider: ProviderSettings | undefined,
+  onProgress?: RemoteProgress,
+): Promise<ResolvedRepoRoot> {
   if (explicitCwd != null) {
     onProgress?.(`Using local checkout ${explicitCwd}…`);
     return { gitRoot: explicitCwd };
@@ -224,7 +220,7 @@ async function resolveRepoRoot(pi: ExtensionAPI, fallbackCwd: string, repo: stri
     return { gitRoot: fallbackCwd };
   }
 
-  const configuredProfile = getConfiguredRepositoryProfile(repo);
+  const configuredProfile = getConfiguredRepositoryProfile(repo, settings);
   if (configuredProfile != null) {
     await validateConfiguredRepoRoot(pi, repo, configuredProfile.gitRoot);
     onProgress?.(`Using configured checkout for ${repo}${configuredProfile.workspacePath == null ? "" : ` at ${configuredProfile.workspacePath}`}…`);
@@ -237,264 +233,187 @@ async function resolveRepoRoot(pi: ExtensionAPI, fallbackCwd: string, repo: stri
     return { gitRoot: localRoot };
   }
 
+  if (provider?.urls.clone == null) throw new Error(`Provider ${provider?.id ?? "unknown"} does not configure a clone URL.`);
   return {
     gitRoot: await ensureRemoteCacheRepo(pi, repo, onProgress),
-    fetchRemote: `https://github.com/${repo}.git`,
+    fetchRemote: renderProviderTemplate(provider.urls.clone, { repo }),
   };
-}
-
-function ghArgs(args: string[], repo: string | undefined): string[] {
-  return repo == null ? args : [...args, "--repo", repo];
 }
 
 function isDefaultBaseBranch(branch: string): boolean {
   return branch === "main" || branch === "master";
 }
 
-function toStackParentMetadata(input: { number?: number | string; title?: string; headRefName?: string; state?: string; url?: string }, fallbackHeadRefName: string): StackParentMetadata | undefined {
-  if (input.number == null) return undefined;
-  return {
-    number: String(input.number),
-    title: input.title ?? `(PR #${input.number})`,
-    headRefName: input.headRefName ?? fallbackHeadRefName,
-    state: input.state ?? "UNKNOWN",
-    url: input.url,
-  };
+function parseJson(value: string, provider: ProviderSettings, label: string): unknown {
+  try {
+    return JSON.parse(value) as unknown;
+  } catch {
+    throw new Error(`Malformed ${provider.label} response for ${label}.`);
+  }
 }
 
-async function getStackParentMetadataForHead(pi: ExtensionAPI, gitRoot: string, headRefName: string, repo?: string, onProgress?: RemoteProgress): Promise<StackParentMetadata | undefined> {
-  if (isDefaultBaseBranch(headRefName)) return undefined;
+function configuredString(provider: ProviderSettings, field: string, value: unknown, label: string, optional = false): string | undefined {
+  const configured = readConfiguredField(provider, field, value);
+  if (configured == null && optional) return undefined;
+  if (typeof configured !== "string" || configured.length === 0) throw new Error(`Malformed ${provider.label} response: ${label} is missing.`);
+  return configured;
+}
 
+function configuredNumber(provider: ProviderSettings, field: string, value: unknown, label: string): number {
+  const configured = readConfiguredField(provider, field, value);
+  if (typeof configured !== "number" || !Number.isFinite(configured) || configured < 0) {
+    throw new Error(`Malformed ${provider.label} response: ${label} is invalid.`);
+  }
+  return configured;
+}
+
+function configuredPrNumber(provider: ProviderSettings, value: unknown, label: string): string {
+  const configured = readConfiguredField(provider, "number", value);
+  const number = typeof configured === "number" && Number.isSafeInteger(configured) ? String(configured) : typeof configured === "string" ? configured : "";
+  if (!/^[1-9]\d*$/.test(number)) throw new Error(`Malformed ${provider.label} response: ${label} is invalid.`);
+  return number;
+}
+
+async function executeProviderOperation(
+  pi: ExtensionAPI,
+  gitRoot: string,
+  provider: ProviderSettings,
+  operation: string,
+  values: Record<string, string | number>,
+  timeout: number,
+): Promise<string> {
+  const rendered = renderProviderOperation(provider, operation, values);
+  const result = await pi.exec(provider.executable, rendered.args, { cwd: gitRoot, timeout });
+  if (result.code !== 0 || result.stdout.trim().length === 0) {
+    throw new Error(`Could not run ${provider.label} ${operation}: ${result.stderr || result.stdout || "empty response"}`);
+  }
+  return result.stdout.trim();
+}
+
+function parseReview(provider: ProviderSettings, value: unknown, index: number): PullRequestMetadata["reviews"][number] {
+  const login = configuredString(provider, "author", value, `reviews[${index}].author`)!;
+  const state = configuredString(provider, "reviewState", value, `reviews[${index}].state`)!;
+  return { author: { login }, state };
+}
+
+async function getProviderReviews(
+  pi: ExtensionAPI,
+  gitRoot: string,
+  provider: ProviderSettings,
+  repo: string,
+  prNumber: string,
+): Promise<PullRequestMetadata["reviews"]> {
+  if (provider.operations.reviews == null) return [];
+  const output = await executeProviderOperation(pi, gitRoot, provider, "reviews", { repo, number: prNumber }, 30000);
+  const parsed = parseJson(output, provider, `PR #${prNumber} reviews`);
+  if (!Array.isArray(parsed)) throw new Error(`Malformed ${provider.label} response for PR #${prNumber} reviews.`);
+  return parsed.map((review, index) => parseReview(provider, review, index));
+}
+
+async function getConfiguredPullRequestMetadata(
+  pi: ExtensionAPI,
+  gitRoot: string,
+  prNumber: string,
+  repo: string,
+  provider: ProviderSettings,
+  onProgress?: RemoteProgress,
+  includeStackParent = true,
+): Promise<PullRequestMetadata> {
+  onProgress?.(`Fetching PR #${prNumber} metadata from ${repo} with ${provider.label}…`);
+  const output = await executeProviderOperation(pi, gitRoot, provider, "pullRequest", { repo, number: prNumber }, 30000);
+  const parsed = parseJson(output, provider, `PR #${prNumber}`);
+  if (parsed == null || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error(`Malformed ${provider.label} response for PR #${prNumber}.`);
+  if (configuredPrNumber(provider, parsed, "number") !== prNumber) {
+    throw new Error(`Malformed ${provider.label} response: PR number does not match #${prNumber}.`);
+  }
+
+  const baseRefOid = configuredString(provider, "baseRefOid", parsed, "baseRefOid", true);
+  if (getProviderCapability(provider, "baseRevisionRequired") && baseRefOid == null) {
+    throw new Error(`Malformed ${provider.label} response: baseRefOid is missing.`);
+  }
+  const metadata: PullRequestMetadata = {
+    number: prNumber,
+    repo,
+    title: configuredString(provider, "title", parsed, "title")!,
+    body: configuredString(provider, "body", parsed, "body", true) ?? "",
+    additions: configuredNumber(provider, "additions", parsed, "additions"),
+    deletions: configuredNumber(provider, "deletions", parsed, "deletions"),
+    changedFiles: configuredNumber(provider, "changedFiles", parsed, "changedFiles"),
+    authorLogin: configuredString(provider, "author", parsed, "author")!,
+    state: configuredString(provider, "state", parsed, "state")!.toUpperCase(),
+    reviews: await getProviderReviews(pi, gitRoot, provider, repo, prNumber),
+    headRefName: configuredString(provider, "headRefName", parsed, "headRefName")!,
+    headRefOid: configuredString(provider, "headRefOid", parsed, "headRefOid")!,
+    baseRefName: configuredString(provider, "baseRefName", parsed, "baseRefName")!,
+    baseRefOid,
+  };
+  if (includeStackParent) metadata.stackParent = await getStackParentMetadataForHead(pi, gitRoot, metadata.baseRefName, repo, provider, onProgress);
+  return metadata;
+}
+
+async function getStackParentMetadataForHead(
+  pi: ExtensionAPI,
+  gitRoot: string,
+  headRefName: string,
+  repo: string,
+  provider: ProviderSettings,
+  onProgress?: RemoteProgress,
+): Promise<StackParentMetadata | undefined> {
+  if (isDefaultBaseBranch(headRefName) || provider.operations.branchLookup == null) return undefined;
   onProgress?.(`Checking stack parent PR for ${headRefName}…`);
-  const result = await pi.exec("provider-cli", ghArgs(["pr", "list", "--state", "all", "--head", headRefName, "--json", "number,title,headRefName,state,url", "--limit", "1"], repo), { cwd: gitRoot, timeout: 15000 });
-  if (result.code !== 0 || result.stdout.trim().length === 0) return undefined;
-
+  let output: string;
   try {
-    const [parent] = JSON.parse(result.stdout.trim()) as Array<{
-      number?: number | string;
-      title?: string;
-      headRefName?: string;
-      state?: string;
-      url?: string;
-    }>;
-    return parent == null ? undefined : toStackParentMetadata(parent, headRefName);
+    output = await executeProviderOperation(pi, gitRoot, provider, "branchLookup", { repo, branch: headRefName }, 15000);
+  } catch {
+    return undefined;
+  }
+  const parsed = parseJson(output, provider, `branch ${headRefName}`);
+  const candidate = Array.isArray(parsed) ? parsed[0] : parsed;
+  if (candidate == null) return undefined;
+  let number: string;
+  try {
+    number = configuredPrNumber(provider, candidate, "number");
+  } catch {
+    return undefined;
+  }
+  try {
+    const metadata = await getConfiguredPullRequestMetadata(pi, gitRoot, number, repo, provider, undefined, false);
+    return {
+      number,
+      title: metadata.title,
+      headRefName: metadata.headRefName,
+      state: metadata.state,
+      url: renderProviderTemplate(provider.urls.canonical, { repo, number }),
+    };
   } catch {
     return undefined;
   }
 }
 
-async function listStackParentCandidates(pi: ExtensionAPI, gitRoot: string, metadata: PullRequestMetadata, repo?: string, onProgress?: RemoteProgress): Promise<StackParentMetadata[]> {
-  onProgress?.("Checking stack parent PR candidates…");
-  const result = await pi.exec("provider-cli", ghArgs(["pr", "list", "--state", "all", "--json", "number,title,headRefName,state,url", "--limit", "100"], repo), { cwd: gitRoot, timeout: 15000 });
-  if (result.code !== 0 || result.stdout.trim().length === 0) return [];
-
-  try {
-    const parsed = JSON.parse(result.stdout.trim()) as Array<{
-      number?: number | string;
-      title?: string;
-      headRefName?: string;
-      state?: string;
-      url?: string;
-    }>;
-    return parsed
-      .map((candidate) => toStackParentMetadata(candidate, candidate.headRefName ?? ""))
-      .filter((candidate): candidate is StackParentMetadata => candidate != null)
-      .filter((candidate) => candidate.number !== metadata.number)
-      .filter((candidate) => candidate.headRefName.length > 0)
-      .filter((candidate) => candidate.headRefName !== metadata.headRefName)
-      .filter((candidate) => candidate.headRefName !== metadata.baseRefName)
-      .filter((candidate) => !isDefaultBaseBranch(candidate.headRefName));
-  } catch {
-    return [];
-  }
+export async function getPullRequestMetadata(
+  pi: ExtensionAPI,
+  gitRoot: string,
+  prNumber: string,
+  repo?: string,
+  onProgress?: RemoteProgress,
+  providerId?: PullRequestProvider,
+  settings = loadPiCodeDiffSettings(),
+): Promise<PullRequestMetadata> {
+  if (repo == null) throw new Error(`Could not resolve PR #${prNumber}: repository is unknown.`);
+  const configuredIds = Object.keys(settings.providers);
+  const resolvedProviderId = providerId ?? (configuredIds.length === 1 ? configuredIds[0] : undefined);
+  if (resolvedProviderId == null) throw new Error(`Could not resolve PR #${prNumber}: provider is unknown.`);
+  return getConfiguredPullRequestMetadata(pi, gitRoot, prNumber, repo, requireProviderSettings(resolvedProviderId, settings), onProgress);
 }
 
-async function getRefDistance(pi: ExtensionAPI, gitRoot: string, baseRef: string, headRef: string): Promise<number | undefined> {
-  const result = await pi.exec("git", ["rev-list", "--count", `${baseRef}..${headRef}`], { cwd: gitRoot, timeout: 10000 });
-  if (result.code !== 0) return undefined;
-  const distance = Number.parseInt(result.stdout.trim(), 10);
-  return Number.isFinite(distance) ? distance : undefined;
-}
-
-async function isAncestorRef(pi: ExtensionAPI, gitRoot: string, candidateRef: string, headRef: string): Promise<boolean> {
-  const result = await pi.exec("git", ["merge-base", "--is-ancestor", candidateRef, headRef], { cwd: gitRoot, timeout: 10000 });
-  return result.code === 0;
-}
-
-async function fetchStackParentCandidateRef(pi: ExtensionAPI, gitRoot: string, candidate: StackParentMetadata, remote = "origin", repo?: string): Promise<string | undefined> {
-  try {
-    await fetchRemoteRefs(pi, gitRoot, [`+${sourceBranchRef(candidate.headRefName)}:${originRef(candidate.headRefName)}`], remote);
-    return originShortRef(candidate.headRefName);
-  } catch {
-    const prHeadBranch = `stack-parent/${candidate.number}/head`;
-    const pullRemote = repo == null || remote !== "origin" ? remote : `https://github.com/${repo}.git`;
-    try {
-      await fetchRemoteRefs(pi, gitRoot, [`+refs/pull/${candidate.number}/head:${originRef(prHeadBranch)}`], pullRemote);
-      return originShortRef(prHeadBranch);
-    } catch {
-      return undefined;
-    }
-  }
-}
-
-function shouldScanStackParentCandidates(): boolean {
-  return process.env.PI_CODE_DIFF_SCAN_STACK_PARENTS === "1";
-}
-
-async function findClosestStackParent(pi: ExtensionAPI, gitRoot: string, metadata: PullRequestMetadata, currentBaseRef: string, headRef: string, remote = "origin", repo?: string, onProgress?: RemoteProgress): Promise<{ baseRef: string; stackParent: StackParentMetadata } | undefined> {
-  const candidates = await listStackParentCandidates(pi, gitRoot, metadata, repo, onProgress);
-  if (candidates.length === 0) return undefined;
-
-  const currentBaseDistance = await getRefDistance(pi, gitRoot, currentBaseRef, headRef);
-  if (currentBaseDistance == null) return undefined;
-
-  let best: { candidate: StackParentMetadata; ref: string; distance: number } | undefined;
-
-  for (const candidate of candidates) {
-    const candidateRef = await fetchStackParentCandidateRef(pi, gitRoot, candidate, remote, repo);
-    if (candidateRef == null) continue;
-    if (!await isAncestorRef(pi, gitRoot, candidateRef, headRef)) continue;
-
-    const distance = await getRefDistance(pi, gitRoot, candidateRef, headRef);
-    if (distance == null || distance <= 0) continue;
-    if (distance >= currentBaseDistance) continue;
-    if (best == null || distance < best.distance || (distance === best.distance && candidate.headRefName.localeCompare(best.candidate.headRefName) < 0)) {
-      best = { candidate, ref: candidateRef, distance };
-    }
-  }
-
-  return best == null ? undefined : { baseRef: await getMergeBase(pi, gitRoot, best.ref, headRef), stackParent: best.candidate };
-}
-
-function parseJsonObject(value: string, label: string): Record<string, unknown> {
-  try {
-    const parsed = JSON.parse(value) as unknown;
-    if (parsed == null || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error();
-    return parsed as Record<string, unknown>;
-  } catch {
-    throw new Error(`Malformed provider response for ${label}.`);
-  }
-}
-
-function requiredObject(value: unknown, label: string): Record<string, unknown> {
-  if (value == null || typeof value !== "object" || Array.isArray(value)) throw new Error(`Malformed provider response: ${label} is missing.`);
-  return value as Record<string, unknown>;
-}
-
-function requiredString(value: unknown, label: string): string {
-  if (typeof value !== "string" || value.length === 0) throw new Error(`Malformed provider response: ${label} is missing.`);
-  return value;
-}
-
-function numericValue(value: unknown, label: string): number {
-  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) throw new Error(`Malformed provider response: ${label} is invalid.`);
-  return value;
-}
-
-async function getproviderReviews(pi: ExtensionAPI, gitRoot: string, repo: string, prNumber: string): Promise<PullRequestMetadata["reviews"]> {
-  const endpoint = `repos/${repo}/pulls/${prNumber}/reviews`;
-  const result = await pi.exec("provider-cli", ["api", endpoint, "--paginate"], { cwd: gitRoot, timeout: 30000 });
-  if (result.code !== 0) throw new Error(`Could not resolve provider reviews for PR #${prNumber}: ${result.stderr || result.stdout || "command failed"}`);
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(result.stdout.trim());
-  } catch {
-    throw new Error(`Malformed provider response for PR #${prNumber} reviews.`);
-  }
-  if (!Array.isArray(parsed)) throw new Error(`Malformed provider response for PR #${prNumber} reviews.`);
-  return parsed.map((review, index) => {
-    const row = requiredObject(review, `reviews[${index}]`);
-    const author = requiredObject(row.user ?? row.author, `reviews[${index}].user`);
-    return {
-      author: { login: requiredString(author.login, `reviews[${index}].user.login`) },
-      state: requiredString(row.state, `reviews[${index}].state`),
-    };
-  });
-}
-
-async function getproviderPullRequestMetadata(pi: ExtensionAPI, gitRoot: string, prNumber: string, repo: string, onProgress?: RemoteProgress): Promise<PullRequestMetadata> {
-  onProgress?.(`Fetching provider PR #${prNumber} metadata from ${repo}…`);
-  const endpoint = `repos/${repo}/pulls/${prNumber}`;
-  const result = await pi.exec("provider-cli", ["api", endpoint], { cwd: gitRoot, timeout: 30000 });
-  if (result.code !== 0 || result.stdout.trim().length === 0) {
-    throw new Error(`Could not resolve provider PR #${prNumber}: ${result.stderr || result.stdout || "empty response"}`);
-  }
-  const parsed = parseJsonObject(result.stdout.trim(), `PR #${prNumber}`);
-  if (String(parsed.number) !== prNumber) throw new Error(`Malformed provider response: PR number does not match #${prNumber}.`);
-  const head = requiredObject(parsed.head, "head");
-  const base = requiredObject(parsed.base, "base");
-  const author = requiredObject(parsed.user, "user");
-  const reviews = await getproviderReviews(pi, gitRoot, repo, prNumber);
-
-  return {
-    number: prNumber,
-    repo,
-    title: requiredString(parsed.title, "title"),
-    body: typeof parsed.body === "string" ? parsed.body : "",
-    additions: numericValue(parsed.additions, "additions"),
-    deletions: numericValue(parsed.deletions, "deletions"),
-    changedFiles: numericValue(parsed.changed_files, "changed_files"),
-    authorLogin: requiredString(author.login, "user.login"),
-    state: requiredString(parsed.state, "state").toUpperCase(),
-    reviews,
-    headRefName: requiredString(head.ref, "head.ref"),
-    headRefOid: requiredString(head.sha, "head.sha"),
-    baseRefName: requiredString(base.ref, "base.ref"),
-    baseRefOid: requiredString(base.sha, "base.sha"),
-  };
-}
-
-export async function getPullRequestMetadata(pi: ExtensionAPI, gitRoot: string, prNumber: string, repo?: string, onProgress?: RemoteProgress, provider: PullRequestProvider = "github"): Promise<PullRequestMetadata> {
-  if (provider === "provider") {
-    if (repo == null) throw new Error(`Could not resolve provider PR #${prNumber}: repository is unknown.`);
-    return getproviderPullRequestMetadata(pi, gitRoot, prNumber, repo, onProgress);
-  }
-
-  onProgress?.(`Fetching PR #${prNumber} metadata${repo == null ? "" : ` from ${repo}`}…`);
-  const result = await pi.exec("provider-cli", ghArgs(["pr", "view", prNumber, "--json", "title,body,additions,deletions,changedFiles,author,reviews,state,headRefName,headRefOid,baseRefName"], repo), { cwd: gitRoot, timeout: 15000 });
-  if (result.code !== 0 || result.stdout.trim().length === 0) {
-    throw new Error(`Could not resolve PR #${prNumber}: ${result.stderr || "empty provider-cli response"}`);
-  }
-
-  const parsed = JSON.parse(result.stdout.trim()) as {
-    title?: string;
-    body?: string;
-    additions?: number;
-    deletions?: number;
-    changedFiles?: number;
-    author?: { login?: string };
-    state?: string;
-    reviews?: Array<{ author: { login: string }; state: string }>;
-    headRefName?: string;
-    headRefOid?: string;
-    baseRefName?: string;
-  };
-
-  if (parsed.headRefName == null || parsed.headRefOid == null) throw new Error(`PR #${prNumber} metadata is missing head ref information.`);
-
-  const baseRefName = parsed.baseRefName ?? "main";
-  const stackParent = await getStackParentMetadataForHead(pi, gitRoot, baseRefName, repo, onProgress);
-
-  return {
-    number: prNumber,
-    repo,
-    title: parsed.title ?? `(PR #${prNumber})`,
-    body: parsed.body ?? "",
-    additions: parsed.additions ?? 0,
-    deletions: parsed.deletions ?? 0,
-    changedFiles: parsed.changedFiles ?? 0,
-    authorLogin: parsed.author?.login ?? "unknown",
-    state: parsed.state ?? "UNKNOWN",
-    reviews: parsed.reviews ?? [],
-    headRefName: parsed.headRefName,
-    headRefOid: parsed.headRefOid,
-    baseRefName,
-    stackParent,
-  };
-}
-
-async function fetchRemoteRefs(pi: ExtensionAPI, gitRoot: string, refspecs: string[], remote = "origin", onProgress?: RemoteProgress): Promise<void> {
-  onProgress?.(`Fetching remote refs from ${remote === "origin" ? "origin" : "GitHub"}…`);
+async function fetchRemoteRefs(
+  pi: ExtensionAPI,
+  gitRoot: string,
+  refspecs: string[],
+  remote = "origin",
+  onProgress?: RemoteProgress,
+): Promise<void> {
+  onProgress?.(`Fetching remote refs from ${remote === "origin" ? "origin" : "configured remote"}…`);
   const result = await pi.exec("git", ["--no-pager", "fetch", "--no-tags", remote, ...refspecs], { cwd: gitRoot, timeout: 60000 });
   if (result.killed) throw new Error(`Timed out fetching remote refs after 60s. stderr: ${result.stderr || "(none)"}`);
   if (result.code !== 0) throw new Error(result.stderr || result.stdout || "Failed to fetch remote refs.");
@@ -506,8 +425,26 @@ async function getMergeBase(pi: ExtensionAPI, gitRoot: string, baseRef: string, 
   return mergeBase != null && mergeBase.length > 0 ? mergeBase : baseRef;
 }
 
-async function fetchPullRequestRefs(pi: ExtensionAPI, gitRoot: string, metadata: PullRequestMetadata, remote = "origin", onProgress?: RemoteProgress): Promise<{ baseRef: string; headRef: string }> {
-  const baseBranch = metadata.baseRefName || "main";
+function configuredTrackingBranch(provider: ProviderSettings, key: string, values: Record<string, string | number>): string {
+  const template = provider.refs[key];
+  if (template == null) throw new Error(`Provider ${provider.id} does not configure ref ${key}.`);
+  const rendered = renderProviderTemplate(template, values)
+    .replace(/^refs\/remotes\/origin\//, "")
+    .replace(/^refs\/heads\//, "");
+  const unsafe = rendered.length === 0 || /[\s~^:?*[\\]/.test(rendered) || rendered.includes("..") || rendered.startsWith("-") || rendered.startsWith("/") || rendered.endsWith("/") || rendered.endsWith(".lock");
+  if (unsafe) throw new Error(`Provider ${provider.id} rendered an invalid ${key} ref.`);
+  return rendered;
+}
+
+async function fetchBranchBasedPullRequestRefs(
+  pi: ExtensionAPI,
+  gitRoot: string,
+  metadata: PullRequestMetadata,
+  provider: ProviderSettings,
+  remote = "origin",
+  onProgress?: RemoteProgress,
+): Promise<{ baseRef: string; headRef: string }> {
+  const baseBranch = metadata.baseRefName;
   try {
     await fetchRemoteRefs(pi, gitRoot, [
       `+${sourceBranchRef(baseBranch)}:${originRef(baseBranch)}`,
@@ -517,38 +454,64 @@ async function fetchPullRequestRefs(pi: ExtensionAPI, gitRoot: string, metadata:
     const headRef = originShortRef(metadata.headRefName);
     return { baseRef: await getMergeBase(pi, gitRoot, baseRef, headRef), headRef };
   } catch {
-    const prHeadBranch = `pr/${metadata.number}/head`;
-    const pullRemote = metadata.repo == null || remote !== "origin" ? remote : `https://github.com/${metadata.repo}.git`;
+    const headSource = provider.refs.head;
+    if (headSource == null) throw new Error(`Provider ${provider.id} does not configure a fallback head ref.`);
+    const values = { repo: metadata.repo ?? "", number: metadata.number };
+    const sourceRef = renderProviderTemplate(headSource, values);
+    const headBranch = `review/${provider.id}/${metadata.number}/head`;
+    const pullRemote = remote !== "origin"
+      ? remote
+      : provider.urls.clone == null || metadata.repo == null
+        ? remote
+        : renderProviderTemplate(provider.urls.clone, { repo: metadata.repo });
     await fetchRemoteRefs(pi, gitRoot, [
       `+${sourceBranchRef(baseBranch)}:${originRef(baseBranch)}`,
-      `+refs/pull/${metadata.number}/head:${originRef(prHeadBranch)}`,
+      `+${sourceRef}:${originRef(headBranch)}`,
     ], pullRemote, onProgress);
     const baseRef = originShortRef(baseBranch);
-    const headRef = originShortRef(prHeadBranch);
+    const headRef = originShortRef(headBranch);
     return { baseRef: await getMergeBase(pi, gitRoot, baseRef, headRef), headRef };
   }
 }
 
-async function fetchproviderPullRequestRefs(pi: ExtensionAPI, gitRoot: string, metadata: PullRequestMetadata, remote = "origin", onProgress?: RemoteProgress): Promise<{ baseRef: string; headRef: string }> {
-  if (metadata.baseRefOid == null) throw new Error(`provider PR #${metadata.number} metadata is missing base SHA.`);
-  const baseBranch = `provider/${metadata.number}/base`;
-  const headBranch = `provider/${metadata.number}/head`;
+async function fetchRevisionPinnedPullRequestRefs(
+  pi: ExtensionAPI,
+  gitRoot: string,
+  metadata: PullRequestMetadata,
+  provider: ProviderSettings,
+  remote = "origin",
+  onProgress?: RemoteProgress,
+): Promise<{ baseRef: string; headRef: string }> {
+  if (metadata.baseRefOid == null) throw new Error(`${provider.label} PR #${metadata.number} metadata is missing base revision.`);
+  const values = { repo: metadata.repo ?? "", number: metadata.number };
+  const baseBranch = configuredTrackingBranch(provider, "base", values);
+  const headBranch = configuredTrackingBranch(provider, "head", values);
   await fetchRemoteRefs(pi, gitRoot, [
     `+${sourceBranchRef(metadata.baseRefName)}:${originRef(baseBranch)}`,
     `+${sourceBranchRef(metadata.headRefName)}:${originRef(headBranch)}`,
   ], remote, onProgress);
 
-  const baseResult = await pi.exec("git", ["rev-parse", originRef(baseBranch)], { cwd: gitRoot, timeout: 10000 });
   const headResult = await pi.exec("git", ["rev-parse", originRef(headBranch)], { cwd: gitRoot, timeout: 10000 });
-  const fetchedBase = baseResult.code === 0 ? baseResult.stdout.trim() : "";
-  const fetchedHead = headResult.code === 0 ? headResult.stdout.trim() : "";
-  if (fetchedBase !== metadata.baseRefOid || fetchedHead !== metadata.headRefOid) {
-    throw new Error(`provider PR #${metadata.number} changed while preparing the review. Reopen it to review the latest base and head.`);
+  const fetchedHead = headResult.code === 0 ? headResult.stdout.trim().toLowerCase() : "";
+  if (fetchedHead !== metadata.headRefOid.toLowerCase()) {
+    throw new Error(`${provider.label} PR #${metadata.number} head changed while preparing the review. Reopen it to review the latest head.`);
   }
-
   const baseRef = originShortRef(baseBranch);
   const headRef = originShortRef(headBranch);
   return { baseRef: await getMergeBase(pi, gitRoot, baseRef, headRef), headRef };
+}
+
+async function fetchPullRequestRefs(
+  pi: ExtensionAPI,
+  gitRoot: string,
+  metadata: PullRequestMetadata,
+  provider: ProviderSettings,
+  remote = "origin",
+  onProgress?: RemoteProgress,
+): Promise<{ baseRef: string; headRef: string }> {
+  return getProviderCapability(provider, "baseRevisionRequired")
+    ? fetchRevisionPinnedPullRequestRefs(pi, gitRoot, metadata, provider, remote, onProgress)
+    : fetchBranchBasedPullRequestRefs(pi, gitRoot, metadata, provider, remote, onProgress);
 }
 
 async function fetchPlainRemoteBranch(pi: ExtensionAPI, gitRoot: string, branch: string, onProgress?: RemoteProgress): Promise<{ baseRef: string; headRef: string }> {
@@ -568,15 +531,40 @@ export function clearRemoteReviewTargetCache(): void {
   remoteTargetCache.clear();
 }
 
-export async function resolveRemoteReviewTarget(pi: ExtensionAPI, fallbackCwd: string, remote: string, explicitCwd?: string, onProgress?: RemoteProgress): Promise<RemoteReviewTarget> {
-  const parsed = extractBranchFromRemote(remote);
-  if (parsed == null) throw new Error(`Could not extract branch name from: ${remote}`);
+function assertHandoffMatchesTarget(handoff: PullRequestHandoff, parsed: RemoteParseResult, remote: string): void {
+  if (parsed.prNumber == null || parsed.repo == null || parsed.provider == null) throw new Error(`Supplied pull request metadata requires a pull request target, not: ${remote}`);
+  if (parsed.prNumber !== handoff.number) throw new Error(`Supplied pull request metadata is for PR #${handoff.number}, but the review target is PR #${parsed.prNumber}.`);
+  if (normalizeRepoName(parsed.repo) !== normalizeRepoName(handoff.repo)) throw new Error(`Supplied pull request metadata is for ${handoff.repo}, but the review target is ${parsed.repo}.`);
+  if (parsed.provider !== handoff.provider) throw new Error(`Supplied pull request metadata is for ${handoff.provider}, but the review target is ${parsed.provider}.`);
+}
 
-  const normalizedRemote = parsed.provider === "provider" && parsed.repo != null && parsed.prNumber != null
-    ? `https://review-host.example.io/repos/${parsed.repo}/pulls/${parsed.prNumber}`
+async function verifySuppliedHeadRevision(pi: ExtensionAPI, gitRoot: string, headRef: string, metadata: PullRequestMetadata): Promise<void> {
+  const result = await pi.exec("git", ["rev-parse", headRef], { cwd: gitRoot, timeout: 10000 });
+  const fetched = result.code === 0 ? result.stdout.trim().toLowerCase() : "";
+  if (fetched !== metadata.headRefOid.toLowerCase()) {
+    throw new Error(`PR #${metadata.number} changed since the supplied metadata was prepared (expected head ${metadata.headRefOid}, fetched ${fetched.length === 0 ? "nothing" : fetched}). Reopen it to review the latest head.`);
+  }
+}
+
+export async function resolveRemoteReviewTarget(
+  pi: ExtensionAPI,
+  fallbackCwd: string,
+  remote: string,
+  explicitCwd?: string,
+  onProgress?: RemoteProgress,
+  handoff?: PullRequestHandoff,
+): Promise<RemoteReviewTarget> {
+  const settings = loadPiCodeDiffSettings();
+  const parsed = extractBranchFromRemote(remote, settings);
+  if (parsed == null) throw new Error(`Could not extract branch name from: ${remote}`);
+  if (handoff != null) assertHandoffMatchesTarget(handoff, parsed, remote);
+
+  const provider = parsed.provider == null ? undefined : requireProviderSettings(parsed.provider, settings);
+  const normalizedRemote = parsed.repo != null && parsed.prNumber != null && provider != null
+    ? renderProviderTemplate(provider.urls.canonical, { repo: parsed.repo, number: parsed.prNumber })
     : remote.trim();
   const cacheKey = JSON.stringify([normalizedRemote, explicitCwd ?? "", parsed.repo == null ? fallbackCwd : ""]);
-  const cached = remoteTargetCache.get(cacheKey);
+  const cached = handoff == null ? remoteTargetCache.get(cacheKey) : undefined;
   if (cached != null && cached.expiresAt > Date.now()) {
     onProgress?.(`Using cached remote review for ${remote}…`);
     return cached.target;
@@ -584,20 +572,25 @@ export async function resolveRemoteReviewTarget(pi: ExtensionAPI, fallbackCwd: s
   remoteTargetCache.delete(cacheKey);
 
   onProgress?.(`Preparing remote review for ${remote}…`);
-  const { gitRoot, fetchRemote, workspacePath, pathspecs, importAliases } = await resolveRepoRoot(pi, fallbackCwd, parsed.repo, explicitCwd, onProgress);
+  const { gitRoot, fetchRemote, workspacePath, pathspecs, importAliases } = await resolveRepoRoot(
+    pi,
+    fallbackCwd,
+    parsed.repo,
+    explicitCwd,
+    settings,
+    provider,
+    onProgress,
+  );
 
-  if (parsed.prNumber != null) {
-    const provider = parsed.provider ?? "github";
-    const pullRequest = await getPullRequestMetadata(pi, gitRoot, parsed.prNumber, parsed.repo, onProgress, provider);
-    const refs = provider === "provider"
-      ? await fetchproviderPullRequestRefs(pi, gitRoot, pullRequest, fetchRemote, onProgress)
-      : await fetchPullRequestRefs(pi, gitRoot, pullRequest, fetchRemote, onProgress);
-    if (provider === "github" && shouldScanStackParentCandidates()) {
-      const closestStackParent = await findClosestStackParent(pi, gitRoot, pullRequest, refs.baseRef, refs.headRef, fetchRemote, parsed.repo, onProgress);
-      if (closestStackParent != null) {
-        refs.baseRef = closestStackParent.baseRef;
-        pullRequest.stackParent = closestStackParent.stackParent;
-      }
+  if (parsed.prNumber != null && parsed.repo != null && provider != null) {
+    const pullRequest = handoff == null
+      ? await getConfiguredPullRequestMetadata(pi, gitRoot, parsed.prNumber, parsed.repo, provider, onProgress)
+      : pullRequestMetadataFromHandoff(handoff);
+    if (handoff != null) onProgress?.(`Using supplied PR #${handoff.number} metadata…`);
+    const refs = await fetchPullRequestRefs(pi, gitRoot, pullRequest, provider, fetchRemote, onProgress);
+    if (handoff != null && !getProviderCapability(provider, "baseRevisionRequired")) {
+      onProgress?.(`Verifying PR #${pullRequest.number} head commit…`);
+      await verifySuppliedHeadRevision(pi, gitRoot, refs.headRef, pullRequest);
     }
     const target: RemoteReviewTarget = {
       gitRoot,
@@ -610,9 +603,10 @@ export async function resolveRemoteReviewTarget(pi: ExtensionAPI, fallbackCwd: s
       workspacePath,
       pathspecs,
       importAliases,
-      provider,
+      provider: provider.id,
+      handoff,
     };
-    remoteTargetCache.set(cacheKey, { target, expiresAt: Date.now() + REMOTE_TARGET_CACHE_TTL_MS });
+    if (handoff == null) remoteTargetCache.set(cacheKey, { target, expiresAt: Date.now() + REMOTE_TARGET_CACHE_TTL_MS });
     return target;
   }
 

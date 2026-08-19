@@ -1,5 +1,14 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { ReviewContextPanelSource } from "./types.js";
+import { hasHandoffContext } from "./pr-handoff.js";
+import {
+  getProviderCapability,
+  readConfiguredField,
+  renderProviderOperation,
+  renderProviderTemplate,
+  requireProviderSettings,
+  type ProviderSettings,
+} from "./provider-settings.js";
 import type { RemoteReviewTarget } from "./remote.js";
 
 interface PullRequestAuthor {
@@ -53,6 +62,9 @@ interface StatusSummary {
 
 const SUMMARY_LABELS = new Set(["Title", "URL", "Author", "Diff", "Status", "Problem", "Changes", "Validation", "Open comments", "Stack"]);
 
+const QUERY_OPEN_TOKEN = "__CODE_DIFF_QUERY_OPEN__";
+const QUERY_CLOSE_TOKEN = "__CODE_DIFF_QUERY_CLOSE__";
+
 const OPEN_REVIEW_THREADS_QUERY = `
 query PullRequestOpenThreads($owner: String!, $name: String!, $number: Int!) {
   repository(owner: $owner, name: $name) {
@@ -79,14 +91,17 @@ query PullRequestOpenThreads($owner: String!, $name: String!, $number: Int!) {
   }
 }`;
 
-function ghArgs(args: string[], repo: string | undefined): string[] {
-  return repo == null ? args : [...args, "--repo", repo];
+function providerForTarget(target: RemoteReviewTarget): ProviderSettings {
+  const providerId = target.provider ?? target.handoff?.provider;
+  if (providerId == null) throw new Error("Remote pull request provider is not configured.");
+  return requireProviderSettings(providerId);
 }
 
-function pullRequestUrl(target: RemoteReviewTarget): string {
+function pullRequestUrl(target: RemoteReviewTarget, provider: ProviderSettings): string {
   const pr = target.pullRequest!;
-  if (target.provider === "provider") return `https://review-host.example.io/repos/${target.repo}/pulls/${pr.number}`;
-  return target.repo == null ? target.remote : `https://github.com/${target.repo}/pull/${pr.number}`;
+  const repo = target.repo ?? pr.repo;
+  if (repo == null) return target.remote;
+  return renderProviderTemplate(provider.urls.canonical, { repo, number: pr.number });
 }
 
 function normalizePlainText(value: string): string {
@@ -159,7 +174,8 @@ function formatThreadSummary(thread: PullRequestThread, maxLength: number): stri
 }
 
 function hasChangesRequested(details: PullRequestDetails): boolean {
-  return latestSubstantiveItems(details.reviews, 20).some((review) => review.state === "CHANGES_REQUESTED");
+  return String(details.reviewDecision ?? "").toUpperCase() === "CHANGES_REQUESTED"
+    || latestSubstantiveItems(details.reviews, 20).some((review) => review.state === "CHANGES_REQUESTED");
 }
 
 function checkName(check: PullRequestCheck): string {
@@ -215,8 +231,8 @@ function extractBodySignal(body: string): string {
   return lines.slice(0, 4).join(" ");
 }
 
-function formatChecks(details: PullRequestDetails): string {
-  if (details.checksUnavailable) return "Check details unavailable from provider context.";
+function formatChecks(details: PullRequestDetails, provider: ProviderSettings): string {
+  if (details.checksUnavailable) return `Check details unavailable from ${provider.label} context.`;
   const failed = failingChecks(details).slice(0, 4).map(checkName);
   if (failed.length > 0) return `Failing: ${failed.join(", ")}`;
   const pending = pendingChecks(details).slice(0, 4).map(checkName);
@@ -248,14 +264,15 @@ function formatReadableSummary(value: string): string {
 
 function replaceSummaryField(summary: string, label: string, value: string): string {
   const field = `${label}:`;
+  const cleanValue = stripMarkup(value);
   const lines = summary.split("\n");
   const index = lines.findIndex((line) => line.trim() === field);
-  if (index < 0) return `${field}\n${value}\n\n${summary}`.trim();
+  if (index < 0) return `${field}\n${cleanValue}\n\n${summary}`.trim();
 
   let end = index + 1;
   while (end < lines.length && lines[end]!.trim().length === 0) end += 1;
-  if (end < lines.length) lines[end] = value;
-  else lines.push(value);
+  if (end < lines.length) lines[end] = cleanValue;
+  else lines.push(cleanValue);
   return lines.join("\n").trim();
 }
 
@@ -265,29 +282,18 @@ function formatDiffStats(target: RemoteReviewTarget): string {
   return `${pr.changedFiles} ${fileLabel} touched | +${pr.additions}/-${pr.deletions}`;
 }
 
-function formatAuthor(authorLogin: string, body: string): string {
-  if (authorLogin !== "example/river") return authorLogin;
-
-  const requester = body.match(/^[ \t]*Requested by[ \t]+([^<\r\n]+?)[ \t]+<([^<>\s]+@[^<>\s]+)>[ \t]*$/im);
-  const name = requester?.[1]?.replace(/\s+/g, " ").trim();
-  const email = requester?.[2]?.trim();
-  if (name == null || name.length === 0 || email == null || email.length === 0) return authorLogin;
-
-  return `${authorLogin} requested by ${name} ${email}`;
-}
-
-function enforceIdentityFields(summary: string, target: RemoteReviewTarget, details: PullRequestDetails): string {
+function enforceIdentityFields(summary: string, target: RemoteReviewTarget, details: PullRequestDetails, provider: ProviderSettings): string {
   const pr = target.pullRequest!;
-  const url = details.url ?? pullRequestUrl(target);
+  const url = details.url ?? pullRequestUrl(target, provider);
   return [
     ["Diff", formatDiffStats(target)],
-    ["Author", formatAuthor(pr.authorLogin, pr.body)],
+    ["Author", pr.authorLogin],
     ["URL", url],
     ["Title", pr.title],
   ].reduce((current, [label, value]) => replaceSummaryField(current, label, value), summary);
 }
 
-function fallbackSummary(target: RemoteReviewTarget, details: PullRequestDetails): string {
+function fallbackSummary(target: RemoteReviewTarget, details: PullRequestDetails, provider: ProviderSettings): string {
   const pr = target.pullRequest!;
   const status = deriveStatus(details);
   const threads = openReviewThreads(details, 4).map((thread) => formatThreadSummary(thread, 180));
@@ -299,19 +305,19 @@ function fallbackSummary(target: RemoteReviewTarget, details: PullRequestDetails
 
   return [
     `Title: ${pr.title}`,
-    `URL: ${details.url ?? pullRequestUrl(target)}`,
-    `Author: ${formatAuthor(pr.authorLogin, pr.body)}`,
+    `URL: ${details.url ?? pullRequestUrl(target, provider)}`,
+    `Author: ${pr.authorLogin}`,
     `Diff: ${formatDiffStats(target)}`,
     `Status: ${status.status} - ${status.reason}`,
     `Problem: ${bodySignal || "PR body did not include a clear problem statement."}`,
     "Changes: Not summarized by the model; read the diff for implementation details.",
-    `Validation: ${formatChecks(details)}`,
+    `Validation: ${formatChecks(details, provider)}`,
     `Open comments: ${threads.length > 0 ? threads.join("; ") : reviews.length > 0 ? reviews.join("; ") : comments.length > 0 ? comments.join("; ") : "None found."}`,
     pr.stackParent != null ? `Stack: parent #${pr.stackParent.number} ${pr.stackParent.title}` : undefined,
   ].filter((line): line is string => line != null).join("\n");
 }
 
-function formatSummaryInput(target: RemoteReviewTarget, details: PullRequestDetails): string {
+function formatSummaryInput(target: RemoteReviewTarget, details: PullRequestDetails, provider: ProviderSettings): string {
   const pr = target.pullRequest!;
   const status = deriveStatus(details);
   const reviews = latestSubstantiveItems(details.reviews, 8)
@@ -326,14 +332,14 @@ function formatSummaryInput(target: RemoteReviewTarget, details: PullRequestDeta
 
   return [
     `Title: ${pr.title}`,
-    `URL: ${details.url ?? pullRequestUrl(target)}`,
-    `Author: ${formatAuthor(pr.authorLogin, pr.body)}`,
+    `URL: ${details.url ?? pullRequestUrl(target, provider)}`,
+    `Author: ${pr.authorLogin}`,
     `Diff: ${formatDiffStats(target)}`,
     `State: ${pr.state}`,
     `Computed status: ${status.status} - ${status.reason}`,
     `Review decision: ${details.reviewDecision ?? "unknown"}`,
     `Merge state: ${details.mergeStateStatus ?? "unknown"}`,
-    `Checks: ${formatChecks(details)}`,
+    `Checks: ${formatChecks(details, provider)}`,
     pr.stackParent != null ? `Stack parent: #${pr.stackParent.number} ${pr.stackParent.title}` : `Base branch: ${pr.baseRefName}`,
     "",
     "PR body:",
@@ -350,30 +356,87 @@ function formatSummaryInput(target: RemoteReviewTarget, details: PullRequestDeta
   ].join("\n");
 }
 
-async function fetchOpenReviewThreads(pi: ExtensionAPI, target: RemoteReviewTarget): Promise<PullRequestThread[]> {
-  const repo = target.repo;
-  const pr = target.pullRequest;
-  if (repo == null || pr == null) return [];
+function providerString(provider: ProviderSettings, field: string, value: unknown): string | undefined {
+  const configured = readConfiguredField(provider, field, value);
+  return typeof configured === "string" && configured.length > 0 ? configured : undefined;
+}
 
-  const [owner, name] = repo.split("/");
-  const number = Number.parseInt(pr.number, 10);
-  if (owner == null || name == null || !Number.isFinite(number)) return [];
+function providerBoolean(provider: ProviderSettings, field: string, value: unknown): boolean | undefined {
+  const configured = readConfiguredField(provider, field, value);
+  return typeof configured === "boolean" ? configured : undefined;
+}
 
-  const result = await pi.exec("provider-cli", [
-    "api",
-    "graphql",
-    "-f",
-    `owner=${owner}`,
-    "-f",
-    `name=${name}`,
-    "-F",
-    `number=${number}`,
-    "-f",
-    `query=${OPEN_REVIEW_THREADS_QUERY}`,
-  ], { cwd: target.gitRoot, timeout: 45000 });
-  if (result.code !== 0 || result.stdout.trim().length === 0) return [];
+function providerNumber(provider: ProviderSettings, field: string, value: unknown): number | null | undefined {
+  const configured = readConfiguredField(provider, field, value);
+  return typeof configured === "number" && Number.isFinite(configured) ? configured : configured === null ? null : undefined;
+}
 
-  const parsed = JSON.parse(result.stdout.trim()) as {
+function providerRows(provider: ProviderSettings, field: string, value: unknown, required: boolean): unknown[] {
+  const configured = readConfiguredField(provider, field, value);
+  const rows = configured ?? (Array.isArray(value) ? value : undefined);
+  if (Array.isArray(rows)) return rows;
+  if (!required && configured == null) return [];
+  throw new Error(`Malformed ${provider.label} response for ${field}.`);
+}
+
+function providerComment(provider: ProviderSettings, value: unknown): PullRequestComment {
+  const author = providerString(provider, "commentAuthor", value);
+  return {
+    ...(author == null ? {} : { author: { login: author } }),
+    body: providerString(provider, "commentBody", value),
+    createdAt: providerString(provider, "commentCreatedAt", value),
+    submittedAt: providerString(provider, "commentSubmittedAt", value),
+    state: providerString(provider, "commentState", value),
+    url: providerString(provider, "commentUrl", value),
+    path: providerString(provider, "commentPath", value),
+    line: providerNumber(provider, "commentLine", value),
+  };
+}
+
+function providerCheck(provider: ProviderSettings, value: unknown): PullRequestCheck {
+  return {
+    name: providerString(provider, "checkName", value),
+    workflowName: providerString(provider, "checkWorkflowName", value),
+    status: providerString(provider, "checkStatus", value),
+    conclusion: providerString(provider, "checkConclusion", value),
+  };
+}
+
+function encodeProviderQuery(value: string): string {
+  return value.replaceAll("{", QUERY_OPEN_TOKEN).replaceAll("}", QUERY_CLOSE_TOKEN);
+}
+
+function decodeProviderQuery(value: string): string {
+  return value.replaceAll(QUERY_OPEN_TOKEN, "{").replaceAll(QUERY_CLOSE_TOKEN, "}");
+}
+
+function parseProviderJson(provider: ProviderSettings, value: string, label: string): unknown {
+  try {
+    return JSON.parse(value) as unknown;
+  } catch {
+    throw new Error(`Malformed ${provider.label} response for ${label}.`);
+  }
+}
+
+async function fetchProviderOperation(
+  pi: ExtensionAPI,
+  target: RemoteReviewTarget,
+  provider: ProviderSettings,
+  operation: string,
+  values: Record<string, string | number>,
+  label: string,
+): Promise<unknown> {
+  const rendered = renderProviderOperation(provider, operation, values);
+  const args = rendered.args.map(decodeProviderQuery);
+  const result = await pi.exec(provider.executable, args, { cwd: target.gitRoot, timeout: 45000 });
+  if (result.code !== 0 || result.stdout.trim().length === 0) {
+    throw new Error(result.stderr.trim() || result.stdout.trim() || `Could not fetch ${provider.label} ${label}.`);
+  }
+  return parseProviderJson(provider, result.stdout.trim(), label);
+}
+
+function parseGraphqlReviewThreads(value: unknown): PullRequestThread[] {
+  const parsed = value as {
     data?: {
       repository?: {
         pullRequest?: {
@@ -383,17 +446,14 @@ async function fetchOpenReviewThreads(pi: ExtensionAPI, target: RemoteReviewTarg
               isOutdated?: boolean;
               path?: string;
               line?: number | null;
-              comments?: {
-                nodes?: PullRequestComment[];
-              };
+              comments?: { nodes?: PullRequestComment[] };
             }>;
           };
         };
       };
     };
   };
-
-  return (parsed.data?.repository?.pullRequest?.reviewThreads?.nodes ?? []).map((thread) => ({
+  return (parsed?.data?.repository?.pullRequest?.reviewThreads?.nodes ?? []).map((thread) => ({
     isResolved: thread.isResolved,
     isOutdated: thread.isOutdated,
     path: thread.path,
@@ -402,112 +462,89 @@ async function fetchOpenReviewThreads(pi: ExtensionAPI, target: RemoteReviewTarg
   }));
 }
 
-function parseproviderJson(value: string, label: string): unknown {
-  try {
-    return JSON.parse(value);
-  } catch {
-    throw new Error(`Malformed provider response for ${label}.`);
+async function fetchOpenReviewThreads(
+  pi: ExtensionAPI,
+  target: RemoteReviewTarget,
+  provider: ProviderSettings,
+  repo: string,
+  number: string,
+): Promise<PullRequestThread[]> {
+  const parts = repo.split("/");
+  const parsedNumber = Number.parseInt(number, 10);
+  if (getProviderCapability(provider, "graphqlReviewThreads") && parts.length === 2 && Number.isFinite(parsedNumber)) {
+    try {
+      const payload = await fetchProviderOperation(pi, target, provider, "reviewThreads", {
+        owner: parts[0]!,
+        name: parts[1]!,
+        number: parsedNumber,
+        query: encodeProviderQuery(OPEN_REVIEW_THREADS_QUERY.replace(/\s+/g, " ").trim()),
+      }, `PR #${number} review threads`);
+      return parseGraphqlReviewThreads(payload);
+    } catch {
+      if (provider.operations.reviewComments == null) return [];
+    }
   }
-}
 
-function providerRecord(value: unknown, label: string): Record<string, unknown> {
-  if (value == null || typeof value !== "object" || Array.isArray(value)) throw new Error(`Malformed provider response for ${label}.`);
-  return value as Record<string, unknown>;
-}
-
-async function fetchproviderApi(pi: ExtensionAPI, target: RemoteReviewTarget, endpoint: string, label: string, paginate = false): Promise<unknown> {
-  const result = await pi.exec("provider-cli", ["api", endpoint, ...(paginate ? ["--paginate"] : [])], { cwd: target.gitRoot, timeout: 45000 });
-  if (result.code !== 0 || result.stdout.trim().length === 0) throw new Error(result.stderr || result.stdout || `Could not fetch provider ${label}.`);
-  return parseproviderJson(result.stdout.trim(), label);
-}
-
-function providerComments(value: unknown, label: string): PullRequestComment[] {
-  if (!Array.isArray(value)) throw new Error(`Malformed provider response for ${label}.`);
-  return value.map((item, index) => {
-    const row = providerRecord(item, `${label}[${index}]`);
-    const user = providerRecord(row.user ?? row.author, `${label}[${index}].user`);
-    if (typeof user.login !== "string" || typeof row.body !== "string") throw new Error(`Malformed provider response for ${label}[${index}].`);
-    return {
-      author: { login: user.login },
-      body: row.body,
-      createdAt: typeof row.created_at === "string" ? row.created_at : undefined,
-      submittedAt: typeof row.submitted_at === "string" ? row.submitted_at : undefined,
-      state: typeof row.state === "string" ? row.state : undefined,
-      url: typeof row.html_url === "string" ? row.html_url : undefined,
-      path: typeof row.path === "string" ? row.path : undefined,
-      line: typeof row.line === "number" ? row.line : null,
-    };
-  });
-}
-
-async function fetchproviderPullRequestDetails(pi: ExtensionAPI, target: RemoteReviewTarget): Promise<PullRequestDetails> {
-  const pr = target.pullRequest!;
-  const repo = target.repo;
-  if (repo == null) throw new Error(`Could not fetch provider PR #${pr.number} context without a repository.`);
-  const prefix = `repos/${repo}`;
-  const [rawPr, rawComments, rawReviews, rawReviewComments] = await Promise.all([
-    fetchproviderApi(pi, target, `${prefix}/pulls/${pr.number}`, `PR #${pr.number}`),
-    fetchproviderApi(pi, target, `${prefix}/issues/${pr.number}/comments`, `PR #${pr.number} comments`, true),
-    fetchproviderApi(pi, target, `${prefix}/pulls/${pr.number}/reviews`, `PR #${pr.number} reviews`, true),
-    fetchproviderApi(pi, target, `${prefix}/pulls/${pr.number}/comments`, `PR #${pr.number} review comments`, true),
-  ]);
-  const row = providerRecord(rawPr, `PR #${pr.number}`);
-  const comments = providerComments(rawComments, `PR #${pr.number} comments`);
-  const reviews = providerComments(rawReviews, `PR #${pr.number} reviews`);
-  const reviewComments = providerComments(rawReviewComments, `PR #${pr.number} review comments`);
-  const rawReviewRows = rawReviewComments as unknown[];
-  const openReviewThreads = reviewComments.map((comment, index) => {
-    const reviewRow = providerRecord(rawReviewRows[index], `PR #${pr.number} review comments[${index}]`);
-    const extension = reviewRow.x_provider == null ? {} : providerRecord(reviewRow.x_provider, `PR #${pr.number} review comments[${index}].x_provider`);
+  const payload = await fetchProviderOperation(pi, target, provider, "reviewComments", { repo, number }, `PR #${number} review comments`);
+  const rows = providerRows(provider, "pullRequestReviewComments", payload, true);
+  return rows.map((row) => {
+    const comment = providerComment(provider, row);
     return {
       path: comment.path,
       line: comment.line,
-      isResolved: extension.is_resolved === true,
-      isOutdated: false,
+      isResolved: providerBoolean(provider, "commentResolved", row) === true,
+      isOutdated: providerBoolean(provider, "commentOutdated", row) === true,
       comments: [comment],
     };
   });
-  const extension = row.x_provider == null ? {} : providerRecord(row.x_provider, `PR #${pr.number}.x_provider`);
-  const mergeability = extension.mergeability == null ? {} : providerRecord(extension.mergeability, `PR #${pr.number}.x_provider.mergeability`);
-  const reviewDecision = mergeability.has_changes_requested_review === true
-    ? "CHANGES_REQUESTED"
-    : mergeability.has_approved_review === true ? "APPROVED" : undefined;
-  return {
-    url: pullRequestUrl(target),
-    isDraft: row.draft === true,
-    mergeStateStatus: typeof row.mergeable_state === "string" ? row.mergeable_state.toUpperCase() : undefined,
-    reviewDecision,
-    comments,
-    reviews,
-    openReviewThreads,
-    statusCheckRollup: [],
-    checksUnavailable: true,
-    createdAt: typeof row.created_at === "string" ? row.created_at : undefined,
-    updatedAt: typeof row.updated_at === "string" ? row.updated_at : undefined,
-  };
 }
 
-async function fetchPullRequestDetails(pi: ExtensionAPI, target: RemoteReviewTarget): Promise<PullRequestDetails> {
-  if (target.provider === "provider") return fetchproviderPullRequestDetails(pi, target);
+async function fetchPullRequestDetails(
+  pi: ExtensionAPI,
+  target: RemoteReviewTarget,
+  provider: ProviderSettings,
+): Promise<PullRequestDetails> {
   const pr = target.pullRequest!;
-  const fields = "url,isDraft,mergeStateStatus,reviewDecision,statusCheckRollup,comments,reviews,createdAt,updatedAt";
-  const result = await pi.exec("provider-cli", ghArgs(["pr", "view", pr.number, "--json", fields], target.repo), { cwd: target.gitRoot, timeout: 45000 });
-  if (result.code !== 0 || result.stdout.trim().length === 0) {
-    throw new Error(result.stderr || result.stdout || `Could not fetch PR #${pr.number} context.`);
-  }
+  const repo = target.repo ?? pr.repo;
+  if (repo == null) throw new Error(`Could not fetch ${provider.label} PR #${pr.number} context without a repository.`);
 
-  const details = JSON.parse(result.stdout.trim()) as PullRequestDetails;
-  try {
-    details.openReviewThreads = await fetchOpenReviewThreads(pi, target);
-  } catch {
-    details.openReviewThreads = [];
-  }
-  return details;
+  const detailsPayload = await fetchProviderOperation(pi, target, provider, "pullRequestDetails", { repo, number: pr.number }, `PR #${pr.number}`);
+  const separateContext = getProviderCapability(provider, "separatePullRequestContext");
+  const [commentsPayload, reviewsPayload, openReviewThreads] = await Promise.all([
+    separateContext
+      ? fetchProviderOperation(pi, target, provider, "pullRequestComments", { repo, number: pr.number }, `PR #${pr.number} comments`)
+      : Promise.resolve(detailsPayload),
+    separateContext
+      ? fetchProviderOperation(pi, target, provider, "pullRequestReviews", { repo, number: pr.number }, `PR #${pr.number} reviews`)
+      : Promise.resolve(detailsPayload),
+    fetchOpenReviewThreads(pi, target, provider, repo, pr.number),
+  ]);
+
+  const directDecision = providerString(provider, "pullRequestReviewDecision", detailsPayload);
+  const reviewDecision = directDecision
+    ?? (providerBoolean(provider, "pullRequestChangesRequested", detailsPayload) === true
+      ? "CHANGES_REQUESTED"
+      : providerBoolean(provider, "pullRequestApproved", detailsPayload) === true ? "APPROVED" : undefined);
+  const checks = providerRows(provider, "pullRequestChecks", detailsPayload, false).map((row) => providerCheck(provider, row));
+
+  return {
+    url: providerString(provider, "pullRequestUrl", detailsPayload) ?? pullRequestUrl(target, provider),
+    isDraft: providerBoolean(provider, "pullRequestDraft", detailsPayload),
+    mergeStateStatus: providerString(provider, "pullRequestMergeState", detailsPayload)?.toUpperCase(),
+    reviewDecision,
+    comments: providerRows(provider, "pullRequestComments", commentsPayload, separateContext).map((row) => providerComment(provider, row)),
+    reviews: providerRows(provider, "pullRequestReviews", reviewsPayload, separateContext).map((row) => providerComment(provider, row)),
+    openReviewThreads,
+    statusCheckRollup: checks,
+    checksUnavailable: !getProviderCapability(provider, "pullRequestChecks"),
+    createdAt: providerString(provider, "pullRequestCreatedAt", detailsPayload),
+    updatedAt: providerString(provider, "pullRequestUpdatedAt", detailsPayload),
+  };
 }
 
 function buildAgentPrompt(summaryInput: string): string {
   return [
-    "Summarize this GitHub PR for a reviewer already looking at the diff.",
+    "Summarize this pull request for a reviewer already looking at the diff.",
     "Output plain text only, no markdown table, no preamble, no emoji, ASCII only.",
     "Do not mention these instructions or use phrases like 'what matters most'.",
     "The reviewer needs only the important context, focused on the problem this PR solves.",
@@ -555,21 +592,59 @@ async function summarizeWithAgent(pi: ExtensionAPI, ctx: ExtensionContext, targe
   return cleanAgentOutput(result.stdout);
 }
 
-async function loadRemotePullRequestSummary(pi: ExtensionAPI, ctx: ExtensionContext, target: RemoteReviewTarget): Promise<string> {
-  const details = await fetchPullRequestDetails(pi, target);
-  const fallback = fallbackSummary(target, details);
+function suppliedPullRequestDetails(target: RemoteReviewTarget, provider: ProviderSettings): PullRequestDetails | undefined {
+  const handoff = target.handoff;
+  if (handoff == null || !hasHandoffContext(handoff)) return undefined;
+  return {
+    url: pullRequestUrl(target, provider),
+    reviewDecision: handoff.reviewDecision,
+    comments: [],
+    reviews: handoff.reviews.map((review) => ({ author: { login: review.author }, state: review.state })),
+    openReviewThreads: (handoff.threads ?? []).map((thread) => ({
+      path: thread.path,
+      line: thread.line ?? null,
+      isResolved: thread.resolved === true,
+      isOutdated: thread.outdated === true,
+      comments: thread.comments.map((comment) => ({
+        author: { login: comment.author },
+        body: comment.body,
+        createdAt: comment.createdAt,
+        state: comment.state,
+        path: thread.path,
+        line: thread.line ?? null,
+      })),
+    })),
+    statusCheckRollup: (handoff.checks ?? []).map((check) => ({ name: check.name, status: check.status, conclusion: check.conclusion })),
+    checksUnavailable: handoff.checks == null,
+  };
+}
+
+async function loadRemotePullRequestSummary(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  target: RemoteReviewTarget,
+  provider: ProviderSettings,
+): Promise<string> {
+  const supplied = suppliedPullRequestDetails(target, provider);
+  const details = supplied ?? await fetchPullRequestDetails(pi, target, provider);
+  const suppliedSummary = target.handoff?.summary;
+  if (suppliedSummary != null) return enforceIdentityFields(formatReadableSummary(suppliedSummary), target, details, provider);
+  const fallback = fallbackSummary(target, details, provider);
   try {
-    return enforceIdentityFields(formatReadableSummary(await summarizeWithAgent(pi, ctx, target, formatSummaryInput(target, details)) ?? fallback), target, details);
+    const generated = await summarizeWithAgent(pi, ctx, target, formatSummaryInput(target, details, provider));
+    return enforceIdentityFields(formatReadableSummary(generated ?? fallback), target, details, provider);
   } catch {
-    return enforceIdentityFields(formatReadableSummary(fallback), target, details);
+    return enforceIdentityFields(formatReadableSummary(fallback), target, details, provider);
   }
 }
 
 export function createRemotePullRequestSummarySource(pi: ExtensionAPI, ctx: ExtensionContext, target: RemoteReviewTarget | undefined): ReviewContextPanelSource | undefined {
   if (target?.pullRequest == null) return undefined;
+  const provider = providerForTarget(target);
   return {
-    title: "PR context",
-    loadingText: "Loading PR context...",
-    load: () => loadRemotePullRequestSummary(pi, ctx, target),
+    title: `${provider.label} PR context`,
+    loadingText: `Loading ${provider.label} PR context...`,
+    load: () => loadRemotePullRequestSummary(pi, ctx, target, provider),
+    url: pullRequestUrl(target, provider),
   };
 }

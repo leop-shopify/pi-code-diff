@@ -2,6 +2,14 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import {
+  getProviderCapability,
+  readConfiguredField,
+  renderProviderOperation,
+  renderProviderTemplate,
+  requireProviderSettings,
+  type ProviderSettings,
+} from "./provider-settings.js";
 import type { PullRequestProvider } from "./remote.js";
 import type { DiffReviewComment, ReviewFile, ReviewSubmitPayload } from "./types.js";
 import { joinReviewPath } from "./types.js";
@@ -19,7 +27,7 @@ export interface ReviewInlineComment {
 }
 
 export interface SubmitReviewInput {
-  provider?: PullRequestProvider;
+  provider: PullRequestProvider;
   repo: string;
   prNumber: string;
   commitId: string;
@@ -61,12 +69,9 @@ function cleanReviewText(text: string): string {
 function formatModifyInlineBody(comment: DiffReviewComment): string {
   const oldText = comment.originalText;
   if (oldText == null || oldText.length === 0) return comment.body;
-
   const lines = ["Suggested change:", "", "```diff"];
   for (const line of oldText.split(/\r\n|\n|\r/)) lines.push(`- ${line}`);
-  if (comment.body.length > 0) {
-    for (const line of comment.body.split(/\r\n|\n|\r/)) lines.push(`+ ${line}`);
-  }
+  for (const line of comment.body.split(/\r\n|\n|\r/)) lines.push(`+ ${line}`);
   lines.push("```");
   return lines.join("\n");
 }
@@ -82,10 +87,9 @@ export function buildInlineComments(files: ReviewFile[], comments: DiffReviewCom
     if (comment.side === "file" || comment.startLine == null) continue;
     const file = files.find((candidate) => candidate.id === comment.fileId);
     if (file?.pathPrefix != null) continue;
-    const path = getCommentFilePath(files, comment.fileId);
     const side = comment.side === "deleted" ? "LEFT" : "RIGHT";
     const line = comment.endLine ?? comment.startLine;
-    const entry: ReviewInlineComment = { path, line, side, body: getInlineCommentBody(comment) };
+    const entry: ReviewInlineComment = { path: getCommentFilePath(files, comment.fileId), line, side, body: getInlineCommentBody(comment) };
     if (comment.startLine !== line) {
       entry.start_line = comment.startLine;
       entry.start_side = side;
@@ -95,21 +99,27 @@ export function buildInlineComments(files: ReviewFile[], comments: DiffReviewCom
   return inline;
 }
 
-export function buildproviderComments(files: ReviewFile[], comments: DiffReviewComment[]): ReviewInlineComment[] {
-  const reviewComments: ReviewInlineComment[] = [];
+export function buildProviderComments(
+  files: ReviewFile[],
+  comments: DiffReviewComment[],
+  allowFileComments: boolean,
+  providerLabel: string,
+): ReviewInlineComment[] {
+  if (!allowFileComments) return buildInlineComments(files, comments);
+  const result: ReviewInlineComment[] = [];
   for (const comment of comments) {
     if (comment.intent !== "comment" && comment.intent !== "modify") continue;
     const file = files.find((candidate) => candidate.id === comment.fileId);
-    if (file == null || file.pathPrefix != null) throw new Error(`provider cannot safely map review comment ${comment.id} to a repository path.`);
-    const path = getCommentFilePath(files, comment.fileId);
+    if (file == null || file.pathPrefix != null) throw new Error(`${providerLabel} cannot safely map review comment ${comment.id} to a repository path.`);
     const body = getInlineCommentBody(comment);
-    if (body.trim().length === 0) throw new Error(`provider review comment ${comment.id} has an empty body.`);
+    if (body.trim().length === 0) throw new Error(`${providerLabel} review comment ${comment.id} has an empty body.`);
+    const path = getCommentFilePath(files, comment.fileId);
     if (comment.side === "file") {
-      if (comment.intent === "modify") throw new Error(`provider cannot safely map file-level MODIFY comment ${comment.id}.`);
-      reviewComments.push({ path, subject_type: "file", body });
+      if (comment.intent === "modify") throw new Error(`${providerLabel} cannot safely map file-level MODIFY comment ${comment.id}.`);
+      result.push({ path, subject_type: "file", body });
       continue;
     }
-    if (comment.startLine == null) throw new Error(`provider cannot safely map review comment ${comment.id} without a line.`);
+    if (comment.startLine == null) throw new Error(`${providerLabel} cannot safely map review comment ${comment.id} without a line.`);
     const side = comment.side === "deleted" ? "LEFT" : "RIGHT";
     const line = comment.endLine ?? comment.startLine;
     const entry: ReviewInlineComment = { path, line, side, body };
@@ -117,58 +127,38 @@ export function buildproviderComments(files: ReviewFile[], comments: DiffReviewC
       entry.start_line = comment.startLine;
       entry.start_side = side;
     }
-    reviewComments.push(entry);
+    result.push(entry);
   }
-  return reviewComments;
+  return result;
 }
 
 export function buildReviewBody(files: ReviewFile[], payload: ReviewSubmitPayload, includeFileComments = true): string | undefined {
   const sections: string[] = [];
   const allComment = cleanReviewText(payload.allComment);
   if (payload.allIntent === "comment" && allComment.length > 0) sections.push(allComment);
-
   for (const comment of payload.comments) {
     if (!includeFileComments || comment.intent !== "comment" || comment.side !== "file") continue;
     const body = cleanReviewText(comment.body);
-    if (body.length === 0) continue;
-    sections.push(`${getCommentFilePath(files, comment.fileId)}:\n${body}`);
+    if (body.length > 0) sections.push(`${getCommentFilePath(files, comment.fileId)}:\n${body}`);
   }
-
   return sections.length > 0 ? sections.join("\n\n") : undefined;
 }
 
-export async function getCurrentGitHubLogin(pi: ExtensionAPI, gitRoot?: string): Promise<string | null> {
-  const result = await pi.exec("provider-cli", ["api", "user", "--jq", ".login"], { cwd: gitRoot, timeout: 15000 });
-  if (result.code !== 0) return null;
-  const login = result.stdout.trim();
-  return login.length > 0 ? login : null;
+function providerForInput(input: SubmitReviewInput): ProviderSettings {
+  return requireProviderSettings(input.provider);
 }
 
-async function getCurrentproviderLogin(pi: ExtensionAPI, gitRoot?: string): Promise<string> {
-  const result = await pi.exec("provider-cli", ["api", "/user"], { cwd: gitRoot, timeout: 15000 });
-  if (result.code !== 0) throw new Error(result.stderr.trim() || result.stdout.trim() || "provider identity lookup failed.");
-  try {
-    const parsed = JSON.parse(result.stdout.trim()) as { login?: unknown };
-    if (typeof parsed.login !== "string" || parsed.login.length === 0) throw new Error();
-    return parsed.login;
-  } catch {
-    throw new Error("Malformed provider response for current user.");
-  }
-}
-
-export function buildReviewPayload(input: SubmitReviewInput): Record<string, unknown> {
+export function buildReviewPayload(input: SubmitReviewInput, provider = providerForInput(input)): Record<string, unknown> {
   const payload: Record<string, unknown> = { event: EVENT_BY_VERDICT[input.verdict] };
   const body = input.body?.trim();
   if (body != null && body.length > 0) payload.body = body;
-  if (input.provider === "provider" || (input.comments != null && input.comments.length > 0)) payload.commit_id = input.commitId;
-  if (input.comments != null && input.comments.length > 0) payload.comments = input.comments;
+  if (getProviderCapability(provider, "commitIdRequired") || (input.comments?.length ?? 0) > 0) payload.commit_id = input.commitId;
+  if ((input.comments?.length ?? 0) > 0) payload.comments = input.comments;
   return payload;
 }
 
-function formatReviewSummary(input: SubmitReviewInput, commentCount: number, bodyIncluded: boolean): string {
-  const url = input.provider === "provider"
-    ? `https://review-host.example.io/repos/${input.repo}/pulls/${input.prNumber}`
-    : `https://github.com/${input.repo}/pull/${input.prNumber}`;
+function formatReviewSummary(input: SubmitReviewInput, provider: ProviderSettings, commentCount: number, bodyIncluded: boolean): string {
+  const url = renderProviderTemplate(provider.urls.canonical, { repo: input.repo, number: input.prNumber });
   const time = new Intl.DateTimeFormat("en-US", { hour: "2-digit", minute: "2-digit", hour12: false }).format(new Date());
   const action = input.verdict === "approve" ? "PR was approved" : input.verdict === "request_changes" ? "Changes were requested" : "Review comment was posted";
   const comments = commentCount === 0 ? "No inline comments were added." : `${commentCount} inline comment${commentCount === 1 ? " was" : "s were"} added.`;
@@ -182,55 +172,48 @@ function formatReviewSummary(input: SubmitReviewInput, commentCount: number, bod
   return [url, `${action} at ${time}.`, comments, body].filter((line): line is string => line != null).join("\n");
 }
 
-async function validateproviderTarget(pi: ExtensionAPI, input: SubmitReviewInput): Promise<void> {
-  if (input.baseCommitId == null || input.baseCommitId.length === 0) throw new Error("provider review submission requires the immutable base commit SHA.");
-  const endpoint = `repos/${input.repo}/pulls/${input.prNumber}`;
-  const result = await pi.exec("provider-cli", ["api", endpoint], { cwd: input.gitRoot, timeout: 15000 });
-  if (result.code !== 0) throw new Error(result.stderr.trim() || result.stdout.trim() || "provider target validation failed.");
+function parseJson(value: string, provider: ProviderSettings, label: string): unknown {
   try {
-    const parsed = JSON.parse(result.stdout.trim()) as { state?: unknown; head?: { sha?: unknown }; base?: { sha?: unknown } };
-    if (typeof parsed.state !== "string" || typeof parsed.head?.sha !== "string" || typeof parsed.base?.sha !== "string") throw new Error();
-    if (parsed.state.toLowerCase() !== "open") throw new Error(`provider PR #${input.prNumber} is no longer open.`);
-    if (parsed.head.sha !== input.commitId) throw new Error(`provider PR #${input.prNumber} head changed from ${input.commitId} to ${parsed.head.sha}. Reopen the review before submitting.`);
-    if (parsed.base.sha !== input.baseCommitId) throw new Error(`provider PR #${input.prNumber} base changed from ${input.baseCommitId} to ${parsed.base.sha}. Reopen the review before submitting.`);
-  } catch (error) {
-    if (error instanceof Error && error.message.startsWith("provider PR #")) throw error;
-    throw new Error(`Malformed provider response for PR #${input.prNumber} target validation.`);
+    return JSON.parse(value) as unknown;
+  } catch {
+    throw new Error(`Malformed ${provider.label} response for ${label}.`);
   }
 }
 
-async function postReview(pi: ExtensionAPI, input: SubmitReviewInput, submission: ReviewSubmission): Promise<SubmitReviewResult> {
-  const payload = buildReviewPayload({ ...input, verdict: submission.verdict, body: submission.body, comments: submission.comments });
-  const dir = mkdtempSync(join(tmpdir(), "pi-code-diff-review-"));
-  const payloadPath = join(dir, "review.json");
-  try {
-    writeFileSync(payloadPath, JSON.stringify(payload), "utf8");
-    const provider = input.provider === "provider";
-    const result = await pi.exec(
-      provider ? "provider-cli" : "provider-cli",
-      provider
-        ? ["api", `repos/${input.repo}/pulls/${input.prNumber}/reviews`, "-X", "POST", "--input", payloadPath]
-        : ["api", `repos/${input.repo}/pulls/${input.prNumber}/reviews`, "--method", "POST", "--input", payloadPath],
-      { cwd: input.gitRoot, timeout: 20000 },
-    );
-    if (result.code !== 0) {
-      return { ok: false, message: result.stderr.trim() || result.stdout.trim() || `${provider ? "provider-cli" : "provider-cli"} api review submission failed.` };
-    }
-    if (provider) {
-      try {
-        const parsed = JSON.parse(result.stdout.trim()) as { id?: unknown; state?: unknown };
-        if ((typeof parsed.id !== "number" && typeof parsed.id !== "string") || typeof parsed.state !== "string") throw new Error();
-      } catch {
-        return { ok: false, message: "Malformed provider response after review submission; inspect the PR before retrying." };
-      }
-    }
-    return { ok: true, message: "submitted" };
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
+async function executeOperation(
+  pi: ExtensionAPI,
+  input: SubmitReviewInput,
+  provider: ProviderSettings,
+  operation: string,
+  values: Record<string, string | number>,
+  timeout: number,
+): Promise<{ stdout: string; stderr: string; code: number }> {
+  const configured = renderProviderOperation(provider, operation, values);
+  return pi.exec(provider.executable, configured.args, { cwd: input.gitRoot, timeout });
 }
 
-function validateReviewComments(input: SubmitReviewInput): string | undefined {
+async function getCurrentLogin(pi: ExtensionAPI, input: SubmitReviewInput, provider: ProviderSettings): Promise<string | null> {
+  if (provider.operations.identity == null) return null;
+  const result = await executeOperation(pi, input, provider, "identity", { repo: input.repo, number: input.prNumber }, 15000);
+  if (result.code !== 0 || result.stdout.trim().length === 0) throw new Error(result.stderr.trim() || result.stdout.trim() || `${provider.label} identity lookup failed.`);
+  const login = readConfiguredField(provider, "identityLogin", parseJson(result.stdout.trim(), provider, "current user"));
+  if (typeof login !== "string" || login.length === 0) throw new Error(`Malformed ${provider.label} response for current user.`);
+  return login;
+}
+
+async function validateLiveTarget(pi: ExtensionAPI, input: SubmitReviewInput, provider: ProviderSettings): Promise<void> {
+  if (!getProviderCapability(provider, "validateTargetBeforeSubmit")) return;
+  const result = await executeOperation(pi, input, provider, "pullRequest", { repo: input.repo, number: input.prNumber }, 15000);
+  if (result.code !== 0 || result.stdout.trim().length === 0) throw new Error(result.stderr.trim() || result.stdout.trim() || `${provider.label} target validation failed.`);
+  const parsed = parseJson(result.stdout.trim(), provider, `PR #${input.prNumber} target`);
+  const state = readConfiguredField(provider, "state", parsed);
+  const head = readConfiguredField(provider, "headRefOid", parsed);
+  if (typeof state !== "string" || typeof head !== "string") throw new Error(`Malformed ${provider.label} response for PR #${input.prNumber} target validation.`);
+  if (state.toLowerCase() !== "open") throw new Error(`${provider.label} PR #${input.prNumber} is no longer open.`);
+  if (head !== input.commitId) throw new Error(`${provider.label} PR #${input.prNumber} head changed from ${input.commitId} to ${head}. Reopen the review before submitting.`);
+}
+
+function validateReviewComments(input: SubmitReviewInput, provider: ProviderSettings): string | undefined {
   for (const [index, comment] of (input.comments ?? []).entries()) {
     const segments = comment.path.split("/");
     if (comment.path.length === 0 || comment.path.startsWith("/") || comment.path.includes("\\") || segments.some((segment) => segment === "" || segment === "." || segment === "..")) {
@@ -238,7 +221,7 @@ function validateReviewComments(input: SubmitReviewInput): string | undefined {
     }
     if (comment.body.trim().length === 0) return `Review comment ${index + 1} has an empty body.`;
     if (comment.subject_type === "file") {
-      if (input.provider !== "provider") return `File-level review comment ${index + 1} is only supported for provider submissions.`;
+      if (!getProviderCapability(provider, "fileComments")) return `File-level review comment ${index + 1} is not supported by ${provider.label}.`;
       if (comment.line != null || comment.side != null || comment.start_line != null || comment.start_side != null) return `File-level review comment ${index + 1} contains unsupported line fields.`;
       continue;
     }
@@ -252,56 +235,78 @@ function validateReviewComments(input: SubmitReviewInput): string | undefined {
   return undefined;
 }
 
+async function postReview(pi: ExtensionAPI, input: SubmitReviewInput, provider: ProviderSettings, submission: ReviewSubmission): Promise<SubmitReviewResult> {
+  const payload = buildReviewPayload({ ...input, verdict: submission.verdict, body: submission.body, comments: submission.comments }, provider);
+  const directory = mkdtempSync(join(tmpdir(), "pi-code-diff-review-"));
+  const payloadPath = join(directory, "review.json");
+  try {
+    writeFileSync(payloadPath, JSON.stringify(payload), { encoding: "utf8", mode: 0o600 });
+    const result = await executeOperation(pi, input, provider, "submitReview", { repo: input.repo, number: input.prNumber, payloadPath }, 20000);
+    if (result.code !== 0) return { ok: false, message: result.stderr.trim() || result.stdout.trim() || `${provider.label} review submission failed.` };
+    if (getProviderCapability(provider, "validateSubmitResponse")) {
+      const parsed = parseJson(result.stdout.trim(), provider, "review submission");
+      const id = readConfiguredField(provider, "submissionId", parsed);
+      const state = readConfiguredField(provider, "submissionState", parsed);
+      if ((typeof id !== "number" && typeof id !== "string") || typeof state !== "string") {
+        return { ok: false, message: `Malformed ${provider.label} response after review submission; inspect the PR before retrying.` };
+      }
+    }
+    return { ok: true, message: "submitted" };
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+}
+
 export async function submitPullRequestReview(pi: ExtensionAPI, input: SubmitReviewInput): Promise<SubmitReviewResult> {
-  const invalidComment = validateReviewComments(input);
+  let provider: ProviderSettings;
+  try {
+    provider = providerForInput(input);
+  } catch (error) {
+    return { ok: false, message: error instanceof Error ? error.message : String(error) };
+  }
+  const invalidComment = validateReviewComments(input, provider);
   if (invalidComment != null) return { ok: false, message: invalidComment };
-  const provider = input.provider === "provider";
+
   if (input.verdict === "approve") {
-    let me: string | null;
     try {
-      me = provider ? await getCurrentproviderLogin(pi, input.gitRoot) : await getCurrentGitHubLogin(pi, input.gitRoot);
+      const me = await getCurrentLogin(pi, input, provider);
+      if (me != null && input.prAuthorLogin != null && me.toLowerCase() === input.prAuthorLogin.toLowerCase()) {
+        return {
+          ok: false,
+          blockedSelfApproval: true,
+          message: `Refusing to approve your own pull request. You are signed in as ${me}, who authored PR #${input.prNumber}. ${provider.label} does not allow self-approval. Use Comment or Request changes instead.`,
+        };
+      }
     } catch (error) {
       return { ok: false, message: error instanceof Error ? error.message : String(error) };
-    }
-    if (me != null && input.prAuthorLogin != null && me.toLowerCase() === input.prAuthorLogin.toLowerCase()) {
-      return {
-        ok: false,
-        blockedSelfApproval: true,
-        message: `Refusing to approve your own pull request. You are signed in as ${me}, who authored PR #${input.prNumber}. ${provider ? "provider" : "GitHub"} does not allow self-approval. Use Comment or Request changes instead.`,
-      };
     }
   }
 
   const hasBody = input.body != null && input.body.trim().length > 0;
-  const hasComments = input.comments != null && input.comments.length > 0;
-  if (input.verdict === "request_changes" && (!hasBody && (!hasComments || provider))) {
-    return { ok: false, message: provider ? "provider request changes needs a review body." : "Request changes needs a review body or at least one inline comment." };
+  const hasComments = (input.comments?.length ?? 0) > 0;
+  if (input.verdict === "request_changes" && !hasBody && (!hasComments || getProviderCapability(provider, "requestChangesBodyRequired"))) {
+    return { ok: false, message: getProviderCapability(provider, "requestChangesBodyRequired")
+      ? `${provider.label} request changes needs a review body.`
+      : "Request changes needs a review body or at least one inline comment." };
+  }
+
+  try {
+    await validateLiveTarget(pi, input, provider);
+  } catch (error) {
+    return { ok: false, message: error instanceof Error ? error.message : String(error) };
   }
 
   const body = input.body?.trim();
   const comments = input.comments ?? [];
-
-  if (provider) {
-    try {
-      await validateproviderTarget(pi, input);
-    } catch (error) {
-      return { ok: false, message: error instanceof Error ? error.message : String(error) };
-    }
-    const result = await postReview(pi, input, { verdict: input.verdict, body, comments });
-    if (!result.ok) return result;
-    return { ok: true, message: formatReviewSummary(input, comments.length, body != null && body.length > 0) };
-  }
-
-  if (input.verdict === "approve" && comments.length > 0) {
-    const commentResult = await postReview(pi, input, { verdict: "comment", comments });
+  if (input.verdict === "approve" && comments.length > 0 && !getProviderCapability(provider, "atomicReview")) {
+    const commentResult = await postReview(pi, input, provider, { verdict: "comment", comments });
     if (!commentResult.ok) return { ok: false, message: `Could not add review comments before approval: ${commentResult.message}` };
-
-    const approvalResult = await postReview(pi, input, { verdict: "approve", body });
+    const approvalResult = await postReview(pi, input, provider, { verdict: "approve", body });
     if (!approvalResult.ok) return { ok: false, message: `Review comments were added, but approval failed: ${approvalResult.message}` };
-    return { ok: true, message: formatReviewSummary(input, comments.length, body != null && body.length > 0) };
+    return { ok: true, message: formatReviewSummary(input, provider, comments.length, body != null && body.length > 0) };
   }
 
-  const result = await postReview(pi, input, { verdict: input.verdict, body, comments });
+  const result = await postReview(pi, input, provider, { verdict: input.verdict, body, comments });
   if (!result.ok) return result;
-  return { ok: true, message: formatReviewSummary(input, comments.length, body != null && body.length > 0) };
+  return { ok: true, message: formatReviewSummary(input, provider, comments.length, body != null && body.length > 0) };
 }
