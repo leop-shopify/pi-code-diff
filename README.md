@@ -1,3 +1,15 @@
+> [!WARNING]
+> **pi-code-diff is deprecated.** Development has moved to [pi-coder](https://github.com/dantetekanem/pi-coder).
+>
+> Migrate with:
+>
+> ```bash
+> pi uninstall https://github.com/leop-shopify/pi-code-diff
+> pi install https://github.com/dantetekanem/pi-coder
+> ```
+>
+> Restart Pi or run `/reload`. If this package was installed project-locally, add `-l` to both commands.
+
 # pi-code-diff
 
 `/diff`, `/code`, and `/code-diff` open an interactive code diff editor for Pi with comments, editable line suggestions, AI-assisted review handoff, configured pull-request submission, and local or remote diff review.
@@ -39,13 +51,14 @@ For local reviews, the UI stages the next message for you. For remote PR verdict
 
 ## Quickstart
 
-### Install
+### Migrate to pi-coder
 
 ```bash
-pi install https://example.com/owner/pi-code-diff
+pi uninstall https://github.com/leop-shopify/pi-code-diff
+pi install https://github.com/dantetekanem/pi-coder
 ```
 
-Then restart Pi or run `/reload`.
+Then restart Pi or run `/reload`. If this package was installed project-locally, add `-l` to both commands.
 
 <details>
 <summary>Local development</summary>

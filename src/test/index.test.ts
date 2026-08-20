@@ -1312,7 +1312,7 @@ describe("code diff extension", () => {
     expect(ctx.ui.notify).toHaveBeenCalledWith("No reviewable files found for this diff.", "info");
   });
 
-  it("surfaces initial shortcut config warnings on startup and reload", async () => {
+  it("surfaces deprecation and initial shortcut config warnings on startup and reload", async () => {
     const handlers = new Map<string, (event: { reason: string }, ctx: { hasUI: boolean; ui: { notify: ReturnType<typeof vi.fn> } }) => Promise<void>>();
     const pi = {
       registerCommand: vi.fn(),
@@ -1321,15 +1321,24 @@ describe("code diff extension", () => {
       on: vi.fn((event: string, handler) => handlers.set(event, handler)),
     };
     const ctx = { hasUI: true, ui: { notify: vi.fn() } };
+    const deprecationWarning = [
+      "pi-code-diff is deprecated. Migrate to pi-coder:",
+      "pi uninstall https://github.com/leop-shopify/pi-code-diff",
+      "pi install https://github.com/dantetekanem/pi-coder",
+      "Restart Pi or run /reload.",
+      "For project-local installs, add -l to both commands.",
+    ].join("\n");
 
     codeDiffExtension(pi as never);
 
     await handlers.get("session_start")?.({ reason: "startup" }, ctx);
     await handlers.get("session_start")?.({ reason: "reload" }, ctx);
 
-    expect(ctx.ui.notify).toHaveBeenCalledTimes(2);
-    expect(ctx.ui.notify).toHaveBeenNthCalledWith(1, "code-diff config: bad shortcut config", "warning");
+    expect(ctx.ui.notify).toHaveBeenCalledTimes(4);
+    expect(ctx.ui.notify).toHaveBeenNthCalledWith(1, deprecationWarning, "warning");
     expect(ctx.ui.notify).toHaveBeenNthCalledWith(2, "code-diff config: bad shortcut config", "warning");
+    expect(ctx.ui.notify).toHaveBeenNthCalledWith(3, deprecationWarning, "warning");
+    expect(ctx.ui.notify).toHaveBeenNthCalledWith(4, "code-diff config: bad shortcut config", "warning");
   });
 
   it("forwards validated pull request metadata to the remote resolver and rejects malformed or non-remote handoffs", async () => {

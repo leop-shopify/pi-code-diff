@@ -53,6 +53,13 @@ interface ReviewRunStatus {
 }
 
 const MODE_VALUES = new Set(["working", "staged", "branch", "custom"]);
+const DEPRECATION_WARNING = [
+  "pi-code-diff is deprecated. Migrate to pi-coder:",
+  "pi uninstall https://github.com/leop-shopify/pi-code-diff",
+  "pi install https://github.com/dantetekanem/pi-coder",
+  "Restart Pi or run /reload.",
+  "For project-local installs, add -l to both commands.",
+].join("\n");
 
 function expandHomePath(path: string): string {
   if (path === "~") return homedir();
@@ -1206,6 +1213,7 @@ export default function codeDiffExtension(pi: ExtensionAPI) {
 
   pi.on("session_start", async (event, ctx) => {
     if (event.reason === "startup" || event.reason === "reload") {
+      if (ctx.hasUI) ctx.ui.notify(DEPRECATION_WARNING, "warning");
       notifyShortcutWarnings(ctx, initialShortcutConfig.warnings);
     }
   });
